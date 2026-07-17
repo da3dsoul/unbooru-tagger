@@ -1,26 +1,35 @@
 namespace UnbooruTagger.Data;
 
 /// <summary>
-/// Picks up to <paramref name="maxPerClass"/> positive IDs (or all, if fewer) and an
-/// equal-sized random sample of negative IDs, so the caller ends up with a
-/// class-balanced set — kept independent of EF Core/unbooru so it's easy to unit test.
+/// Picks up to <paramref name="maxPerClass"/> positives (or all, if fewer) from the
+/// full matching pool. Negatives are then drawn from a mix of whatever matching images
+/// were left over (not selected as positives — these still share 1-to-all of the
+/// target tags with the positive set) and the true zero-overlap candidates, so the
+/// negative set spans a spread of tag-overlap counts rather than uniformly "none of the
+/// target tags". Falls back to zero-overlap-only negatives when there's no leftover
+/// (e.g. every matching image was already used as a positive) — kept independent of EF
+/// Core/unbooru so it's easy to unit test.
 /// </summary>
 public static class BalancedSampleSelector
 {
     public static (IReadOnlyList<int> Positives, IReadOnlyList<int> Negatives) Select(
-        IReadOnlyList<int> positiveCandidateIds,
-        IReadOnlyList<int> negativeCandidateIds,
+        IReadOnlyList<int> matchingCandidateIds,
+        IReadOnlyList<int> zeroOverlapCandidateIds,
         int? maxPerClass,
         Random? random = null)
     {
         random ??= Random.Shared;
 
+        var shuffledMatching = Shuffle(matchingCandidateIds, random);
         var positiveCount = maxPerClass.HasValue
-            ? Math.Min(maxPerClass.Value, positiveCandidateIds.Count)
-            : positiveCandidateIds.Count;
+            ? Math.Min(maxPerClass.Value, shuffledMatching.Count)
+            : shuffledMatching.Count;
 
-        var positives = Shuffle(positiveCandidateIds, random).Take(positiveCount).ToList();
-        var negatives = Shuffle(negativeCandidateIds, random).Take(positives.Count).ToList();
+        var positives = shuffledMatching.Take(positiveCount).ToList();
+        var leftoverMatching = shuffledMatching.Skip(positiveCount).ToList();
+
+        var negativePool = leftoverMatching.Concat(zeroOverlapCandidateIds).ToList();
+        var negatives = Shuffle(negativePool, random).Take(positives.Count).ToList();
 
         return (positives, negatives);
     }
