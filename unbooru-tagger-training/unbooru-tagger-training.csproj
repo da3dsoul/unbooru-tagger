@@ -8,6 +8,19 @@
     <PackageReference Include="OnnxSharp" Version="0.3.2" />
     <PackageReference Include="System.CommandLine" Version="2.0.10" />
     <PackageReference Include="TorchSharp" Version="0.107.0" />
+  </ItemGroup>
+
+  <!--
+    Native backend: CUDA on Linux (the actual training box has an NVIDIA GPU), CPU
+    everywhere else (this repo is developed on Windows, which has no CUDA package
+    conditioned in here — TorchSharp-cuda-windows would be the equivalent if that ever
+    changes). TorchSharp-cuda-linux bundles its own CUDA 12.8 runtime, so no separate
+    CUDA Toolkit install is required on the training machine, just a compatible driver.
+  -->
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+    <PackageReference Include="TorchSharp-cuda-linux" Version="0.107.0" />
+  </ItemGroup>
+  <ItemGroup Condition="!$([MSBuild]::IsOSPlatform('Linux'))">
     <PackageReference Include="TorchSharp-cpu" Version="0.107.0" />
   </ItemGroup>
 

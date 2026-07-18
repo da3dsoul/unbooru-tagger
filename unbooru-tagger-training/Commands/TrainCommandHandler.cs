@@ -66,10 +66,11 @@ public static class TrainCommandHandler
             .Select(_ => EmbeddingInit.RandomRow(embeddingDim))
             .ToArray();
 
-        var imageTower = new ImageTower(embeddingDim);
-        var tagTower = TagTower.CreateFullyTrainable(initialRows, embeddingDim);
+        var device = DeviceSelector.Best();
+        var imageTower = new ImageTower(embeddingDim, device: device);
+        var tagTower = TagTower.CreateFullyTrainable(initialRows, embeddingDim, device);
         var optimizer = optim.Adam(imageTower.parameters().Concat(tagTower.parameters()).ToArray(), lr: learningRate);
-        var allTagIndices = tensor(Enumerable.Range(0, vocabulary.Records.Count).Select(i => (long)i).ToArray());
+        var allTagIndices = tensor(Enumerable.Range(0, vocabulary.Records.Count).Select(i => (long)i).ToArray(), device: device);
 
         var (trainingIndices, validationIndices) = SplitForValidation(datasetCount, validationFraction);
         var trainingTagRows = trainingIndices.Select(i => imageTagRows[i]).ToList();
@@ -84,12 +85,12 @@ public static class TrainCommandHandler
                 var localBatchIndices = sampler.SampleBatch(batchSize);
                 var globalBatchIndices = localBatchIndices.Select(li => trainingIndices[li]).ToList();
 
-                using var pixelBatch = loadBatch(globalBatchIndices);
+                using var pixelBatch = loadBatch(globalBatchIndices).to(device);
                 var (pooled, _) = imageTower.forward(pixelBatch);
                 var tagEmbeddings = tagTower.forward(allTagIndices);
 
                 var batchTagRows = localBatchIndices.Select(li => trainingTagRows[li]).ToList();
-                using var labels = BatchLabelBuilder.Build(batchTagRows, vocabulary.Records.Count);
+                using var labels = BatchLabelBuilder.Build(batchTagRows, vocabulary.Records.Count).to(device);
                 var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels);
 
                 optimizer.zero_grad();
@@ -106,13 +107,18 @@ public static class TrainCommandHandler
                 Console.WriteLine($"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch} loss {lossValue:F4}");
             }
 
+            // Save after every epoch, not just at the end: a long run (especially on
+            // GPU) can be killed, crash, or lose its SSH session partway through, and
+            // without this, all completed work would be unrecoverable.
+            SaveCheckpoint(checkpointDir, imageTower, tagTower, embeddingDim, resolvedInputSize, vocabulary);
+
             if (validationIndices.Count == 0)
             {
                 Console.WriteLine("Not enough images for a validation split — running the full epoch count without early stopping.");
                 continue;
             }
 
-            var validationLoss = Evaluate(imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count);
+            var validationLoss = Evaluate(imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count, device);
             Console.WriteLine($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:F4}");
 
             if (earlyStopping.ShouldStop(validationLoss))
@@ -122,14 +128,17 @@ public static class TrainCommandHandler
             }
         }
 
+        return 0;
+    }
+
+    private static void SaveCheckpoint(string checkpointDir, ImageTower imageTower, TagTower tagTower, int embeddingDim, int inputSize, TagVocabulary vocabulary)
+    {
         var embeddings = TagEmbeddingStore.CreateEmpty(embeddingDim);
         foreach (var row in tagTower.ExtractRows())
             embeddings.AppendRow(row);
 
-        var config = ModelConfig.Default(embeddingDim, resolvedInputSize);
+        var config = ModelConfig.Default(embeddingDim, inputSize);
         Checkpoint.Save(checkpointDir, imageTower, config, vocabulary, embeddings);
-
-        return 0;
     }
 
     private static double Evaluate(
@@ -139,16 +148,17 @@ public static class TrainCommandHandler
         IReadOnlyList<IReadOnlyList<int>> imageTagRows,
         IReadOnlyList<int> validationIndices,
         Tensor allTagIndices,
-        int vocabularySize)
+        int vocabularySize,
+        Device device)
     {
         using var _ = no_grad();
 
-        using var pixelBatch = loadBatch(validationIndices);
+        using var pixelBatch = loadBatch(validationIndices).to(device);
         var (pooled, _) = imageTower.forward(pixelBatch);
         var tagEmbeddings = tagTower.forward(allTagIndices);
 
         var batchTagRows = validationIndices.Select(i => imageTagRows[i]).ToList();
-        using var labels = BatchLabelBuilder.Build(batchTagRows, vocabularySize);
+        using var labels = BatchLabelBuilder.Build(batchTagRows, vocabularySize).to(device);
         using var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels);
 
         return loss.item<float>();

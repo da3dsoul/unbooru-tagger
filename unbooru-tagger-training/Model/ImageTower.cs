@@ -30,14 +30,14 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
 
     public int EmbeddingDim { get; }
 
-    public ImageTower(int embeddingDim, int stemChannels = 64, int[]? stageChannels = null, int[]? blocksPerStage = null)
+    public ImageTower(int embeddingDim, int stemChannels = 64, int[]? stageChannels = null, int[]? blocksPerStage = null, Device? device = null)
         : base(nameof(ImageTower))
     {
         stageChannels ??= [64, 128, 256];
         blocksPerStage ??= [2, 2, 2];
         EmbeddingDim = embeddingDim;
 
-        Stem = Conv2d(3, stemChannels, kernel_size: StemKernel, stride: StemStride);
+        Stem = Conv2d(3, stemChannels, kernel_size: StemKernel, stride: StemStride, device: device);
 
         // Real ConvNeXt normalizes right after the stem and before every downsample
         // (its downsample "layer" is literally LayerNorm -> Conv). Without that, plain
@@ -47,23 +47,23 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
         // GroupNorm into computing NaN, LayerScale notwithstanding (LayerScale only
         // dampens a block's finite output; it can't recover an already-NaN/Infinity
         // value produced inside the branch).
-        var layers = new List<Module<Tensor, Tensor>> { GroupNorm(1, stemChannels, eps: 1e-3) };
+        var layers = new List<Module<Tensor, Tensor>> { GroupNorm(1, stemChannels, eps: 1e-3, device: device) };
         long inChannels = stemChannels;
         for (var stage = 0; stage < stageChannels.Length; stage++)
         {
             long outChannels = stageChannels[stage];
             if (outChannels != inChannels)
             {
-                layers.Add(GroupNorm(1, inChannels, eps: 1e-3));
-                layers.Add(Conv2d(inChannels, outChannels, kernel_size: 2, stride: 2));
+                layers.Add(GroupNorm(1, inChannels, eps: 1e-3, device: device));
+                layers.Add(Conv2d(inChannels, outChannels, kernel_size: 2, stride: 2, device: device));
             }
             for (var b = 0; b < blocksPerStage[stage]; b++)
-                layers.Add(new ConvNeXtBlock(outChannels));
+                layers.Add(new ConvNeXtBlock(outChannels, device));
             inChannels = outChannels;
         }
 
         Layers = ModuleList(layers.ToArray());
-        Projection = Conv2d(inChannels, embeddingDim, kernel_size: 1);
+        Projection = Conv2d(inChannels, embeddingDim, kernel_size: 1, device: device);
 
         RegisterComponents();
     }

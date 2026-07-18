@@ -30,7 +30,8 @@ public static class AddTagCommandHandler
         int earlyStoppingPatience = 5,
         ITagTextEmbedder? warmStartEmbedder = null)
     {
-        var (imageTower, config, vocabulary, embeddings) = Checkpoint.Load(checkpointDir);
+        var device = DeviceSelector.Best();
+        var (imageTower, config, vocabulary, embeddings) = Checkpoint.Load(checkpointDir, device);
 
         if (!vocabulary.TryGet(tag, out var record))
         {
@@ -48,7 +49,7 @@ public static class AddTagCommandHandler
             parameter.requires_grad = false;
 
         var allRows = Enumerable.Range(0, embeddings.RowCount).Select(i => embeddings.GetRow(i).ToArray()).ToArray();
-        var tagTower = TagTower.CreateWithSingleTrainableRow(allRows, record.RowIndex, embeddings.EmbeddingDim);
+        var tagTower = TagTower.CreateWithSingleTrainableRow(allRows, record.RowIndex, embeddings.EmbeddingDim, device);
         var optimizer = optim.Adam(tagTower.parameters().ToArray(), lr: learningRate);
 
         var imagePaths = manifest.Entries.Select(e => e.ImagePath).ToList();
@@ -58,20 +59,20 @@ public static class AddTagCommandHandler
                 .Where(rowIndex => rowIndex >= 0)
                 .ToList())
             .ToList();
-        var allTagIndices = tensor(Enumerable.Range(0, vocabulary.Records.Count).Select(i => (long)i).ToArray());
+        var allTagIndices = tensor(Enumerable.Range(0, vocabulary.Records.Count).Select(i => (long)i).ToArray(), device: device);
 
         var (trainingIndices, validationIndices) = SplitForValidation(manifest.Entries.Count);
         var useEarlyStopping = validationIndices.Count > 0;
 
-        using var trainingPixelBatch = ImageBatchLoader.Load(trainingIndices.Select(i => imagePaths[i]).ToList(), config.InputSize);
-        using var trainingLabels = BatchLabelBuilder.Build(trainingIndices.Select(i => imageTagRows[i]).ToList(), vocabulary.Records.Count);
+        using var trainingPixelBatch = ImageBatchLoader.Load(trainingIndices.Select(i => imagePaths[i]).ToList(), config.InputSize).to(device);
+        using var trainingLabels = BatchLabelBuilder.Build(trainingIndices.Select(i => imageTagRows[i]).ToList(), vocabulary.Records.Count).to(device);
 
         Tensor? validationPixelBatch = null;
         Tensor? validationLabels = null;
         if (useEarlyStopping)
         {
-            validationPixelBatch = ImageBatchLoader.Load(validationIndices.Select(i => imagePaths[i]).ToList(), config.InputSize);
-            validationLabels = BatchLabelBuilder.Build(validationIndices.Select(i => imageTagRows[i]).ToList(), vocabulary.Records.Count);
+            validationPixelBatch = ImageBatchLoader.Load(validationIndices.Select(i => imagePaths[i]).ToList(), config.InputSize).to(device);
+            validationLabels = BatchLabelBuilder.Build(validationIndices.Select(i => imageTagRows[i]).ToList(), vocabulary.Records.Count).to(device);
         }
         else
         {
@@ -79,6 +80,17 @@ public static class AddTagCommandHandler
         }
 
         var earlyStopping = new EarlyStopping(earlyStoppingPatience);
+
+        // Periodic saves so a crash/interrupt partway through doesn't lose completed
+        // work — add-tag runs are usually quick, but not always fast enough that this
+        // doesn't matter.
+        void SaveProgress()
+        {
+            var updatedRows = tagTower.ExtractRows();
+            for (var i = 0; i < updatedRows.Length; i++)
+                embeddings.SetRow(i, updatedRows[i]);
+            Checkpoint.Save(checkpointDir, imageTower, config, vocabulary, embeddings);
+        }
 
         for (var step = 0; step < steps; step++)
         {
@@ -99,6 +111,9 @@ public static class AddTagCommandHandler
 
             Console.WriteLine($"step {step + 1}/{steps} loss {lossValue:F4}");
 
+            if (step % 20 == 19)
+                SaveProgress();
+
             if (!useEarlyStopping)
                 continue;
 
@@ -117,12 +132,8 @@ public static class AddTagCommandHandler
         validationPixelBatch?.Dispose();
         validationLabels?.Dispose();
 
-        var updatedRows = tagTower.ExtractRows();
-        for (var i = 0; i < updatedRows.Length; i++)
-            embeddings.SetRow(i, updatedRows[i]);
-
         vocabulary.PromoteIfThresholdMet(tag, minImageThreshold);
-        Checkpoint.Save(checkpointDir, imageTower, config, vocabulary, embeddings);
+        SaveProgress();
 
         return 0;
     }

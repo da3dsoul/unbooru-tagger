@@ -2,6 +2,7 @@ using System.Text.Json;
 using UnbooruTagger.Core.Embedding;
 using UnbooruTagger.Core.Vocabulary;
 using UnbooruTagger.Training.Model;
+using static TorchSharp.torch;
 
 namespace UnbooruTagger.Training.Checkpoints;
 
@@ -28,12 +29,12 @@ public static class Checkpoint
         embeddings.Save(Path.Combine(directory, EmbeddingsFileName));
     }
 
-    public static (ImageTower ImageTower, ModelConfig Config, TagVocabulary Vocabulary, TagEmbeddingStore Embeddings) Load(string directory)
+    public static (ImageTower ImageTower, ModelConfig Config, TagVocabulary Vocabulary, TagEmbeddingStore Embeddings) Load(string directory, Device? device = null)
     {
         var config = JsonSerializer.Deserialize<ModelConfig>(File.ReadAllText(Path.Combine(directory, ConfigFileName)))
                      ?? throw new InvalidDataException($"'{directory}' does not contain a valid model config.");
 
-        var imageTower = new ImageTower(config.EmbeddingDim, config.StemChannels, config.StageChannels, config.BlocksPerStage);
+        var imageTower = new ImageTower(config.EmbeddingDim, config.StemChannels, config.StageChannels, config.BlocksPerStage, device);
         imageTower.load(Path.Combine(directory, ImageTowerFileName));
 
         var vocabulary = TagVocabulary.Load(Path.Combine(directory, VocabularyFileName));

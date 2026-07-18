@@ -32,9 +32,9 @@ public sealed class TagTower : Module<Tensor, Tensor>
     }
 
     /// <summary>Every row trainable — the full/periodic fine-tune pass.</summary>
-    public static TagTower CreateFullyTrainable(float[][] initialRows, int embeddingDim)
+    public static TagTower CreateFullyTrainable(float[][] initialRows, int embeddingDim, Device? device = null)
     {
-        var weights = ToTensor(initialRows, embeddingDim);
+        var weights = ToTensor(initialRows, embeddingDim, device);
         return new TagTower(weights.detach(), new Parameter(weights.clone()), 0, embeddingDim);
     }
 
@@ -43,9 +43,9 @@ public sealed class TagTower : Module<Tensor, Tensor>
     /// <paramref name="initialRows"/>[trainableRowIndex] should already hold the
     /// text-embedding warm-start prior for the new tag.
     /// </summary>
-    public static TagTower CreateWithSingleTrainableRow(float[][] initialRows, int trainableRowIndex, int embeddingDim)
+    public static TagTower CreateWithSingleTrainableRow(float[][] initialRows, int trainableRowIndex, int embeddingDim, Device? device = null)
     {
-        var weights = ToTensor(initialRows, embeddingDim);
+        var weights = ToTensor(initialRows, embeddingDim, device);
         var trainableRow = weights.narrow(0, trainableRowIndex, 1).clone();
         return new TagTower(weights.detach(), new Parameter(trainableRow), trainableRowIndex, embeddingDim);
     }
@@ -86,11 +86,11 @@ public sealed class TagTower : Module<Tensor, Tensor>
         return pieces.Count == 1 ? pieces[0] : cat(pieces.ToArray(), dim: 0);
     }
 
-    private static Tensor ToTensor(float[][] rows, int embeddingDim)
+    private static Tensor ToTensor(float[][] rows, int embeddingDim, Device? device)
     {
         var flat = new float[rows.Length * embeddingDim];
         for (var i = 0; i < rows.Length; i++)
             Array.Copy(rows[i], 0, flat, i * embeddingDim, embeddingDim);
-        return tensor(flat, [rows.Length, embeddingDim]);
+        return tensor(flat, [rows.Length, embeddingDim], device: device);
     }
 }
