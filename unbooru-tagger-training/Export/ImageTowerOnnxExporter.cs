@@ -33,21 +33,27 @@ public static class ImageTowerOnnxExporter
             {
                 Conv2d conv => ExportConv2d(graph, conv, current, names),
                 ConvNeXtBlock block => ExportConvNeXtBlock(graph, block, current, names),
+                GroupNorm norm => ExportGroupNorm(graph, norm, current, names),
                 _ => throw new NotSupportedException($"No ONNX export defined for layer type {layer.GetType().Name}.")
             };
         }
+
+        // Projection happens BEFORE pooling — see ImageTower's doc comment: this puts
+        // both outputs in the same embeddingDim-dimensional space, which the pooled
+        // output being a straight GlobalAveragePool+Flatten of it depends on.
+        var projectedSpatial = ExportConv2d(graph, tower.Projection, current, names);
 
         graph.Node.Add(new NodeProto
         {
             OpType = "Identity",
             Name = names.Next("Identity"),
-            Input = { current },
+            Input = { projectedSpatial },
             Output = { SpatialOutputName }
         });
         graph.Output.Add(MakeValueInfo(SpatialOutputName));
 
-        var pooled = ExportGlobalAveragePoolAndFlatten(graph, current, names);
-        ExportLinear(graph, tower.Projection, pooled, names, PooledOutputName);
+        var pooled = ExportGlobalAveragePoolAndFlatten(graph, projectedSpatial, names);
+        graph.Node.Add(new NodeProto { OpType = "Identity", Name = names.Next("Identity"), Input = { pooled }, Output = { PooledOutputName } });
         graph.Output.Add(MakeValueInfo(PooledOutputName));
 
         var model = new ModelProto { IrVersion = 9, Graph = graph };
@@ -194,24 +200,6 @@ public static class ImageTowerOnnxExporter
         flattenNode.Attribute.Add(Int("axis", 1));
         graph.Node.Add(flattenNode);
         return flatName;
-    }
-
-    private static void ExportLinear(GraphProto graph, Linear linear, string inputName, NameAllocator names, string outputName)
-    {
-        var weightName = names.Next("linear_weight");
-        var biasName = names.Next("linear_bias");
-        graph.Initializer.Add(MakeInitializer(weightName, linear.weight));
-        graph.Initializer.Add(MakeInitializer(biasName, linear.bias!));
-
-        var node = new NodeProto
-        {
-            OpType = "Gemm",
-            Name = names.Next("Gemm"),
-            Input = { inputName, weightName, biasName },
-            Output = { outputName }
-        };
-        node.Attribute.Add(Int("transB", 1));
-        graph.Node.Add(node);
     }
 
     private static TensorProto MakeInitializer(string name, Tensor tensor)

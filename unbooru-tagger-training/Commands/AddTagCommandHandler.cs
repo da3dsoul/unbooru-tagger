@@ -90,7 +90,14 @@ public static class AddTagCommandHandler
             loss.backward();
             optimizer.step();
 
-            Console.WriteLine($"step {step + 1}/{steps} loss {loss.item<float>():F4}");
+            var lossValue = loss.item<float>();
+            if (float.IsNaN(lossValue))
+            {
+                Console.Error.WriteLine($"step {step + 1}/{steps}: {NaNGuard.Message}");
+                return 1;
+            }
+
+            Console.WriteLine($"step {step + 1}/{steps} loss {lossValue:F4}");
 
             if (!useEarlyStopping)
                 continue;

@@ -10,6 +10,14 @@ namespace UnbooruTagger.Training.Model;
 /// global embedding and the pre-pool spatial feature map, as CLAUDE.md's image-tower
 /// spec requires for localization. <see cref="Layers"/> interleaves stride-2 downsample
 /// convs between stages of <see cref="ConvNeXtBlock"/>s.
+///
+/// <see cref="Projection"/> is a 1x1 conv (not a plain <c>Linear</c> on the pooled
+/// vector alone) applied to the full spatial map BEFORE pooling, so the spatial output
+/// lives in the same embeddingDim-dimensional space as tag embeddings and the pooled
+/// output — required for <c>TagScorer.Heatmap</c>'s dot product against a tag embedding
+/// to even be dimensionally valid, let alone meaningful. A 1x1 conv commutes with
+/// average pooling (it's a linear map applied per-location), so projecting-then-pooling
+/// gives the exact same pooled result as the old pooling-then-projecting order.
 /// </summary>
 public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
 {
@@ -18,7 +26,7 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
 
     public readonly Conv2d Stem;
     public readonly ModuleList<Module<Tensor, Tensor>> Layers;
-    public readonly Linear Projection;
+    public readonly Conv2d Projection;
 
     public int EmbeddingDim { get; }
 
@@ -31,20 +39,31 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
 
         Stem = Conv2d(3, stemChannels, kernel_size: StemKernel, stride: StemStride);
 
-        var layers = new List<Module<Tensor, Tensor>>();
+        // Real ConvNeXt normalizes right after the stem and before every downsample
+        // (its downsample "layer" is literally LayerNorm -> Conv). Without that, plain
+        // unnormalized downsample convs let activation magnitude drift across stages
+        // with nothing to rein it in — traced to a real bug: by the last block of the
+        // last stage, that drift occasionally pushed a ConvNeXtBlock's internal
+        // GroupNorm into computing NaN, LayerScale notwithstanding (LayerScale only
+        // dampens a block's finite output; it can't recover an already-NaN/Infinity
+        // value produced inside the branch).
+        var layers = new List<Module<Tensor, Tensor>> { GroupNorm(1, stemChannels, eps: 1e-3) };
         long inChannels = stemChannels;
         for (var stage = 0; stage < stageChannels.Length; stage++)
         {
             long outChannels = stageChannels[stage];
             if (outChannels != inChannels)
+            {
+                layers.Add(GroupNorm(1, inChannels, eps: 1e-3));
                 layers.Add(Conv2d(inChannels, outChannels, kernel_size: 2, stride: 2));
+            }
             for (var b = 0; b < blocksPerStage[stage]; b++)
                 layers.Add(new ConvNeXtBlock(outChannels));
             inChannels = outChannels;
         }
 
         Layers = ModuleList(layers.ToArray());
-        Projection = Linear(inChannels, embeddingDim);
+        Projection = Conv2d(inChannels, embeddingDim, kernel_size: 1);
 
         RegisterComponents();
     }
@@ -55,9 +74,8 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
         foreach (var layer in Layers)
             x = layer.forward(x);
 
-        var spatial = x;
-        var pooled = functional.adaptive_avg_pool2d(x, [1L, 1L]).flatten(1);
-        pooled = Projection.forward(pooled);
+        var spatial = Projection.forward(x);
+        var pooled = functional.adaptive_avg_pool2d(spatial, [1L, 1L]).flatten(1);
         return (pooled, spatial);
     }
 }

@@ -22,7 +22,13 @@ public sealed class ConvNeXtBlock : Module<Tensor, Tensor>
     public ConvNeXtBlock(long channels) : base(nameof(ConvNeXtBlock))
     {
         Depthwise = Conv2d(channels, channels, kernel_size: 7, padding: 3, groups: channels);
-        Norm = GroupNorm(1, channels);
+        // A larger-than-default eps (PyTorch/TorchSharp default is 1e-5): LayerScale
+        // dampens a block's *output* once it's computed, but if variance genuinely lands
+        // near zero, dividing by sqrt(variance + eps) can still overflow to Infinity/NaN
+        // internally before LayerScale ever gets a chance to scale it down — Infinity/NaN
+        // survive multiplication by any finite scale. A bigger eps keeps the denominator
+        // bounded away from zero in the first place.
+        Norm = GroupNorm(1, channels, eps: 1e-3);
         PointwiseExpand = Conv2d(channels, channels * 4, kernel_size: 1);
         PointwiseProject = Conv2d(channels * 4, channels, kernel_size: 1);
 

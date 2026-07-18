@@ -96,7 +96,14 @@ public static class TrainCommandHandler
                 loss.backward();
                 optimizer.step();
 
-                Console.WriteLine($"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch} loss {loss.item<float>():F4}");
+                var lossValue = loss.item<float>();
+                if (float.IsNaN(lossValue))
+                {
+                    Console.Error.WriteLine($"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch}: {NaNGuard.Message}");
+                    return 1;
+                }
+
+                Console.WriteLine($"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch} loss {lossValue:F4}");
             }
 
             if (validationIndices.Count == 0)
