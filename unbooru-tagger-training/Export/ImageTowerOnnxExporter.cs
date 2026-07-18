@@ -94,6 +94,12 @@ public static class ImageTowerOnnxExporter
         x = ExportGelu(graph, x, names);
         x = ExportConv2d(graph, block.PointwiseProject, x, names);
 
+        var layerScaleName = names.Next("layer_scale");
+        graph.Initializer.Add(MakeInitializer(layerScaleName, block.LayerScale));
+        var scaledName = names.Next("layer_scaled");
+        graph.Node.Add(new NodeProto { OpType = "Mul", Name = names.Next("Mul"), Input = { x, layerScaleName }, Output = { scaledName } });
+        x = scaledName;
+
         var outputName = names.Next("residual_out");
         graph.Node.Add(new NodeProto
         {

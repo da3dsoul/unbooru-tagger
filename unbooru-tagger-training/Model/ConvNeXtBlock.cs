@@ -17,6 +17,7 @@ public sealed class ConvNeXtBlock : Module<Tensor, Tensor>
     public readonly GroupNorm Norm;
     public readonly Conv2d PointwiseExpand;
     public readonly Conv2d PointwiseProject;
+    public readonly Parameter LayerScale;
 
     public ConvNeXtBlock(long channels) : base(nameof(ConvNeXtBlock))
     {
@@ -24,6 +25,13 @@ public sealed class ConvNeXtBlock : Module<Tensor, Tensor>
         Norm = GroupNorm(1, channels);
         PointwiseExpand = Conv2d(channels, channels * 4, kernel_size: 1);
         PointwiseProject = Conv2d(channels * 4, channels, kernel_size: 1);
+
+        // ConvNeXt's "LayerScale": start each block as (near) an identity mapping so a
+        // stack of several blocks can't compound an unlucky random init into an
+        // activation blowup (observed in practice: real training runs hit NaN loss from
+        // step 1 without this). The branch's contribution grows from ~0 as training
+        // makes it useful, rather than being full-strength from the very first forward pass.
+        LayerScale = new Parameter(ones([1, channels, 1, 1]) * 1e-6);
 
         RegisterComponents();
     }
@@ -35,6 +43,6 @@ public sealed class ConvNeXtBlock : Module<Tensor, Tensor>
         x = PointwiseExpand.forward(x);
         x = functional.gelu(x);
         x = PointwiseProject.forward(x);
-        return x + input;
+        return input + (LayerScale * x);
     }
 }
