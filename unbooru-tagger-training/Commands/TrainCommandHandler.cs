@@ -118,7 +118,7 @@ public static class TrainCommandHandler
                 continue;
             }
 
-            var validationLoss = Evaluate(imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count, device);
+            var validationLoss = Evaluate(imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count, device, batchSize);
             Console.WriteLine($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:F4}");
 
             if (earlyStopping.ShouldStop(validationLoss))
@@ -149,19 +149,33 @@ public static class TrainCommandHandler
         IReadOnlyList<int> validationIndices,
         Tensor allTagIndices,
         int vocabularySize,
-        Device device)
+        Device device,
+        int batchSize)
     {
         using var _ = no_grad();
 
-        using var pixelBatch = loadBatch(validationIndices).to(device);
-        var (pooled, _) = imageTower.forward(pixelBatch);
-        var tagEmbeddings = tagTower.forward(allTagIndices);
+        using var tagEmbeddings = tagTower.forward(allTagIndices);
 
-        var batchTagRows = validationIndices.Select(i => imageTagRows[i]).ToList();
-        using var labels = BatchLabelBuilder.Build(batchTagRows, vocabularySize).to(device);
-        using var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels);
+        double totalLoss = 0;
+        var totalCount = 0;
+        for (var offset = 0; offset < validationIndices.Count; offset += batchSize)
+        {
+            var chunk = validationIndices.Skip(offset).Take(batchSize).ToList();
 
-        return loss.item<float>();
+            using var pixelBatch = loadBatch(chunk).to(device);
+            var (pooled, spatial) = imageTower.forward(pixelBatch);
+            using var _pooled = pooled;
+            using var _spatial = spatial;
+
+            var batchTagRows = chunk.Select(i => imageTagRows[i]).ToList();
+            using var labels = BatchLabelBuilder.Build(batchTagRows, vocabularySize).to(device);
+            using var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels);
+
+            totalLoss += loss.item<float>() * chunk.Count;
+            totalCount += chunk.Count;
+        }
+
+        return totalLoss / totalCount;
     }
 
     private static Tensor LoadCacheBatch(PreprocessedDatasetCacheReader cache, IReadOnlyList<int> indices, int inputSize)
