@@ -6,6 +6,7 @@
 
   <ItemGroup>
     <PackageReference Include="OnnxSharp" Version="0.3.2" />
+    <PackageReference Include="Spectre.Console" Version="0.57.2" />
     <PackageReference Include="System.CommandLine" Version="2.0.10" />
     <PackageReference Include="TorchSharp" Version="0.107.0" />
   </ItemGroup>

@@ -1,3 +1,4 @@
+using Spectre.Console;
 using UnbooruTagger.Core.Dataset;
 using UnbooruTagger.Core.Encoding;
 using UnbooruTagger.Training.Checkpoints;
@@ -76,7 +77,7 @@ public static class AddTagCommandHandler
         }
         else
         {
-            Console.WriteLine($"Only {manifest.Entries.Count} images — too few for a validation split, running the full {steps}-step count without early stopping.");
+            AnsiConsole.MarkupLineInterpolated($"Only {manifest.Entries.Count} images — too few for a validation split, running the full {steps}-step count without early stopping.");
         }
 
         var earlyStopping = new EarlyStopping(earlyStoppingPatience);
@@ -92,45 +93,62 @@ public static class AddTagCommandHandler
             Checkpoint.Save(checkpointDir, imageTower, config, vocabulary, embeddings);
         }
 
-        for (var step = 0; step < steps; step++)
-        {
-            var (pooled, _) = imageTower.forward(trainingPixelBatch);
-            var tagEmbeddings = tagTower.forward(allTagIndices);
-            var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, trainingLabels);
+        var result = 0;
 
-            optimizer.zero_grad();
-            loss.backward();
-            optimizer.step();
-
-            var lossValue = loss.item<float>();
-            if (float.IsNaN(lossValue))
+        AnsiConsole.Progress()
+            .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new RemainingTimeColumn())
+            .Start(ctx =>
             {
-                Console.Error.WriteLine($"step {step + 1}/{steps}: {NaNGuard.Message}");
-                return 1;
-            }
+                var task = ctx.AddTask($"Fine-tuning '{tag}'", maxValue: steps);
 
-            Console.WriteLine($"step {step + 1}/{steps} loss {lossValue:F4}");
+                for (var step = 0; step < steps; step++)
+                {
+                    var (pooled, _) = imageTower.forward(trainingPixelBatch);
+                    var tagEmbeddings = tagTower.forward(allTagIndices);
+                    var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, trainingLabels);
 
-            if (step % 20 == 19)
-                SaveProgress();
+                    optimizer.zero_grad();
+                    loss.backward();
+                    optimizer.step();
 
-            if (!useEarlyStopping)
-                continue;
+                    var lossValue = loss.item<float>();
+                    if (float.IsNaN(lossValue))
+                    {
+                        AnsiConsole.MarkupLineInterpolated($"[red]step {step + 1}/{steps}: {NaNGuard.Message}[/]");
+                        result = 1;
+                        return;
+                    }
 
-            using var _ = no_grad();
-            var (valPooled, _) = imageTower.forward(validationPixelBatch!);
-            var valTagEmbeddings = tagTower.forward(allTagIndices);
-            var validationLoss = SigmoidContrastiveLoss.Compute(valPooled, valTagEmbeddings, validationLabels!).item<float>();
+                    task.Increment(1);
+                    // G4 (not F4): a diverging-but-not-yet-NaN loss can be enormous, and
+                    // F4's full decimal expansion of a huge float is long enough to wrap
+                    // the terminal line and corrupt Spectre's live-region redraw.
+                    task.Description = $"Fine-tuning '{tag}' step {step + 1}/{steps} loss {lossValue:G4}";
 
-            if (earlyStopping.ShouldStop(validationLoss))
-            {
-                Console.WriteLine($"Early stopping: validation loss stopped improving after step {step + 1}.");
-                break;
-            }
-        }
+                    if (step % 20 == 19)
+                        SaveProgress();
+
+                    if (!useEarlyStopping)
+                        continue;
+
+                    using var _ = no_grad();
+                    var (valPooled, _) = imageTower.forward(validationPixelBatch!);
+                    var valTagEmbeddings = tagTower.forward(allTagIndices);
+                    var validationLoss = SigmoidContrastiveLoss.Compute(valPooled, valTagEmbeddings, validationLabels!).item<float>();
+
+                    if (earlyStopping.ShouldStop(validationLoss))
+                    {
+                        AnsiConsole.MarkupLineInterpolated($"[yellow]Early stopping: validation loss stopped improving after step {step + 1}.[/]");
+                        break;
+                    }
+                }
+            });
 
         validationPixelBatch?.Dispose();
         validationLabels?.Dispose();
+
+        if (result != 0)
+            return result;
 
         vocabulary.PromoteIfThresholdMet(tag, minImageThreshold);
         SaveProgress();

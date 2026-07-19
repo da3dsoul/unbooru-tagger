@@ -1,4 +1,5 @@
 using System.CommandLine;
+using Spectre.Console;
 using UnbooruTagger.Data;
 
 var connectionStringOption = new Option<string>("--connection-string") { Description = "unbooru SQL Server connection string", Required = true };
@@ -22,12 +23,15 @@ buildSmallCommand.SetAction(async (parseResult, cancellationToken) =>
     var outputDirectory = parseResult.GetRequiredValue(outOption);
     using var context = UnbooruContextFactory.Create(parseResult.GetRequiredValue(connectionStringOption));
 
-    var manifest = await SmallDatasetBuilder.BuildAsync(
-        context,
-        parseResult.GetRequiredValue(tagsOption),
-        outputDirectory,
-        parseResult.GetValue(smallMaxImagesOption),
-        cancellationToken: cancellationToken);
+    var manifest = await AnsiConsole.Progress()
+        .Columns(ProgressBarColumns.Default)
+        .StartAsync(ctx => SmallDatasetBuilder.BuildAsync(
+            context,
+            parseResult.GetRequiredValue(tagsOption),
+            outputDirectory,
+            parseResult.GetValue(smallMaxImagesOption),
+            progress: ProgressBarColumns.AddTask(ctx, "Writing images"),
+            cancellationToken: cancellationToken));
 
     Console.WriteLine($"Wrote {manifest.Entries.Count} images to '{outputDirectory}'.");
     return 0;
@@ -52,23 +56,24 @@ buildLargeCommand.Options.Add(pageSizeOption);
 buildLargeCommand.SetAction(async (parseResult, cancellationToken) =>
 {
     var outputDirectory = parseResult.GetRequiredValue(outOption);
-    using var context = UnbooruContextFactory.Create(parseResult.GetRequiredValue(connectionStringOption));
+    var connectionString = parseResult.GetRequiredValue(connectionStringOption);
+    using var context = UnbooruContextFactory.Create(connectionString);
 
-    var progress = new Progress<int>(count =>
-    {
-        if (count % 100 == 0)
-            Console.WriteLine($"Preprocessed {count} images...");
-    });
-
-    await LargeDatasetPreprocessor.BuildAsync(
-        context,
-        outputDirectory,
-        parseResult.GetRequiredValue(inputSizeOption),
-        parseResult.GetValue(largeMaxImagesOption),
-        parseResult.GetRequiredValue(minImagesPerTagOption),
-        progress,
-        cancellationToken,
-        parseResult.GetRequiredValue(pageSizeOption));
+    await AnsiConsole.Progress()
+        .Columns(ProgressBarColumns.LargeCacheColumns)
+        .StartAsync(ctx => LargeDatasetPreprocessor.BuildAsync(
+            context,
+            outputDirectory,
+            parseResult.GetRequiredValue(inputSizeOption),
+            parseResult.GetValue(largeMaxImagesOption),
+            parseResult.GetRequiredValue(minImagesPerTagOption),
+            ProgressBarColumns.AddLargeCacheTasks(ctx),
+            cancellationToken,
+            parseResult.GetRequiredValue(pageSizeOption),
+            // A separate connection per blob-fetch chunk (see BuildAsync) so the slow
+            // part of a page's fetch -- transferring full-resolution image bytes --
+            // isn't serialized behind a single connection.
+            contextFactory: () => UnbooruContextFactory.Create(connectionString)));
 
     Console.WriteLine($"Done. Cache written to '{outputDirectory}'.");
     return 0;
