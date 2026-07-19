@@ -20,6 +20,7 @@ public static class SmallDatasetBuilder
         string outputDirectory,
         int? maxImages = null,
         Random? random = null,
+        IProgress<ImageBuildProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
         var targetTagIds = await context.ImageTags
@@ -55,6 +56,7 @@ public static class SmallDatasetBuilder
         Directory.CreateDirectory(imagesDirectory);
 
         var entries = new List<DatasetImageEntry>();
+        var written = 0;
         foreach (var image in images)
         {
             // Extension doesn't matter — SkiaSharp sniffs format from content, and
@@ -64,6 +66,9 @@ public static class SmallDatasetBuilder
 
             var tags = image.TagSources.Select(link => link.Tag.Name).Distinct().ToList();
             entries.Add(new DatasetImageEntry(imagePath, tags));
+
+            written++;
+            progress?.Report(new ImageBuildProgress(written, images.Count));
         }
 
         var manifest = new DatasetManifest(entries);

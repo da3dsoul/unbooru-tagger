@@ -1,3 +1,4 @@
+using Spectre.Console;
 using UnbooruTagger.Core.Dataset;
 using UnbooruTagger.Core.Embedding;
 using UnbooruTagger.Core.Vocabulary;
@@ -78,57 +79,71 @@ public static class TrainCommandHandler
         var earlyStopping = new EarlyStopping(earlyStoppingPatience);
 
         var stepsPerEpoch = Math.Max(1, trainingIndices.Count / batchSize);
-        for (var epoch = 0; epoch < epochs; epoch++)
-        {
-            for (var step = 0; step < stepsPerEpoch; step++)
+        var result = 0;
+
+        AnsiConsole.Progress()
+            .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new RemainingTimeColumn())
+            .Start(ctx =>
             {
-                var localBatchIndices = sampler.SampleBatch(batchSize);
-                var globalBatchIndices = localBatchIndices.Select(li => trainingIndices[li]).ToList();
+                var task = ctx.AddTask("Training", maxValue: epochs * stepsPerEpoch);
 
-                using var pixelBatch = loadBatch(globalBatchIndices).to(device);
-                var (pooled, _) = imageTower.forward(pixelBatch);
-                var tagEmbeddings = tagTower.forward(allTagIndices);
-
-                var batchTagRows = localBatchIndices.Select(li => trainingTagRows[li]).ToList();
-                using var labels = BatchLabelBuilder.Build(batchTagRows, vocabulary.Records.Count).to(device);
-                var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels);
-
-                optimizer.zero_grad();
-                loss.backward();
-                optimizer.step();
-
-                var lossValue = loss.item<float>();
-                if (float.IsNaN(lossValue))
+                for (var epoch = 0; epoch < epochs; epoch++)
                 {
-                    Console.Error.WriteLine($"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch}: {NaNGuard.Message}");
-                    return 1;
+                    for (var step = 0; step < stepsPerEpoch; step++)
+                    {
+                        var localBatchIndices = sampler.SampleBatch(batchSize);
+                        var globalBatchIndices = localBatchIndices.Select(li => trainingIndices[li]).ToList();
+
+                        using var pixelBatch = loadBatch(globalBatchIndices).to(device);
+                        var (pooled, _) = imageTower.forward(pixelBatch);
+                        var tagEmbeddings = tagTower.forward(allTagIndices);
+
+                        var batchTagRows = localBatchIndices.Select(li => trainingTagRows[li]).ToList();
+                        using var labels = BatchLabelBuilder.Build(batchTagRows, vocabulary.Records.Count).to(device);
+                        var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels);
+
+                        optimizer.zero_grad();
+                        loss.backward();
+                        optimizer.step();
+
+                        var lossValue = loss.item<float>();
+                        if (float.IsNaN(lossValue))
+                        {
+                            AnsiConsole.MarkupLineInterpolated($"[red]epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch}: {NaNGuard.Message}[/]");
+                            result = 1;
+                            return;
+                        }
+
+                        task.Increment(1);
+                        // G4 (not F4): a diverging-but-not-yet-NaN loss can be enormous, and
+                        // F4's full decimal expansion of a huge float is long enough to wrap
+                        // the terminal line and corrupt Spectre's live-region redraw.
+                        task.Description = $"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch} loss {lossValue:G4}";
+                    }
+
+                    // Save after every epoch, not just at the end: a long run (especially on
+                    // GPU) can be killed, crash, or lose its SSH session partway through, and
+                    // without this, all completed work would be unrecoverable.
+                    SaveCheckpoint(checkpointDir, imageTower, tagTower, embeddingDim, resolvedInputSize, vocabulary);
+
+                    if (validationIndices.Count == 0)
+                    {
+                        AnsiConsole.MarkupLine("Not enough images for a validation split — running the full epoch count without early stopping.");
+                        continue;
+                    }
+
+                    var validationLoss = Evaluate(imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count, device, batchSize);
+                    AnsiConsole.MarkupLineInterpolated($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:G4}");
+
+                    if (earlyStopping.ShouldStop(validationLoss))
+                    {
+                        AnsiConsole.MarkupLineInterpolated($"[yellow]Early stopping: validation loss stopped improving after epoch {epoch + 1}.[/]");
+                        break;
+                    }
                 }
+            });
 
-                Console.WriteLine($"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch} loss {lossValue:F4}");
-            }
-
-            // Save after every epoch, not just at the end: a long run (especially on
-            // GPU) can be killed, crash, or lose its SSH session partway through, and
-            // without this, all completed work would be unrecoverable.
-            SaveCheckpoint(checkpointDir, imageTower, tagTower, embeddingDim, resolvedInputSize, vocabulary);
-
-            if (validationIndices.Count == 0)
-            {
-                Console.WriteLine("Not enough images for a validation split — running the full epoch count without early stopping.");
-                continue;
-            }
-
-            var validationLoss = Evaluate(imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count, device, batchSize);
-            Console.WriteLine($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:F4}");
-
-            if (earlyStopping.ShouldStop(validationLoss))
-            {
-                Console.WriteLine($"Early stopping: validation loss stopped improving after epoch {epoch + 1}.");
-                break;
-            }
-        }
-
-        return 0;
+        return result;
     }
 
     private static void SaveCheckpoint(string checkpointDir, ImageTower imageTower, TagTower tagTower, int embeddingDim, int inputSize, TagVocabulary vocabulary)
