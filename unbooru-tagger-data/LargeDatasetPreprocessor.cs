@@ -13,7 +13,11 @@ namespace UnbooruTagger.Data;
 /// directly into a <see cref="PreprocessedDatasetCache"/>, instead of leaving
 /// Training to re-decode the same images on every epoch. This is the
 /// "maximum speed" mode; "maximum accuracy" comes from pulling the full corpus
-/// rather than a capped sample.
+/// rather than a capped sample. When a cap is given, selection is tag-coverage-aware
+/// (see <see cref="TagCoverageSampleSelector"/>) rather than an arbitrary ImageId-ordered
+/// prefix, so a capped cache still gives every known tag a fair shot at training —
+/// CLAUDE.md's oversampling batch sampler can only rebalance gradients for tags that
+/// actually made it into the cache in the first place.
 /// </summary>
 public static class LargeDatasetPreprocessor
 {
@@ -22,6 +26,7 @@ public static class LargeDatasetPreprocessor
         string outputDirectory,
         int inputSize,
         int? maxImages = null,
+        int minImagesPerTag = 15,
         IProgress<int>? progress = null,
         CancellationToken cancellationToken = default)
     {
@@ -36,7 +41,22 @@ public static class LargeDatasetPreprocessor
             .OrderBy(i => i.ImageId);
 
         if (maxImages.HasValue)
-            query = query.Take(maxImages.Value);
+        {
+            // A plain ImageId-ordered Take() has no relationship to tag distribution and
+            // can silently drop a tag's images entirely — spend the capped budget on tag
+            // coverage instead (see TagCoverageSampleSelector).
+            var allImageTags = await context.Images
+                .AsNoTracking()
+                .Select(i => new { i.ImageId, TagNames = i.TagSources.Select(link => link.Tag.Name).Distinct().ToList() })
+                .ToListAsync(cancellationToken);
+
+            var selectedIds = TagCoverageSampleSelector.Select(
+                allImageTags.Select(i => (i.ImageId, (IReadOnlyList<string>)i.TagNames)).ToList(),
+                maxImages.Value,
+                minImagesPerTag);
+
+            query = query.Where(i => selectedIds.Contains(i.ImageId));
+        }
 
         using var writer = new PreprocessedDatasetCacheWriter(outputDirectory, inputSize);
 
