@@ -11,6 +11,7 @@ public sealed class TagVocabulary
 {
     private readonly Dictionary<string, TagRecord> _byTag;
     private readonly List<TagRecord> _byRow;
+    private readonly List<TagRecord> _pendingNewRecords = [];
 
     private TagVocabulary(List<TagRecord> records)
     {
@@ -39,6 +40,7 @@ public sealed class TagVocabulary
         var record = new TagRecord { RowIndex = _byRow.Count, Tag = tag };
         _byRow.Add(record);
         _byTag.Add(tag, record);
+        _pendingNewRecords.Add(record);
         return record;
     }
 
@@ -54,17 +56,73 @@ public sealed class TagVocabulary
             record.Status = TagStatus.Trained;
     }
 
-    public static TagVocabulary Load(string path)
+    /// <summary>
+    /// Loads the base snapshot at <paramref name="path"/> and, if <paramref name="deltaPath"/>
+    /// is given and exists, replays tags appended via <see cref="SaveDelta"/> since that
+    /// snapshot was last compacted by <see cref="Save"/> on top of it.
+    /// </summary>
+    public static TagVocabulary Load(string path, string? deltaPath = null)
     {
         var json = File.ReadAllText(path);
         var records = JsonSerializer.Deserialize<List<TagRecord>>(json)
                       ?? throw new InvalidDataException($"'{path}' did not contain a valid tag vocabulary.");
-        return new TagVocabulary(records.OrderBy(r => r.RowIndex).ToList());
+        var vocabulary = new TagVocabulary(records.OrderBy(r => r.RowIndex).ToList());
+
+        if (deltaPath is not null && File.Exists(deltaPath))
+        {
+            foreach (var line in File.ReadLines(deltaPath))
+            {
+                if (line.Length == 0)
+                    continue;
+
+                var record = JsonSerializer.Deserialize<TagRecord>(line)
+                             ?? throw new InvalidDataException($"'{deltaPath}' contains an invalid tag vocabulary delta line.");
+                if (vocabulary._byTag.ContainsKey(record.Tag))
+                    continue;
+
+                vocabulary._byRow.Add(record);
+                vocabulary._byTag.Add(record.Tag, record);
+            }
+        }
+
+        return vocabulary;
     }
 
+    /// <summary>
+    /// Appends only the tags added since the vocabulary was created/loaded or since the
+    /// last <see cref="SaveDelta"/> call — O(new tags), not O(vocabulary size). Lets a
+    /// long build checkpoint new row assignments after every page (needed so a resumed
+    /// run reuses the same RowIndex for tags already baked into a cache's tag-row labels)
+    /// without <see cref="Save"/>'s full-file rewrite cost compounding as the vocabulary
+    /// grows into the hundreds of thousands of tags (CLAUDE.md long-tail).
+    /// </summary>
+    public void SaveDelta(string deltaPath)
+    {
+        if (_pendingNewRecords.Count == 0)
+            return;
+
+        using (var writer = new StreamWriter(new FileStream(deltaPath, FileMode.Append, FileAccess.Write)))
+        {
+            foreach (var record in _pendingNewRecords)
+                writer.WriteLine(JsonSerializer.Serialize(record));
+        }
+
+        _pendingNewRecords.Clear();
+    }
+
+    /// <summary>
+    /// Writes the full, compacted snapshot, including tags previously appended via
+    /// <see cref="SaveDelta"/>. Callers that use <see cref="SaveDelta"/> for per-page
+    /// checkpointing should call this once the run finishes and delete the delta file, so
+    /// the next <see cref="Load"/> starts from a clean, fully up-to-date base snapshot.
+    /// </summary>
     public void Save(string path)
     {
         var json = JsonSerializer.Serialize(_byRow, new JsonSerializerOptions { WriteIndented = true });
         File.WriteAllText(path, json);
+
+        // Everything pending is now captured in the base snapshot, so it shouldn't be
+        // re-appended by a later SaveDelta call.
+        _pendingNewRecords.Clear();
     }
 }

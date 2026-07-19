@@ -31,20 +31,36 @@ public static class ImagePreprocessing
 
     private static float[] Normalize(SKBitmap original, int inputSize)
     {
-        using var resized = original.Resize(new SKImageInfo(inputSize, inputSize), SKSamplingOptions.Default)
+        // Rgba8888/Unpremul so the raw byte layout is known (R,G,B,A per pixel)
+        // regardless of platform-native decode format, and pixel values match what
+        // GetPixel used to hand back (SKColor is always unpremultiplied) — needed to
+        // read the buffer directly below instead of going through GetPixel per pixel.
+        var resizeInfo = new SKImageInfo(inputSize, inputSize, SKColorType.Rgba8888, SKAlphaType.Unpremul);
+        using var resized = original.Resize(resizeInfo, SKSamplingOptions.Default)
             ?? throw new InvalidOperationException("Failed to resize image.");
 
         var channelSize = inputSize * inputSize;
         var flat = new float[3 * channelSize];
 
+        // Direct pixel-buffer access instead of GetPixel(x, y) per pixel: GetPixel's
+        // per-call overhead (bounds checks, color conversion) dwarfs decode+resize cost
+        // for a 224x224+ image, and this is the hottest loop in the whole preprocessing
+        // pipeline since it runs once per image in the entire corpus.
+        var pixels = resized.GetPixelSpan();
+        var rowBytes = resized.RowBytes;
+        const int bytesPerPixel = 4;
+
         for (var y = 0; y < inputSize; y++)
-        for (var x = 0; x < inputSize; x++)
         {
-            var pixel = resized.GetPixel(x, y);
-            var pixelIndex = y * inputSize + x;
-            flat[(0 * channelSize) + pixelIndex] = (pixel.Red / 255f - Mean[0]) / Std[0];
-            flat[(1 * channelSize) + pixelIndex] = (pixel.Green / 255f - Mean[1]) / Std[1];
-            flat[(2 * channelSize) + pixelIndex] = (pixel.Blue / 255f - Mean[2]) / Std[2];
+            var rowStart = y * rowBytes;
+            for (var x = 0; x < inputSize; x++)
+            {
+                var offset = rowStart + x * bytesPerPixel;
+                var pixelIndex = y * inputSize + x;
+                flat[(0 * channelSize) + pixelIndex] = (pixels[offset] / 255f - Mean[0]) / Std[0];
+                flat[(1 * channelSize) + pixelIndex] = (pixels[offset + 1] / 255f - Mean[1]) / Std[1];
+                flat[(2 * channelSize) + pixelIndex] = (pixels[offset + 2] / 255f - Mean[2]) / Std[2];
+            }
         }
 
         return flat;

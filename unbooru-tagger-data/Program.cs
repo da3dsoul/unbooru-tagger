@@ -40,13 +40,15 @@ var minImagesPerTagOption = new Option<int>("--min-images-per-tag")
     Description = "When --max-images caps the corpus, images to reserve per tag (rarest first) so every known tag gets a fair shot at training",
     DefaultValueFactory = _ => 15
 };
+var pageSizeOption = new Option<int>("--page-size") { Description = "Images pulled from the DB per round-trip; a run resumes after this many images on a crash/connection drop", DefaultValueFactory = _ => 500 };
 
-var buildLargeCommand = new Command("build-large-cache", "Preprocess the full (or a capped) corpus into a fast-loading training cache");
+var buildLargeCommand = new Command("build-large-cache", "Preprocess the full (or a capped) corpus into a fast-loading training cache. Re-running against the same --out directory resumes an interrupted run.");
 buildLargeCommand.Options.Add(connectionStringOption);
 buildLargeCommand.Options.Add(outOption);
 buildLargeCommand.Options.Add(inputSizeOption);
 buildLargeCommand.Options.Add(largeMaxImagesOption);
 buildLargeCommand.Options.Add(minImagesPerTagOption);
+buildLargeCommand.Options.Add(pageSizeOption);
 buildLargeCommand.SetAction(async (parseResult, cancellationToken) =>
 {
     var outputDirectory = parseResult.GetRequiredValue(outOption);
@@ -65,7 +67,8 @@ buildLargeCommand.SetAction(async (parseResult, cancellationToken) =>
         parseResult.GetValue(largeMaxImagesOption),
         parseResult.GetRequiredValue(minImagesPerTagOption),
         progress,
-        cancellationToken);
+        cancellationToken,
+        parseResult.GetRequiredValue(pageSizeOption));
 
     Console.WriteLine($"Done. Cache written to '{outputDirectory}'.");
     return 0;

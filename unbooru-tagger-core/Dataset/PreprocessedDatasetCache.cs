@@ -11,28 +11,81 @@ namespace UnbooruTagger.Core.Dataset;
 public static class PreprocessedDatasetCache
 {
     internal const string PixelsFileName = "images.bin";
-    internal const string LabelsFileName = "tag_rows.json";
+    internal const string LabelsFileName = "tag_rows.jsonl";
     internal const int HeaderBytes = sizeof(int) * 2;
 }
 
+/// <summary>
+/// Appends to <see cref="PreprocessedDatasetCache"/>'s on-disk files. Labels are
+/// stored one JSON array per line (not one big JSON array) specifically so they can
+/// be appended without rewriting the whole file — needed for <see cref="OpenOrCreate"/>
+/// to resume a run that was interrupted partway through a multi-million-image corpus.
+/// </summary>
 public sealed class PreprocessedDatasetCacheWriter : IDisposable
 {
     private readonly FileStream _pixelStream;
     private readonly BinaryWriter _pixelWriter;
-    private readonly List<int[]> _tagRows = [];
+    private readonly StreamWriter _labelWriter;
     private readonly int _inputSize;
-    private readonly string _directory;
+
+    /// <summary>Images durably committed as of the last <see cref="Flush"/> (or resumed from a prior run).</summary>
+    public int ImageCount { get; private set; }
 
     public PreprocessedDatasetCacheWriter(string directory, int inputSize)
+        : this(directory, inputSize, resume: false)
     {
-        _directory = directory;
+    }
+
+    /// <summary>
+    /// Opens an existing cache directory to continue appending where a prior run left
+    /// off, or creates a fresh one if <paramref name="directory"/> is empty/missing.
+    /// Any bytes/lines left over from a page that started but never finished a
+    /// <see cref="Flush"/> are dropped, so resumed appends start exactly at the last
+    /// confirmed image boundary.
+    /// </summary>
+    public static PreprocessedDatasetCacheWriter OpenOrCreate(string directory, int inputSize) =>
+        new(directory, inputSize, resume: true);
+
+    private PreprocessedDatasetCacheWriter(string directory, int inputSize, bool resume)
+    {
         _inputSize = inputSize;
         Directory.CreateDirectory(directory);
 
-        _pixelStream = File.Create(Path.Combine(directory, PreprocessedDatasetCache.PixelsFileName));
-        _pixelWriter = new BinaryWriter(_pixelStream);
-        _pixelWriter.Write(0); // image count placeholder, patched in Dispose once known
-        _pixelWriter.Write(inputSize);
+        var pixelPath = Path.Combine(directory, PreprocessedDatasetCache.PixelsFileName);
+        var labelPath = Path.Combine(directory, PreprocessedDatasetCache.LabelsFileName);
+
+        if (resume && File.Exists(pixelPath))
+        {
+            _pixelStream = new FileStream(pixelPath, FileMode.Open, FileAccess.ReadWrite);
+            _pixelWriter = new BinaryWriter(_pixelStream);
+
+            _pixelStream.Position = 0;
+            using (var headerReader = new BinaryReader(_pixelStream, System.Text.Encoding.UTF8, leaveOpen: true))
+            {
+                ImageCount = headerReader.ReadInt32();
+                var storedInputSize = headerReader.ReadInt32();
+                if (storedInputSize != inputSize)
+                    throw new InvalidDataException($"Cache at '{directory}' was built with input size {storedInputSize}, but {inputSize} was requested.");
+            }
+
+            var imageBytes = 3L * inputSize * inputSize * sizeof(float);
+            _pixelStream.SetLength(PreprocessedDatasetCache.HeaderBytes + ImageCount * imageBytes);
+            _pixelStream.Position = _pixelStream.Length;
+
+            var confirmedLines = File.Exists(labelPath) ? File.ReadLines(labelPath).Take(ImageCount).ToList() : [];
+            File.WriteAllLines(labelPath, confirmedLines);
+            _labelWriter = new StreamWriter(new FileStream(labelPath, FileMode.Append, FileAccess.Write));
+        }
+        else
+        {
+            _pixelStream = File.Create(pixelPath);
+            _pixelWriter = new BinaryWriter(_pixelStream);
+            _pixelWriter.Write(0); // image count placeholder, patched by Flush/Dispose
+            _pixelWriter.Write(inputSize);
+
+            _labelWriter = new StreamWriter(File.Create(labelPath));
+            ImageCount = 0;
+        }
     }
 
     /// <summary>Appends one already-normalized image (see Core.Encoding.ImagePreprocessing) and its tag row indices.</summary>
@@ -44,17 +97,32 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
 
         foreach (var value in normalizedPixels)
             _pixelWriter.Write(value);
-        _tagRows.Add(tagRows.ToArray());
+        _labelWriter.WriteLine(JsonSerializer.Serialize(tagRows));
+        ImageCount++;
+    }
+
+    /// <summary>
+    /// Durably persists everything appended so far (patches the header count and
+    /// flushes both files) so a crash loses at most the images appended since the
+    /// last call, and a subsequent <see cref="OpenOrCreate"/> resumes right here.
+    /// </summary>
+    public void Flush()
+    {
+        _pixelWriter.Flush();
+        var position = _pixelStream.Position;
+        _pixelStream.Position = 0;
+        _pixelWriter.Write(ImageCount);
+        _pixelStream.Position = position;
+        _pixelWriter.Flush();
+
+        _labelWriter.Flush();
     }
 
     public void Dispose()
     {
-        _pixelStream.Position = 0;
-        _pixelWriter.Write(_tagRows.Count);
-        _pixelWriter.Flush();
+        Flush();
         _pixelWriter.Dispose();
-
-        File.WriteAllText(Path.Combine(_directory, PreprocessedDatasetCache.LabelsFileName), JsonSerializer.Serialize(_tagRows));
+        _labelWriter.Dispose();
     }
 }
 
@@ -80,9 +148,13 @@ public sealed class PreprocessedDatasetCacheReader : IDisposable
         _imageFloats = 3 * InputSize * InputSize;
         _imageBytes = _imageFloats * sizeof(float);
 
-        var json = File.ReadAllText(Path.Combine(directory, PreprocessedDatasetCache.LabelsFileName));
-        ImageTagRows = JsonSerializer.Deserialize<List<int[]>>(json)
-                      ?? throw new InvalidDataException($"'{directory}' does not contain valid tag-row labels.");
+        // Only the first ImageCount lines are confirmed committed — a crash can leave
+        // dangling trailing lines from a page that started but never finished flushing.
+        ImageTagRows = File.ReadLines(Path.Combine(directory, PreprocessedDatasetCache.LabelsFileName))
+            .Take(ImageCount)
+            .Select(line => (IReadOnlyList<int>)(JsonSerializer.Deserialize<int[]>(line)
+                             ?? throw new InvalidDataException($"'{directory}' contains an invalid tag-row label line.")))
+            .ToList();
     }
 
     /// <summary>Reads one image's normalized pixel tensor directly off disk — the cache is never fully loaded into memory.</summary>

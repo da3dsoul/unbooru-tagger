@@ -83,7 +83,12 @@ public sealed class TagTower : Module<Tensor, Tensor>
         if (trainableEnd < totalRows)
             pieces.Add(_frozenRows.narrow(0, trainableEnd, totalRows - trainableEnd));
 
-        return pieces.Count == 1 ? pieces[0] : cat(pieces.ToArray(), dim: 0);
+        // Always go through cat, even for a single piece: cat guarantees a fresh
+        // tensor, whereas returning pieces[0] directly (the fully-trainable case,
+        // where the single piece IS _trainableRows) would hand callers the live
+        // Parameter itself. Callers wrap the result in `using` (see ExtractRows),
+        // which previously disposed _trainableRows and crashed the next forward().
+        return cat(pieces.ToArray(), dim: 0);
     }
 
     private static Tensor ToTensor(float[][] rows, int embeddingDim, Device? device)
