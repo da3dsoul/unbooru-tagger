@@ -33,7 +33,7 @@ public static class TrainCommandHandler
         double validationFraction,
         int earlyStoppingPatience,
         double localizationWeight = 0.1,
-        double localizationTemperature = 0.5,
+        double localizationTemperature = 0.35,
         double selfSupervisedWeight = 0.1)
     {
         if ((manifestPath is null) == (cacheDir is null))

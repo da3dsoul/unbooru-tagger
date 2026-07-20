@@ -24,7 +24,7 @@ var localizationWeightOption = new Option<double>("--localization-weight")
 var localizationTemperatureOption = new Option<double>("--localization-temperature")
 {
     Description = "Log-sum-exp pooling temperature for the localization loss: lower sharpens toward a max over locations, higher smooths toward plain average pooling",
-    DefaultValueFactory = _ => 0.5
+    DefaultValueFactory = _ => 0.35
 };
 var selfSupervisedWeightOption = new Option<double>("--self-supervised-weight")
 {
