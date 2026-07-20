@@ -12,6 +12,9 @@ public sealed class EarlyStopping(int patience = 3, double minDelta = 1e-4)
     private double _bestLoss = double.PositiveInfinity;
     private int _evaluationsSinceImprovement;
 
+    public double BestLoss => _bestLoss;
+    public int EvaluationsSinceImprovement => _evaluationsSinceImprovement;
+
     public bool ShouldStop(double validationLoss)
     {
         if (validationLoss < _bestLoss - minDelta)
@@ -23,5 +26,16 @@ public sealed class EarlyStopping(int patience = 3, double minDelta = 1e-4)
 
         _evaluationsSinceImprovement++;
         return _evaluationsSinceImprovement >= patience;
+    }
+
+    /// <summary>
+    /// Restores evaluation history saved by a previous run, so resuming continues the
+    /// same patience window instead of silently forgetting every earlier evaluation and
+    /// giving a diverging run <paramref name="patience"/> fresh evaluations to recover in.
+    /// </summary>
+    public void Restore(double bestLoss, int evaluationsSinceImprovement)
+    {
+        _bestLoss = bestLoss;
+        _evaluationsSinceImprovement = evaluationsSinceImprovement;
     }
 }
