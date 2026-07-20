@@ -16,6 +16,21 @@ var batchSizeOption = new Option<int>("--batch-size") { DefaultValueFactory = _ 
 var learningRateOption = new Option<double>("--lr") { DefaultValueFactory = _ => 1e-4 };
 var validationFractionOption = new Option<double>("--validation-fraction") { Description = "Fraction of the dataset held out for early-stopping evaluation", DefaultValueFactory = _ => 0.1 };
 var earlyStoppingPatienceOption = new Option<int>("--early-stopping-patience") { Description = "Epochs without validation-loss improvement before stopping", DefaultValueFactory = _ => 3 };
+var localizationWeightOption = new Option<double>("--localization-weight")
+{
+    Description = "Weight of the per-location (MIL/log-sum-exp) auxiliary loss that directly rewards sharp spatial responses instead of leaving localization as a side effect of pooling. 0 disables it.",
+    DefaultValueFactory = _ => 0.1
+};
+var localizationTemperatureOption = new Option<double>("--localization-temperature")
+{
+    Description = "Log-sum-exp pooling temperature for the localization loss: lower sharpens toward a max over locations, higher smooths toward plain average pooling",
+    DefaultValueFactory = _ => 0.5
+};
+var selfSupervisedWeightOption = new Option<double>("--self-supervised-weight")
+{
+    Description = "Weight of the label-free SimSiam-style consistency loss between two augmented crops of the same image. 0 disables it (skips the extra forward passes entirely).",
+    DefaultValueFactory = _ => 0.1
+};
 
 var trainCommand = new Command("train", "Full/periodic fine-tune pass over a dataset manifest or preprocessed cache");
 trainCommand.Options.Add(manifestOption);
@@ -28,6 +43,9 @@ trainCommand.Options.Add(batchSizeOption);
 trainCommand.Options.Add(learningRateOption);
 trainCommand.Options.Add(validationFractionOption);
 trainCommand.Options.Add(earlyStoppingPatienceOption);
+trainCommand.Options.Add(localizationWeightOption);
+trainCommand.Options.Add(localizationTemperatureOption);
+trainCommand.Options.Add(selfSupervisedWeightOption);
 trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
     parseResult.GetValue(manifestOption),
     parseResult.GetValue(cacheDirOption),
@@ -38,7 +56,10 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
     parseResult.GetRequiredValue(batchSizeOption),
     parseResult.GetRequiredValue(learningRateOption),
     parseResult.GetRequiredValue(validationFractionOption),
-    parseResult.GetRequiredValue(earlyStoppingPatienceOption)));
+    parseResult.GetRequiredValue(earlyStoppingPatienceOption),
+    parseResult.GetRequiredValue(localizationWeightOption),
+    parseResult.GetRequiredValue(localizationTemperatureOption),
+    parseResult.GetRequiredValue(selfSupervisedWeightOption)));
 
 var tagArgument = new Argument<string>("tag") { Description = "The new tag to add" };
 var imagesOption = new Option<string>("--images") { Description = "Dataset manifest of the newly tagged images", Required = true };

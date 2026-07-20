@@ -31,7 +31,10 @@ public static class TrainCommandHandler
         int batchSize,
         double learningRate,
         double validationFraction,
-        int earlyStoppingPatience)
+        int earlyStoppingPatience,
+        double localizationWeight = 0.1,
+        double localizationTemperature = 0.5,
+        double selfSupervisedWeight = 0.1)
     {
         if ((manifestPath is null) == (cacheDir is null))
             throw new ArgumentException("Provide exactly one of --manifest or --cache-dir.");
@@ -126,7 +129,13 @@ public static class TrainCommandHandler
             tagTower = TagTower.CreateFullyTrainable(initialRows, embeddingDim, device);
         }
 
-        var optimizer = optim.Adam(imageTower.parameters().Concat(tagTower.parameters()).ToArray(), lr: learningRate);
+        // Not checkpointed/resumed: it only shapes how the image tower trains (see the
+        // self-supervised loss below), never reaches the exported model, and is cheap
+        // enough to relearn from scratch within a handful of steps after a resume.
+        var predictionHead = new PredictionHead(embeddingDim, Math.Max(embeddingDim / 4, 32), device);
+
+        var optimizer = optim.Adam(
+            imageTower.parameters().Concat(tagTower.parameters()).Concat(predictionHead.parameters()).ToArray(), lr: learningRate);
         if (resumingOptimizerState)
             TrainingState.LoadOptimizerState(checkpointDir, optimizer);
 
@@ -163,12 +172,28 @@ public static class TrainCommandHandler
                             var globalBatchIndices = localBatchIndices.Select(li => trainingIndices[li]).ToList();
 
                             using var pixelBatch = loadBatch(globalBatchIndices).to(device);
-                            var (pooled, _) = imageTower.forward(pixelBatch);
+                            var (pooled, spatial) = imageTower.forward(pixelBatch);
                             var tagEmbeddings = tagTower.forward(allTagIndices);
 
                             var batchTagRows = localBatchIndices.Select(li => trainingTagRows[li]).ToList();
                             using var labels = BatchLabelBuilder.Build(batchTagRows, vocabulary.Records.Count).to(device);
                             var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels);
+
+                            if (localizationWeight > 0)
+                                loss += localizationWeight * SigmoidContrastiveLoss.ComputeLocalized(spatial, tagEmbeddings, labels, (float)localizationTemperature);
+
+                            if (selfSupervisedWeight > 0)
+                            {
+                                // Two independent crop+flip views of the same already-loaded batch --
+                                // no extra image I/O, just extra forward passes through imageTower.
+                                using var viewA = RandomCropAugmentation.Apply(pixelBatch);
+                                using var viewB = RandomCropAugmentation.Apply(pixelBatch);
+                                var (pooledA, _) = imageTower.forward(viewA);
+                                var (pooledB, _) = imageTower.forward(viewB);
+                                var predictionA = predictionHead.forward(pooledA);
+                                var predictionB = predictionHead.forward(pooledB);
+                                loss += selfSupervisedWeight * SelfSupervisedConsistencyLoss.Compute(pooledA, predictionA, pooledB, predictionB);
+                            }
 
                             optimizer.zero_grad();
                             loss.backward();
