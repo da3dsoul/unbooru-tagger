@@ -149,103 +149,93 @@ public static class TrainCommandHandler
         }
 
         AnsiConsole.Progress()
-            .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new RemainingTimeColumn())
+            .Columns(TrainingProgressColumns.Columns)
             .Start(ctx =>
             {
-                var task = ctx.AddTask("Training", maxValue: epochs * stepsPerEpoch);
-                task.Value = startEpoch * stepsPerEpoch;
-
-                // A second row for whatever's happening between training steps —
-                // checkpoint save and validation are both silent otherwise, and both can
-                // take long enough (validation especially: a full pass over the held-out
-                // split) that the "Training" row above sits frozen at the last completed
-                // step's value for the whole time, which reads as a hang.
-                var phaseTask = ctx.AddTask("Phase");
-                phaseTask.IsIndeterminate = true;
-
-                for (var epoch = startEpoch; epoch < epochs; epoch++)
+                var reporter = TrainingProgressColumns.AddTasks(ctx, epochs * stepsPerEpoch, startEpoch * stepsPerEpoch);
+                try
                 {
-                    phaseTask.IsIndeterminate = true;
-                    phaseTask.Description = $"epoch {epoch + 1}/{epochs}: training";
-
-                    for (var step = 0; step < stepsPerEpoch; step++)
+                    for (var epoch = startEpoch; epoch < epochs; epoch++)
                     {
-                        var localBatchIndices = sampler.SampleBatch(batchSize);
-                        var globalBatchIndices = localBatchIndices.Select(li => trainingIndices[li]).ToList();
-
-                        using var pixelBatch = loadBatch(globalBatchIndices).to(device);
-                        var (pooled, _) = imageTower.forward(pixelBatch);
-                        var tagEmbeddings = tagTower.forward(allTagIndices);
-
-                        var batchTagRows = localBatchIndices.Select(li => trainingTagRows[li]).ToList();
-                        using var labels = BatchLabelBuilder.Build(batchTagRows, vocabulary.Records.Count).to(device);
-                        var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels);
-
-                        optimizer.zero_grad();
-                        loss.backward();
-                        optimizer.step();
-
-                        var lossValue = loss.item<float>();
-                        if (float.IsNaN(lossValue))
+                        for (var step = 0; step < stepsPerEpoch; step++)
                         {
-                            AnsiConsole.MarkupLineInterpolated($"[red]epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch}: {NaNGuard.Message}[/]");
-                            result = 1;
-                            return;
-                        }
+                            var localBatchIndices = sampler.SampleBatch(batchSize);
+                            var globalBatchIndices = localBatchIndices.Select(li => trainingIndices[li]).ToList();
 
-                        task.Increment(1);
-                        // G4 (not F4): a diverging-but-not-yet-NaN loss can be enormous, and
-                        // F4's full decimal expansion of a huge float is long enough to wrap
-                        // the terminal line and corrupt Spectre's live-region redraw.
-                        task.Description = $"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch} loss {lossValue:G4}";
-                    }
+                            using var pixelBatch = loadBatch(globalBatchIndices).to(device);
+                            var (pooled, _) = imageTower.forward(pixelBatch);
+                            var tagEmbeddings = tagTower.forward(allTagIndices);
 
-                    // Save after every epoch, not just at the end: a long run (especially on
-                    // GPU) can be killed, crash, or lose its SSH session partway through, and
-                    // without this, all completed work would be unrecoverable.
-                    phaseTask.IsIndeterminate = true;
-                    phaseTask.Description = $"epoch {epoch + 1}/{epochs}: saving checkpoint...";
-                    SaveCheckpoint(checkpointDir, imageTower, tagTower, embeddingDim, resolvedInputSize, vocabulary);
+                            var batchTagRows = localBatchIndices.Select(li => trainingTagRows[li]).ToList();
+                            using var labels = BatchLabelBuilder.Build(batchTagRows, vocabulary.Records.Count).to(device);
+                            var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels);
 
-                    var stopEarly = false;
-                    if (validationIndices.Count == 0)
-                    {
-                        AnsiConsole.MarkupLine("Not enough images for a validation split — running the full epoch count without early stopping.");
-                    }
-                    else
-                    {
-                        phaseTask.IsIndeterminate = false;
-                        phaseTask.MaxValue = Math.Max(1, (int)Math.Ceiling(validationIndices.Count / (double)batchSize));
-                        phaseTask.Value = 0;
-                        var validationLoss = Evaluate(
-                            imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count, device, batchSize,
-                            onBatchComplete: batchesDone =>
+                            optimizer.zero_grad();
+                            loss.backward();
+                            optimizer.step();
+
+                            var lossValue = loss.item<float>();
+                            if (float.IsNaN(lossValue))
                             {
-                                phaseTask.Value = batchesDone;
-                                phaseTask.Description = $"epoch {epoch + 1}/{epochs}: validating batch {batchesDone}/{phaseTask.MaxValue}";
-                            });
-                        AnsiConsole.MarkupLineInterpolated($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:G4}");
+                                AnsiConsole.MarkupLineInterpolated($"[red]epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch}: {NaNGuard.Message}[/]");
+                                result = 1;
+                                return;
+                            }
 
-                        if (earlyStopping.ShouldStop(validationLoss))
-                        {
-                            AnsiConsole.MarkupLineInterpolated($"[yellow]Early stopping: validation loss stopped improving after epoch {epoch + 1}.[/]");
-                            stopEarly = true;
+                            reporter.ReportStepComplete();
+                            // G4 (not F4): a diverging-but-not-yet-NaN loss can be enormous, and
+                            // F4's full decimal expansion of a huge float is long enough to wrap
+                            // the terminal line and corrupt Spectre's live-region redraw. Tracks
+                            // a real fraction of *this epoch* (not the whole run), so a run with
+                            // a huge total step count doesn't sit looking stuck near 0% for the
+                            // entire first epoch -- the Overall row above already covers that.
+                            reporter.ReportPhaseProgress($"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch} loss {lossValue:G4}", step + 1, stepsPerEpoch);
                         }
+
+                        // Save after every epoch, not just at the end: a long run (especially on
+                        // GPU) can be killed, crash, or lose its SSH session partway through, and
+                        // without this, all completed work would be unrecoverable.
+                        reporter.ReportPhase($"epoch {epoch + 1}/{epochs}: saving checkpoint...");
+                        SaveCheckpoint(checkpointDir, imageTower, tagTower, embeddingDim, resolvedInputSize, vocabulary);
+
+                        var stopEarly = false;
+                        if (validationIndices.Count == 0)
+                        {
+                            AnsiConsole.MarkupLine("Not enough images for a validation split — running the full epoch count without early stopping.");
+                        }
+                        else
+                        {
+                            var validationBatchCount = Math.Max(1, (int)Math.Ceiling(validationIndices.Count / (double)batchSize));
+                            var validationLoss = Evaluate(
+                                imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count, device, batchSize,
+                                onBatchComplete: batchesDone =>
+                                    reporter.ReportPhaseProgress($"epoch {epoch + 1}/{epochs}: validating batch {batchesDone}/{validationBatchCount}", batchesDone, validationBatchCount));
+                            AnsiConsole.MarkupLineInterpolated($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:G4}");
+
+                            if (earlyStopping.ShouldStop(validationLoss))
+                            {
+                                AnsiConsole.MarkupLineInterpolated($"[yellow]Early stopping: validation loss stopped improving after epoch {epoch + 1}.[/]");
+                                stopEarly = true;
+                            }
+                        }
+
+                        // Saved once per epoch regardless of which branch ran above, so a
+                        // resumed run always picks up this epoch's completed count and
+                        // EarlyStopping's latest history (unchanged if there was no
+                        // validation split to evaluate against).
+                        reporter.ReportPhase($"epoch {epoch + 1}/{epochs}: saving training state...");
+                        TrainingState.Save(checkpointDir, new TrainingProgress(epoch + 1, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement), optimizer);
+
+                        if (stopEarly)
+                            break;
                     }
 
-                    // Saved once per epoch regardless of which branch ran above, so a
-                    // resumed run always picks up this epoch's completed count and
-                    // EarlyStopping's latest history (unchanged if there was no
-                    // validation split to evaluate against).
-                    phaseTask.IsIndeterminate = true;
-                    phaseTask.Description = $"epoch {epoch + 1}/{epochs}: saving training state...";
-                    TrainingState.Save(checkpointDir, new TrainingProgress(epoch + 1, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement), optimizer);
-
-                    if (stopEarly)
-                        break;
+                    reporter.StopPhase();
                 }
-
-                phaseTask.StopTask();
+                finally
+                {
+                    reporter.Dispose();
+                }
             });
 
         return result;
