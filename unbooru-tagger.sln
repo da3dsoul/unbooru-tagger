@@ -13,7 +13,9 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "unbooru-tagger-training", "
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "unbooru-tagger-tests", "unbooru-tagger-tests\unbooru-tagger-tests.csproj", "{02CAF84B-16D4-4DA0-AC89-FB2372A3F7DF}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "unbooru-tagger-data", "unbooru-tagger-data\unbooru-tagger-data.csproj", "{8AF48079-F7C1-4495-9452-00CF59239C6A}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "unbooru-tagger-data-unbooru-import", "unbooru-tagger-data-unbooru-import\unbooru-tagger-data-unbooru-import.csproj", "{8AF48079-F7C1-4495-9452-00CF59239C6A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "unbooru-tagger-data-booru-downloader", "unbooru-tagger-data-booru-downloader\unbooru-tagger-data-booru-downloader.csproj", "{D4EB5F71-23C9-4536-B701-10BE3416B724}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Core", "..\unbooru\Core\Core.csproj", "{6F84C3A1-1AD0-480F-9F5A-A1CE1D9C1235}"
 EndProject
@@ -89,6 +91,18 @@ Global
 		{8AF48079-F7C1-4495-9452-00CF59239C6A}.Release|x64.Build.0 = Release|Any CPU
 		{8AF48079-F7C1-4495-9452-00CF59239C6A}.Release|x86.ActiveCfg = Release|Any CPU
 		{8AF48079-F7C1-4495-9452-00CF59239C6A}.Release|x86.Build.0 = Release|Any CPU
+		{D4EB5F71-23C9-4536-B701-10BE3416B724}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D4EB5F71-23C9-4536-B701-10BE3416B724}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D4EB5F71-23C9-4536-B701-10BE3416B724}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{D4EB5F71-23C9-4536-B701-10BE3416B724}.Debug|x64.Build.0 = Debug|Any CPU
+		{D4EB5F71-23C9-4536-B701-10BE3416B724}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{D4EB5F71-23C9-4536-B701-10BE3416B724}.Debug|x86.Build.0 = Debug|Any CPU
+		{D4EB5F71-23C9-4536-B701-10BE3416B724}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D4EB5F71-23C9-4536-B701-10BE3416B724}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D4EB5F71-23C9-4536-B701-10BE3416B724}.Release|x64.ActiveCfg = Release|Any CPU
+		{D4EB5F71-23C9-4536-B701-10BE3416B724}.Release|x64.Build.0 = Release|Any CPU
+		{D4EB5F71-23C9-4536-B701-10BE3416B724}.Release|x86.ActiveCfg = Release|Any CPU
+		{D4EB5F71-23C9-4536-B701-10BE3416B724}.Release|x86.Build.0 = Release|Any CPU
 		{6F84C3A1-1AD0-480F-9F5A-A1CE1D9C1235}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{6F84C3A1-1AD0-480F-9F5A-A1CE1D9C1235}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{6F84C3A1-1AD0-480F-9F5A-A1CE1D9C1235}.Debug|x64.ActiveCfg = Debug|Any CPU
