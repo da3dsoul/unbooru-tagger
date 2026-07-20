@@ -63,32 +63,111 @@ public static class TrainCommandHandler
 
         var tagFrequencies = ComputeTagFrequencies(imageTagRows);
 
-        var initialRows = Enumerable.Range(0, vocabulary.Records.Count)
-            .Select(_ => EmbeddingInit.RandomRow(embeddingDim))
-            .ToArray();
-
         var device = DeviceSelector.Best();
-        var imageTower = new ImageTower(embeddingDim, device: device);
-        var tagTower = TagTower.CreateFullyTrainable(initialRows, embeddingDim, device);
+
+        ImageTower imageTower;
+        TagTower tagTower;
+        var startEpoch = 0;
+        var resumedProgress = TrainingProgress.Initial;
+        var resumingOptimizerState = false;
+        if (Checkpoint.Exists(checkpointDir))
+        {
+            // Resume instead of starting over: re-running `train` against the same
+            // --checkpoint-dir after a crash/kill previously silently discarded every
+            // completed epoch's work (SaveCheckpoint wrote it, but nothing ever read it
+            // back), which is the whole point of saving a checkpoint every epoch in the
+            // first place.
+            var (loadedImageTower, config, checkpointVocabulary, embeddings) = Checkpoint.Load(checkpointDir, device);
+
+            // The embedding table's row count is baked into its saved tensor shape, so
+            // the vocabulary used from here on must be the exact one that produced it —
+            // not a fresh load of the dataset's current vocabulary, which could have
+            // grown (e.g. a still-running build-large-cache) since this checkpoint was
+            // written.
+            if (checkpointVocabulary.Records.Count != vocabulary.Records.Count)
+                throw new InvalidOperationException(
+                    $"Checkpoint at '{checkpointDir}' has {checkpointVocabulary.Records.Count} tags but the dataset vocabulary has {vocabulary.Records.Count} -- resuming would misalign tag-row indices. Use a fresh --checkpoint-dir, or a dataset that matches the one this checkpoint was trained on.");
+
+            if (config.EmbeddingDim != embeddingDim)
+                AnsiConsole.MarkupLineInterpolated($"[yellow]Resuming: checkpoint embedding dim {config.EmbeddingDim} overrides --embedding-dim {embeddingDim}.[/]");
+
+            embeddingDim = config.EmbeddingDim;
+            vocabulary = checkpointVocabulary;
+            imageTower = loadedImageTower;
+
+            var resumedRows = Enumerable.Range(0, embeddings.RowCount)
+                .Select(i => embeddings.GetRow(i).ToArray())
+                .ToArray();
+            tagTower = TagTower.CreateFullyTrainable(resumedRows, embeddingDim, device);
+
+            // Model weights resume unconditionally above (Checkpoint.Exists), but epoch
+            // count / EarlyStopping history / optimizer momentum are only there if this
+            // checkpoint was written by a build that already had this feature -- an
+            // older checkpoint directory still resumes, just with those three reset,
+            // rather than failing to resume at all.
+            if (TrainingState.Exists(checkpointDir))
+            {
+                resumedProgress = TrainingState.LoadProgress(checkpointDir);
+                startEpoch = resumedProgress.CompletedEpochs;
+                resumingOptimizerState = true;
+                AnsiConsole.MarkupLineInterpolated($"Resuming from checkpoint in '{checkpointDir}' (epoch {startEpoch}, optimizer state, early-stopping history).");
+            }
+            else
+            {
+                AnsiConsole.MarkupLineInterpolated($"[yellow]Resuming from checkpoint in '{checkpointDir}', but no training_progress.json/optimizer.dat found -- epoch count, optimizer momentum, and early-stopping history all restart from scratch.[/]");
+            }
+        }
+        else
+        {
+            var initialRows = Enumerable.Range(0, vocabulary.Records.Count)
+                .Select(_ => EmbeddingInit.RandomRow(embeddingDim))
+                .ToArray();
+            imageTower = new ImageTower(embeddingDim, device: device);
+            tagTower = TagTower.CreateFullyTrainable(initialRows, embeddingDim, device);
+        }
+
         var optimizer = optim.Adam(imageTower.parameters().Concat(tagTower.parameters()).ToArray(), lr: learningRate);
+        if (resumingOptimizerState)
+            TrainingState.LoadOptimizerState(checkpointDir, optimizer);
+
         var allTagIndices = tensor(Enumerable.Range(0, vocabulary.Records.Count).Select(i => (long)i).ToArray(), device: device);
 
         var (trainingIndices, validationIndices) = SplitForValidation(datasetCount, validationFraction);
         var trainingTagRows = trainingIndices.Select(i => imageTagRows[i]).ToList();
         var sampler = new RareTagOversamplingBatchSampler(trainingTagRows, tagFrequencies);
         var earlyStopping = new EarlyStopping(earlyStoppingPatience);
+        if (resumingOptimizerState)
+            earlyStopping.Restore(resumedProgress.EarlyStoppingBestLoss, resumedProgress.EarlyStoppingEvaluationsSinceImprovement);
 
         var stepsPerEpoch = Math.Max(1, trainingIndices.Count / batchSize);
         var result = 0;
+
+        if (startEpoch >= epochs)
+        {
+            AnsiConsole.MarkupLineInterpolated($"[yellow]Checkpoint already completed {startEpoch}/{epochs} epochs -- nothing to do. Pass a larger --epochs to continue training.[/]");
+            return result;
+        }
 
         AnsiConsole.Progress()
             .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new RemainingTimeColumn())
             .Start(ctx =>
             {
                 var task = ctx.AddTask("Training", maxValue: epochs * stepsPerEpoch);
+                task.Value = startEpoch * stepsPerEpoch;
 
-                for (var epoch = 0; epoch < epochs; epoch++)
+                // A second row for whatever's happening between training steps —
+                // checkpoint save and validation are both silent otherwise, and both can
+                // take long enough (validation especially: a full pass over the held-out
+                // split) that the "Training" row above sits frozen at the last completed
+                // step's value for the whole time, which reads as a hang.
+                var phaseTask = ctx.AddTask("Phase");
+                phaseTask.IsIndeterminate = true;
+
+                for (var epoch = startEpoch; epoch < epochs; epoch++)
                 {
+                    phaseTask.IsIndeterminate = true;
+                    phaseTask.Description = $"epoch {epoch + 1}/{epochs}: training";
+
                     for (var step = 0; step < stepsPerEpoch; step++)
                     {
                         var localBatchIndices = sampler.SampleBatch(batchSize);
@@ -124,23 +203,49 @@ public static class TrainCommandHandler
                     // Save after every epoch, not just at the end: a long run (especially on
                     // GPU) can be killed, crash, or lose its SSH session partway through, and
                     // without this, all completed work would be unrecoverable.
+                    phaseTask.IsIndeterminate = true;
+                    phaseTask.Description = $"epoch {epoch + 1}/{epochs}: saving checkpoint...";
                     SaveCheckpoint(checkpointDir, imageTower, tagTower, embeddingDim, resolvedInputSize, vocabulary);
 
+                    var stopEarly = false;
                     if (validationIndices.Count == 0)
                     {
                         AnsiConsole.MarkupLine("Not enough images for a validation split — running the full epoch count without early stopping.");
-                        continue;
                     }
-
-                    var validationLoss = Evaluate(imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count, device, batchSize);
-                    AnsiConsole.MarkupLineInterpolated($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:G4}");
-
-                    if (earlyStopping.ShouldStop(validationLoss))
+                    else
                     {
-                        AnsiConsole.MarkupLineInterpolated($"[yellow]Early stopping: validation loss stopped improving after epoch {epoch + 1}.[/]");
-                        break;
+                        phaseTask.IsIndeterminate = false;
+                        phaseTask.MaxValue = Math.Max(1, (int)Math.Ceiling(validationIndices.Count / (double)batchSize));
+                        phaseTask.Value = 0;
+                        var validationLoss = Evaluate(
+                            imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count, device, batchSize,
+                            onBatchComplete: batchesDone =>
+                            {
+                                phaseTask.Value = batchesDone;
+                                phaseTask.Description = $"epoch {epoch + 1}/{epochs}: validating batch {batchesDone}/{phaseTask.MaxValue}";
+                            });
+                        AnsiConsole.MarkupLineInterpolated($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:G4}");
+
+                        if (earlyStopping.ShouldStop(validationLoss))
+                        {
+                            AnsiConsole.MarkupLineInterpolated($"[yellow]Early stopping: validation loss stopped improving after epoch {epoch + 1}.[/]");
+                            stopEarly = true;
+                        }
                     }
+
+                    // Saved once per epoch regardless of which branch ran above, so a
+                    // resumed run always picks up this epoch's completed count and
+                    // EarlyStopping's latest history (unchanged if there was no
+                    // validation split to evaluate against).
+                    phaseTask.IsIndeterminate = true;
+                    phaseTask.Description = $"epoch {epoch + 1}/{epochs}: saving training state...";
+                    TrainingState.Save(checkpointDir, new TrainingProgress(epoch + 1, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement), optimizer);
+
+                    if (stopEarly)
+                        break;
                 }
+
+                phaseTask.StopTask();
             });
 
         return result;
@@ -165,7 +270,8 @@ public static class TrainCommandHandler
         Tensor allTagIndices,
         int vocabularySize,
         Device device,
-        int batchSize)
+        int batchSize,
+        Action<int>? onBatchComplete = null)
     {
         using var _ = no_grad();
 
@@ -173,6 +279,7 @@ public static class TrainCommandHandler
 
         double totalLoss = 0;
         var totalCount = 0;
+        var batchesDone = 0;
         for (var offset = 0; offset < validationIndices.Count; offset += batchSize)
         {
             var chunk = validationIndices.Skip(offset).Take(batchSize).ToList();
@@ -188,6 +295,9 @@ public static class TrainCommandHandler
 
             totalLoss += loss.item<float>() * chunk.Count;
             totalCount += chunk.Count;
+
+            batchesDone++;
+            onBatchComplete?.Invoke(batchesDone);
         }
 
         return totalLoss / totalCount;

@@ -20,6 +20,13 @@ public static class Checkpoint
     private const string VocabularyFileName = "tag_vocabulary.json";
     private const string EmbeddingsFileName = "tag_embeddings.bin";
 
+    /// <summary>Whether <paramref name="directory"/> holds a complete checkpoint <see cref="Load"/> can read back.</summary>
+    public static bool Exists(string directory) =>
+        File.Exists(Path.Combine(directory, ConfigFileName)) &&
+        File.Exists(Path.Combine(directory, ImageTowerFileName)) &&
+        File.Exists(Path.Combine(directory, VocabularyFileName)) &&
+        File.Exists(Path.Combine(directory, EmbeddingsFileName));
+
     public static void Save(string directory, ImageTower imageTower, ModelConfig config, TagVocabulary vocabulary, TagEmbeddingStore embeddings)
     {
         Directory.CreateDirectory(directory);
