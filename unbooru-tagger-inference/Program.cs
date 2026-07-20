@@ -22,6 +22,23 @@ var outputOption = new Option<string>("--out")
     DefaultValueFactory = _ => "heatmap.png"
 };
 
+var boxThresholdOption = new Option<float>("--box-threshold")
+{
+    Description = "Absolute floor: minimum per-location confidence required to include a spatial cell in a bounding box",
+    DefaultValueFactory = _ => 0.5f
+};
+
+var boxPercentileOption = new Option<float>("--box-percentile")
+{
+    Description = "Additionally cut within each tag's own heatmap range (0 = its weakest cell, 1 = only its single strongest) to tighten boxes around each tag's peak",
+    DefaultValueFactory = _ => 0.6f
+};
+
+var detectOutputOption = new Option<string?>("--out")
+{
+    Description = "If set, also render the detected boxes onto the image and write it as a PNG here"
+};
+
 var tagCommand = new Command("tag", "Score a single image against the tag vocabulary");
 tagCommand.Arguments.Add(imageArgument);
 tagCommand.Options.Add(modelDirOption);
@@ -51,11 +68,27 @@ heatmapCommand.SetAction(parseResult => HeatmapCommandHandler.Run(
     parseResult.GetRequiredValue(tagArgument),
     parseResult.GetRequiredValue(outputOption)));
 
+var detectCommand = new Command("detect", "Tag an image and report a rough bounding box per detected tag");
+detectCommand.Arguments.Add(imageArgument);
+detectCommand.Options.Add(modelDirOption);
+detectCommand.Options.Add(thresholdOption);
+detectCommand.Options.Add(boxThresholdOption);
+detectCommand.Options.Add(boxPercentileOption);
+detectCommand.Options.Add(detectOutputOption);
+detectCommand.SetAction(parseResult => DetectCommandHandler.Run(
+    parseResult.GetRequiredValue(modelDirOption),
+    parseResult.GetRequiredValue(imageArgument),
+    parseResult.GetRequiredValue(thresholdOption),
+    parseResult.GetRequiredValue(boxThresholdOption),
+    parseResult.GetRequiredValue(boxPercentileOption),
+    parseResult.GetValue(detectOutputOption)));
+
 var rootCommand = new RootCommand("unbooru-tagger inference CLI")
 {
     tagCommand,
     tagBatchCommand,
-    heatmapCommand
+    heatmapCommand,
+    detectCommand
 };
 
 return rootCommand.Parse(args).Invoke();
