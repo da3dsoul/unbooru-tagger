@@ -6,12 +6,11 @@ C# with [TorchSharp](https://github.com/dotnet/TorchSharp) for training
 and ONNX Runtime for inference. Unlike a fixed-head classifier (WD14
 tagger, DeepDanbooru), tags live in a learned embedding table, so new
 tags can be added later without retraining the whole model. See
-[`CLAUDE.md`](CLAUDE.md) for the full architecture rationale.
-
-> **Note:** `CLAUDE.md`'s "Stack notes" section describes a Python/PyTorch
-> training stack. That was the original plan; the implementation in this
-> repo is entirely C#/.NET (TorchSharp for training, ONNX Runtime for
-> inference). There is no Python code here.
+[`CLAUDE.md`](CLAUDE.md) for the full architecture rationale, including an
+explicit rundown of where the implementation has ended up differing from
+the original plan (entirely C#/.NET rather than Python/PyTorch being the
+biggest one — TorchSharp for training, ONNX Runtime for inference; there
+is no Python code in this repo).
 
 ## Features
 
@@ -19,11 +18,17 @@ tags can be added later without retraining the whole model. See
   back confidence values per tag.
 - **Localization** — a rough heatmap showing where in the image a given
   tag's evidence concentrates, with no bounding-box training data needed.
-- **Bounding-box detection** — approximate boxes derived from the
-  localization heatmap (newest feature, least battle-tested).
-- **Open-ended vocabulary** — add a brand-new tag by warm-starting its
-  embedding and fine-tuning just that row, without touching the rest of
-  the model.
+- **Bounding-box detection** — approximate boxes from connected components
+  over the localization heatmap, tightened without any bounding-box
+  training data via per-tag percentile thresholding and a bilateral filter
+  that snaps the heatmap to the source image's own edges. Newest feature,
+  least battle-tested.
+- **Open-ended vocabulary** — add a brand-new tag and fine-tune just that
+  row, without touching the rest of the model. The row is meant to
+  warm-start from a frozen text embedding of the tag string (see
+  `ITagTextEmbedder` in `unbooru-tagger-core`), but no CLI flag wires a
+  concrete model into that path yet — new tags currently start from small
+  random noise instead.
 - **Rare-tag aware training** — oversampling and a minimum-image
   threshold so long-tail tags aren't drowned out by common ones.
 - **Label-free localization & representation training** — an auxiliary
@@ -241,9 +246,9 @@ entirely when disabled):
   predictor head with stop-gradient on the target side. Uses no tag
   labels, just images already in the corpus.
 
-**Add a new tag** without retraining the whole model — warm-starts the
-new tag's embedding and fine-tunes only that row with the image encoder
-frozen:
+**Add a new tag** without retraining the whole model — creates the new
+tag's embedding row (random-init today, see the Features note above) and
+fine-tunes only that row with the image encoder frozen:
 
 ```sh
 dotnet run --project unbooru-tagger-training -- add-tag hatsune_miku_nurse_costume \
