@@ -44,7 +44,17 @@ var minImagesPerTagOption = new Option<int>("--min-images-per-tag")
     Description = "When --max-images caps the corpus, images to reserve per tag (rarest first) so every known tag gets a fair shot at training",
     DefaultValueFactory = _ => 15
 };
+var minTagImagesOption = new Option<int>("--min-tag-images")
+{
+    Description = "Only include tags that appear on at least this many images across the full corpus; images keep any other tags they have",
+    DefaultValueFactory = _ => 100
+};
 var pageSizeOption = new Option<int>("--page-size") { Description = "Images pulled from the DB per round-trip; a run resumes after this many images on a crash/connection drop", DefaultValueFactory = _ => 500 };
+var vocabCompactionIntervalOption = new Option<int>("--vocab-compact-interval")
+{
+    Description = "Pages between full tag_vocabulary.json compactions (the delta log is still checkpointed every page regardless)",
+    DefaultValueFactory = _ => 20
+};
 
 var buildLargeCommand = new Command("build-large-cache", "Preprocess the full (or a capped) corpus into a fast-loading training cache. Re-running against the same --out directory resumes an interrupted run.");
 buildLargeCommand.Options.Add(connectionStringOption);
@@ -52,7 +62,9 @@ buildLargeCommand.Options.Add(outOption);
 buildLargeCommand.Options.Add(inputSizeOption);
 buildLargeCommand.Options.Add(largeMaxImagesOption);
 buildLargeCommand.Options.Add(minImagesPerTagOption);
+buildLargeCommand.Options.Add(minTagImagesOption);
 buildLargeCommand.Options.Add(pageSizeOption);
+buildLargeCommand.Options.Add(vocabCompactionIntervalOption);
 buildLargeCommand.SetAction(async (parseResult, cancellationToken) =>
 {
     var outputDirectory = parseResult.GetRequiredValue(outOption);
@@ -67,9 +79,11 @@ buildLargeCommand.SetAction(async (parseResult, cancellationToken) =>
             parseResult.GetRequiredValue(inputSizeOption),
             parseResult.GetValue(largeMaxImagesOption),
             parseResult.GetRequiredValue(minImagesPerTagOption),
+            parseResult.GetRequiredValue(minTagImagesOption),
             ProgressBarColumns.AddLargeCacheTasks(ctx),
             cancellationToken,
             parseResult.GetRequiredValue(pageSizeOption),
+            parseResult.GetRequiredValue(vocabCompactionIntervalOption),
             // A separate connection per blob-fetch chunk (see BuildAsync) so the slow
             // part of a page's fetch -- transferring full-resolution image bytes --
             // isn't serialized behind a single connection.
