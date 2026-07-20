@@ -1,0 +1,290 @@
+# unbooru-tagger
+
+A multi-label anime/booru-style image tagger built on a dual-encoder,
+sigmoid-contrastive architecture (JoyTag / SigLIP-style), implemented in
+C# with [TorchSharp](https://github.com/dotnet/TorchSharp) for training
+and ONNX Runtime for inference. Unlike a fixed-head classifier (WD14
+tagger, DeepDanbooru), tags live in a learned embedding table, so new
+tags can be added later without retraining the whole model. See
+[`CLAUDE.md`](CLAUDE.md) for the full architecture rationale.
+
+> **Note:** `CLAUDE.md`'s "Stack notes" section describes a Python/PyTorch
+> training stack. That was the original plan; the implementation in this
+> repo is entirely C#/.NET (TorchSharp for training, ONNX Runtime for
+> inference). There is no Python code here.
+
+## Features
+
+- **Tagging** — score an image against the full tag vocabulary and get
+  back confidence values per tag.
+- **Localization** — a rough heatmap showing where in the image a given
+  tag's evidence concentrates, with no bounding-box training data needed.
+- **Bounding-box detection** — approximate boxes derived from the
+  localization heatmap (newest feature, least battle-tested).
+- **Open-ended vocabulary** — add a brand-new tag by warm-starting its
+  embedding and fine-tuning just that row, without touching the rest of
+  the model.
+- **Rare-tag aware training** — oversampling and a minimum-image
+  threshold so long-tail tags aren't drowned out by common ones.
+- **Label-free localization & representation training** — an auxiliary
+  MIL/log-sum-exp pooled loss that directly rewards sharp per-location
+  responses, plus a SimSiam-style self-supervised consistency loss
+  between random-crop views of the same image. Both use only the tag
+  labels/images already in the corpus — no bounding-box data needed.
+
+## Repository layout
+
+| Project | Type | Purpose |
+|---|---|---|
+| `unbooru-tagger-core` | library | Shared model-bundle loading, ONNX image encoding, tag vocabulary/embedding storage, SigLIP-style scoring, heatmap/box generation, dataset manifest & cache formats. |
+| `unbooru-tagger-data` | CLI | Pulls images/tags from the [unbooru](#prerequisites) database and builds training datasets/caches. |
+| `unbooru-tagger-training` | CLI | Trains the dual-encoder model with TorchSharp, adds new tags, exports to ONNX. |
+| `unbooru-tagger-inference` | CLI | Loads an exported model bundle and tags/localizes/detects on images. |
+| `unbooru-tagger-tests` | xUnit | Test suite covering all of the above. |
+
+## Prerequisites
+
+- **.NET 10 SDK** (see [`global.json`](global.json); prerelease SDKs are
+  allowed via `rollForward: latestMajor`).
+- To build/run **`unbooru-tagger-data`** (and to open the full
+  `.sln`, which references it): a sibling checkout of the
+  [`unbooru`](https://github.com/da3dsoul/unbooru) repo at `../unbooru`
+  relative to this repo, e.g.:
+  ```
+  GitHub/
+    unbooru/           <- sibling repo, provides Core.csproj + Abstractions.csproj
+    unbooru-tagger/     <- this repo
+  ```
+  `unbooru-tagger-core`, `unbooru-tagger-training`, and
+  `unbooru-tagger-inference` do **not** need `unbooru` and can be built
+  standalone.
+- A SQL Server instance with an `unbooru` database, if you intend to
+  build datasets from `unbooru-tagger-data`.
+- To train with GPU acceleration: **Linux with an NVIDIA GPU** — the
+  training project pulls in `TorchSharp-cuda-linux` (bundles its own CUDA
+  12.8 runtime, just needs a compatible driver) only on Linux. On Windows
+  (and any other non-Linux OS) it falls back to `TorchSharp-cpu`, so
+  training on Windows is CPU-only.
+
+## Getting started (end users — tagging images)
+
+You need a trained model bundle: either train your own (see below) or
+grab one from this repo's
+[Releases](https://github.com/da3dsoul/unbooru-tagger/releases) page. A
+model bundle is a directory containing:
+
+```
+model/
+  image_encoder.onnx
+  tag_vocabulary.json
+  tag_embeddings.bin
+```
+
+Build and run the inference CLI:
+
+```sh
+dotnet build unbooru-tagger-inference -c Release
+```
+
+**Tag a single image:**
+
+```sh
+dotnet run --project unbooru-tagger-inference -- tag ./cat.png --model-dir ./model --threshold 0.4
+```
+
+Prints `confidence<TAB>tag` lines to stdout, most confident first.
+
+**Tag a directory of images (batch):**
+
+```sh
+dotnet run --project unbooru-tagger-inference -- tag-batch ./images --model-dir ./model > tags.json
+```
+
+Prints a single JSON object: `{ "filename.png": { "tag": confidence, ... }, ... }`.
+
+**Render a heatmap for one tag on one image:**
+
+```sh
+dotnet run --project unbooru-tagger-inference -- heatmap ./cat.png solo --model-dir ./model --out solo_heatmap.png
+```
+
+**Detect approximate bounding boxes:**
+
+```sh
+dotnet run --project unbooru-tagger-inference -- detect ./cat.png --model-dir ./model --box-threshold 0.5 --box-percentile 0.6 --out detected.png
+```
+
+Prints JSON detections to stdout; `--out` additionally writes an
+annotated PNG with colored boxes and tag/confidence labels.
+
+Every command accepts `--model-dir` (default `./model`) and (except
+`detect`, which has its own `--box-threshold`) `--threshold` (default
+`0.5`) for the minimum tag confidence to report.
+
+## Building from source (developers)
+
+Clone this repo, and — if you need `unbooru-tagger-data` or the full
+solution — clone `unbooru` alongside it:
+
+```sh
+git clone https://github.com/da3dsoul/unbooru-tagger.git
+git clone https://github.com/da3dsoul/unbooru.git   # sibling, only if you need unbooru-tagger-data
+```
+
+Build everything:
+
+```sh
+dotnet build unbooru-tagger.sln
+```
+
+Or build a single project (no sibling repo needed for these three):
+
+```sh
+dotnet build unbooru-tagger-core
+dotnet build unbooru-tagger-training
+dotnet build unbooru-tagger-inference
+```
+
+Run the test suite:
+
+```sh
+dotnet test unbooru-tagger-tests
+```
+
+Tests run sequentially, not in parallel — TorchSharp's RNG is
+process-global native state, so parallel test execution would make
+TorchSharp-seeded tests non-deterministic
+(`[assembly: CollectionBehavior(DisableTestParallelization = true)]`).
+
+There is no configuration file anywhere in the solution — connection
+strings, model paths, and hyperparameters are all passed as CLI flags,
+never read from `appsettings.json` or environment variables.
+
+## Building a dataset (`unbooru-tagger-data`)
+
+Requires the `unbooru` sibling repo and a reachable `unbooru` SQL Server
+database.
+
+**Small dataset** — pulls images matching any of the given tags plus an
+equal-sized sample of non-matching images, for quick iteration:
+
+```sh
+dotnet run --project unbooru-tagger-data -- build-small-dataset \
+  --tags hatsune_miku twintails \
+  --connection-string "Server=...;Database=unbooru;..." \
+  --out ./data/miku-small \
+  --max-images 500
+```
+
+Writes `./data/miku-small/images/<ImageId>` files and a
+`./data/miku-small/manifest.json`.
+
+**Large cache** — streams the whole corpus (or a capped subset) into a
+preprocessed, memory-mappable cache for full training runs. Interrupted
+runs resume automatically if you re-run against the same `--out`:
+
+```sh
+dotnet run --project unbooru-tagger-data -- build-large-cache \
+  --connection-string "Server=...;Database=unbooru;..." \
+  --out ./data/large-cache \
+  --input-size 224 \
+  --min-tag-images 100
+```
+
+Writes `images.bin` (preprocessed pixel data) and `tag_rows.jsonl` under
+`--out`. `--min-images-per-tag` (default 15) reserves the rarest-first
+images per tag when `--max-images` caps the corpus; `--min-tag-images`
+(default 100) is the corpus-wide occurrence count a tag needs to get a
+vocabulary row at all.
+
+## Training a model (`unbooru-tagger-training`)
+
+**Train** (from a manifest or a preprocessed cache — pick one):
+
+```sh
+dotnet run --project unbooru-tagger-training -- train \
+  --manifest ./data/miku-small/manifest.json \
+  --checkpoint-dir ./checkpoint \
+  --epochs 10 \
+  --batch-size 32
+```
+
+```sh
+dotnet run --project unbooru-tagger-training -- train \
+  --cache-dir ./data/large-cache \
+  --checkpoint-dir ./checkpoint
+```
+
+Re-running against the same `--checkpoint-dir` automatically resumes
+(model weights, optimizer state, epoch count, and early-stopping history
+if present). A checkpoint is saved after every epoch. Uses CUDA if
+available, CPU otherwise. Key flags: `--embedding-dim` (default 512),
+`--lr` (default 1e-4), `--validation-fraction` (default 0.1),
+`--early-stopping-patience` (default 3).
+
+Two auxiliary, label-free training objectives are on by default, each
+individually disableable by setting its weight to `0` (the
+self-supervised term additionally skips its extra forward passes
+entirely when disabled):
+
+- `--localization-weight` (default `0.1`) / `--localization-temperature`
+  (default `0.35`) — an MIL/log-sum-exp pooled loss over every spatial
+  location instead of one pooled embedding, so sharp localization is
+  directly rewarded rather than left as a side effect of pooling. Lower
+  temperature concentrates gradient on a tag's single best-matching
+  location (more max-like); higher temperature smooths back toward the
+  main loss's plain average-pooling behavior (mathematically identical
+  in the limit).
+- `--self-supervised-weight` (default `0.1`) — a SimSiam-style
+  consistency loss between two random-crop-augmented views of the same
+  image, predicting each other's pooled embedding through a small
+  predictor head with stop-gradient on the target side. Uses no tag
+  labels, just images already in the corpus.
+
+**Add a new tag** without retraining the whole model — warm-starts the
+new tag's embedding and fine-tunes only that row with the image encoder
+frozen:
+
+```sh
+dotnet run --project unbooru-tagger-training -- add-tag hatsune_miku_nurse_costume \
+  --checkpoint-dir ./checkpoint \
+  --images ./new-tag-manifest.json \
+  --steps 300
+```
+
+The tag is promoted from warm-start-only to fully trained once it has
+seen `--min-image-threshold` images (default 15).
+
+**Export to ONNX** for inference:
+
+```sh
+dotnet run --project unbooru-tagger-training -- export-onnx \
+  --checkpoint-dir ./checkpoint \
+  --model-dir ./model
+```
+
+Produces the `model/` bundle described above, ready for
+`unbooru-tagger-inference`.
+
+### Checkpoint directory contents
+
+```
+checkpoint/
+  image_tower.dat       # TorchSharp native weights (not ONNX)
+  model_config.json
+  tag_vocabulary.json
+  tag_embeddings.bin
+  training_progress.json (+ optimizer state, for resume)
+```
+
+## Model artifacts are not checked into git
+
+`.gitignore` excludes `*.onnx`, `*.pt`, and `*.bin` (except test
+fixtures). Checkpoints and exported model bundles are expected to be
+trained locally or downloaded from
+[Releases](https://github.com/da3dsoul/unbooru-tagger/releases) — never
+committed.
+
+## License
+
+No license file is currently included in this repository.
