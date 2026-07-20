@@ -27,10 +27,18 @@ namespace UnbooruTagger.Data;
 /// Core can't resume it — the whole run dies. Paginating bounds a hiccup's blast
 /// radius to one page, and persisting progress after every page (cache + vocabulary
 /// + <see cref="LargeCacheResumeState"/>) means re-running the same command resumes
-/// right where it left off instead of restarting from scratch. New tag rows are
-/// checkpointed via <see cref="TagVocabulary.SaveDelta"/> (append-only) rather than
-/// re-serializing the whole vocabulary every page, so a run's per-page cost doesn't
-/// grow with vocabulary size as it scales toward CLAUDE.md's long-tail vocabulary.
+/// right where it left off instead of restarting from scratch. New tag rows and
+/// image-count updates are checkpointed via <see cref="TagVocabulary.SaveDelta"/>
+/// (append-only) rather than re-serializing the whole vocabulary every page, so a
+/// run's per-page cost doesn't grow with vocabulary size as it scales toward
+/// CLAUDE.md's long-tail vocabulary.
+/// The delta is periodically folded back into a fresh <c>tag_vocabulary.json</c>
+/// snapshot (every <c>vocabCompactionIntervalPages</c> pages, not only once the run
+/// finishes) so anything reading that file directly sees reasonably current state.
+/// Tags below <c>minTagImageCount</c> images across the whole corpus (CLAUDE.md's
+/// minimum-image threshold) never get a vocabulary row or a tag-row entry at all —
+/// computed once up front from a grouped count over the tag-link table so it applies
+/// uniformly whether or not <c>maxImages</c> caps the run.
 ///
 /// Within a page, decode/resize/normalize (CPU-bound, independent per image) runs in
 /// parallel across cores; vocabulary bookkeeping and cache writes are cheap by
@@ -78,9 +86,11 @@ public static class LargeDatasetPreprocessor
         int inputSize,
         int? maxImages = null,
         int minImagesPerTag = 15,
+        int minTagImageCount = 100,
         LargeCacheProgressReporter? progress = null,
         CancellationToken cancellationToken = default,
         int pageSize = DefaultPageSize,
+        int vocabCompactionIntervalPages = 20,
         Func<CoreContext>? contextFactory = null)
     {
         Directory.CreateDirectory(outputDirectory);
@@ -103,6 +113,19 @@ public static class LargeDatasetPreprocessor
             vocabulary.Save(vocabularyPath);
         }
 
+        // A tag with only a handful of images in the whole corpus isn't worth a
+        // trained embedding row yet (CLAUDE.md's minimum-image threshold) — computed
+        // as one cheap grouped count over the tag-link table (no blobs touched), and
+        // applied uniformly whether or not --max-images caps the run, so a capped
+        // sample can't launder an ineligible tag in by never seeing its full count.
+        progress?.ReportPhase("Computing per-tag image counts...");
+        var eligibleTagNames = await context.ImageImageTags
+            .AsNoTracking()
+            .GroupBy(link => link.Tag.Name)
+            .Where(g => g.Count() >= minTagImageCount)
+            .Select(g => g.Key)
+            .ToHashSetAsync(cancellationToken);
+
         IReadOnlySet<int>? selectedIds = null;
         if (maxImages.HasValue)
         {
@@ -120,7 +143,7 @@ public static class LargeDatasetPreprocessor
                 .ToListAsync(cancellationToken);
 
             selectedIds = TagCoverageSampleSelector.Select(
-                allImageTags.Select(i => (i.ImageId, (IReadOnlyList<string>)i.TagNames)).ToList(),
+                allImageTags.Select(i => (i.ImageId, (IReadOnlyList<string>)i.TagNames.Where(eligibleTagNames.Contains).ToList())).ToList(),
                 maxImages.Value,
                 minImagesPerTag);
         }
@@ -177,9 +200,10 @@ public static class LargeDatasetPreprocessor
                     var tagRows = new List<int>();
                     foreach (var tagName in image.TagNames)
                     {
-                        if (!vocabulary.TryGet(tagName, out var record))
-                            record = vocabulary.AddTag(tagName);
-                        record.ImageCount++;
+                        if (!eligibleTagNames.Contains(tagName))
+                            continue;
+
+                        var record = vocabulary.RecordObservation(tagName);
                         tagRows.Add(record.RowIndex);
                     }
 
@@ -196,23 +220,38 @@ public static class LargeDatasetPreprocessor
                 // Persist everything after each page so a crash (e.g. a dropped DB
                 // connection over a long WAN-backed run) loses at most one page's worth
                 // of work, and re-running the same command resumes right here. New tag
-                // rows are appended to a delta log rather than rewriting the whole
-                // vocabulary file: that rewrite's cost scales with vocabulary size, and
-                // redoing it every ~500 images is what made a long build visibly slow
-                // down over time as the vocabulary grew toward CLAUDE.md's
-                // hundreds-of-thousands-of-tags scale.
+                // rows and image-count updates are appended to a delta log rather than
+                // rewriting the whole vocabulary file: that rewrite's cost scales with
+                // vocabulary size, and redoing it every ~500 images is what made a long
+                // build visibly slow down over time as the vocabulary grew toward
+                // CLAUDE.md's hundreds-of-thousands-of-tags scale. The vocabulary delta is saved
+                // before the cache is flushed: the cache's tag rows reference RowIndex
+                // values that only exist once the delta durably records them, so if a
+                // crash lands between these two calls, the ordering guarantees the cache
+                // never ends up referencing a row the vocabulary doesn't know about yet.
                 progress?.ReportPhase($"Page {pageNumber}: checkpointing (cache, vocabulary, resume state)...");
-                writer.Flush();
                 vocabulary.SaveDelta(vocabularyDeltaPath);
+                writer.Flush();
                 new LargeCacheResumeState(lastImageId).Save(outputDirectory);
+
+                // Periodically fold the delta log back into a fresh tag_vocabulary.json
+                // (rather than only at the very end) so a tool reading the vocabulary
+                // file directly — or a run that's killed rather than crashing outright —
+                // sees a reasonably fresh snapshot without paying the full-rewrite cost
+                // on every single page.
+                if (pageNumber % vocabCompactionIntervalPages == 0)
+                {
+                    progress?.ReportPhase($"Page {pageNumber}: compacting vocabulary...");
+                    vocabulary.Save(vocabularyPath);
+                    File.Delete(vocabularyDeltaPath);
+                }
 
                 if (page.Count < take)
                     break;
             }
 
             // Compact the delta into a fresh, fully up-to-date snapshot now that the run
-            // has finished, so the next Load starts clean (also picking up ImageCount
-            // updates for tags that already existed, which SaveDelta doesn't persist).
+            // has finished, so the next Load starts clean.
             progress?.ReportPhase("Compacting vocabulary...");
             vocabulary.Save(vocabularyPath);
             File.Delete(vocabularyDeltaPath);

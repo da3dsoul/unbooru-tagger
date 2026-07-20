@@ -11,7 +11,13 @@ public sealed class TagVocabulary
 {
     private readonly Dictionary<string, TagRecord> _byTag;
     private readonly List<TagRecord> _byRow;
-    private readonly List<TagRecord> _pendingNewRecords = [];
+
+    // Every record that's new or has changed (ImageCount, Status) since the last
+    // SaveDelta/Save call. The list preserves write order for the delta file; the set
+    // is just there so repeat observations of the same tag within one checkpoint
+    // window dedupe to a single pending entry instead of growing the list unbounded.
+    private readonly List<TagRecord> _pendingDirtyRecords = [];
+    private readonly HashSet<TagRecord> _pendingDirtySet = [];
 
     private TagVocabulary(List<TagRecord> records)
     {
@@ -40,7 +46,25 @@ public sealed class TagVocabulary
         var record = new TagRecord { RowIndex = _byRow.Count, Tag = tag };
         _byRow.Add(record);
         _byTag.Add(tag, record);
-        _pendingNewRecords.Add(record);
+        MarkDirty(record);
+        return record;
+    }
+
+    /// <summary>
+    /// Registers one observed occurrence of <paramref name="tag"/> — creating its
+    /// vocabulary row (warm-start only) first if this is the first time it's been
+    /// seen — and increments its image count. Callers processing a corpus should use
+    /// this instead of <see cref="TryGet"/> + <see cref="AddTag"/> + a manual
+    /// <c>ImageCount++</c>, since only this path marks the record dirty for the next
+    /// <see cref="SaveDelta"/> call.
+    /// </summary>
+    public TagRecord RecordObservation(string tag)
+    {
+        if (!TryGet(tag, out var record))
+            record = AddTag(tag);
+
+        record.ImageCount++;
+        MarkDirty(record);
         return record;
     }
 
@@ -53,13 +77,25 @@ public sealed class TagVocabulary
     {
         var record = _byTag[tag];
         if (record.Status == TagStatus.WarmStartOnly && record.ImageCount >= minImageThreshold)
+        {
             record.Status = TagStatus.Trained;
+            MarkDirty(record);
+        }
+    }
+
+    private void MarkDirty(TagRecord record)
+    {
+        if (_pendingDirtySet.Add(record))
+            _pendingDirtyRecords.Add(record);
     }
 
     /// <summary>
     /// Loads the base snapshot at <paramref name="path"/> and, if <paramref name="deltaPath"/>
-    /// is given and exists, replays tags appended via <see cref="SaveDelta"/> since that
-    /// snapshot was last compacted by <see cref="Save"/> on top of it.
+    /// is given and exists, replays the change log written by <see cref="SaveDelta"/>
+    /// since that snapshot was last compacted by <see cref="Save"/> on top of it. A tag
+    /// can appear on more than one delta line (one per checkpoint that changed it, e.g.
+    /// its image count going up) — later lines win, since they carry that tag's most
+    /// recent state.
     /// </summary>
     public static TagVocabulary Load(string path, string? deltaPath = null)
     {
@@ -77,11 +113,17 @@ public sealed class TagVocabulary
 
                 var record = JsonSerializer.Deserialize<TagRecord>(line)
                              ?? throw new InvalidDataException($"'{deltaPath}' contains an invalid tag vocabulary delta line.");
-                if (vocabulary._byTag.ContainsKey(record.Tag))
-                    continue;
 
-                vocabulary._byRow.Add(record);
-                vocabulary._byTag.Add(record.Tag, record);
+                if (vocabulary._byTag.TryGetValue(record.Tag, out var existing))
+                {
+                    existing.ImageCount = record.ImageCount;
+                    existing.Status = record.Status;
+                }
+                else
+                {
+                    vocabulary._byRow.Add(record);
+                    vocabulary._byTag.Add(record.Tag, record);
+                }
             }
         }
 
@@ -89,32 +131,37 @@ public sealed class TagVocabulary
     }
 
     /// <summary>
-    /// Appends only the tags added since the vocabulary was created/loaded or since the
-    /// last <see cref="SaveDelta"/> call — O(new tags), not O(vocabulary size). Lets a
-    /// long build checkpoint new row assignments after every page (needed so a resumed
-    /// run reuses the same RowIndex for tags already baked into a cache's tag-row labels)
-    /// without <see cref="Save"/>'s full-file rewrite cost compounding as the vocabulary
-    /// grows into the hundreds of thousands of tags (CLAUDE.md long-tail).
+    /// Appends every record that's new or changed (image count, status) since the
+    /// vocabulary was created/loaded or since the last <see cref="SaveDelta"/> call —
+    /// O(changes), not O(vocabulary size) — as a staging log meant to be periodically
+    /// folded back into the base snapshot by <see cref="Save"/> rather than rewritten
+    /// on every call. Lets a long build checkpoint every page's worth of new rows and
+    /// image-count updates (needed so a resumed run reuses the same RowIndex for tags
+    /// already baked into a cache's tag-row labels, and doesn't lose count updates to a
+    /// crash) without <see cref="Save"/>'s full-file rewrite cost compounding as the
+    /// vocabulary grows into the hundreds of thousands of tags (CLAUDE.md long-tail).
     /// </summary>
     public void SaveDelta(string deltaPath)
     {
-        if (_pendingNewRecords.Count == 0)
+        if (_pendingDirtyRecords.Count == 0)
             return;
 
         using (var writer = new StreamWriter(new FileStream(deltaPath, FileMode.Append, FileAccess.Write)))
         {
-            foreach (var record in _pendingNewRecords)
+            foreach (var record in _pendingDirtyRecords)
                 writer.WriteLine(JsonSerializer.Serialize(record));
         }
 
-        _pendingNewRecords.Clear();
+        _pendingDirtyRecords.Clear();
+        _pendingDirtySet.Clear();
     }
 
     /// <summary>
-    /// Writes the full, compacted snapshot, including tags previously appended via
-    /// <see cref="SaveDelta"/>. Callers that use <see cref="SaveDelta"/> for per-page
-    /// checkpointing should call this once the run finishes and delete the delta file, so
-    /// the next <see cref="Load"/> starts from a clean, fully up-to-date base snapshot.
+    /// Writes the full, compacted snapshot, including every change previously
+    /// appended via <see cref="SaveDelta"/>. Callers that use <see cref="SaveDelta"/>
+    /// for per-page checkpointing should call this periodically (and once the run
+    /// finishes) and delete the delta file, so the next <see cref="Load"/> starts from
+    /// a small, fast-to-replay delta on top of a reasonably fresh base snapshot.
     /// </summary>
     public void Save(string path)
     {
@@ -123,6 +170,7 @@ public sealed class TagVocabulary
 
         // Everything pending is now captured in the base snapshot, so it shouldn't be
         // re-appended by a later SaveDelta call.
-        _pendingNewRecords.Clear();
+        _pendingDirtyRecords.Clear();
+        _pendingDirtySet.Clear();
     }
 }
