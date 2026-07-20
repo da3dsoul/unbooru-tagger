@@ -23,7 +23,8 @@
     <ProjectReference Include="..\unbooru-tagger-core\unbooru-tagger-core.csproj" />
     <ProjectReference Include="..\unbooru-tagger-inference\unbooru-tagger-inference.csproj" />
     <ProjectReference Include="..\unbooru-tagger-training\unbooru-tagger-training.csproj" />
-    <ProjectReference Include="..\unbooru-tagger-data\unbooru-tagger-data.csproj" />
+    <ProjectReference Include="..\unbooru-tagger-data-unbooru-import\unbooru-tagger-data-unbooru-import.csproj" />
+    <ProjectReference Include="..\unbooru-tagger-data-booru-downloader\unbooru-tagger-data-booru-downloader.csproj" />
   </ItemGroup>
 
 </Project>

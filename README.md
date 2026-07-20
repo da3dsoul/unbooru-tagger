@@ -42,7 +42,8 @@ is no Python code in this repo).
 | Project | Type | Purpose |
 |---|---|---|
 | `unbooru-tagger-core` | library | Shared model-bundle loading, ONNX image encoding, tag vocabulary/embedding storage, SigLIP-style scoring, heatmap/box generation, dataset manifest & cache formats. |
-| `unbooru-tagger-data` | CLI | Pulls images/tags from the [unbooru](#prerequisites) database and builds training datasets/caches. |
+| `unbooru-tagger-data-unbooru-import` | CLI | Pulls images/tags from the [unbooru](#prerequisites) database and builds training datasets/caches. |
+| `unbooru-tagger-data-booru-downloader` | CLI | Downloads images/tags directly from Danbooru/Gelbooru into a trainable dataset directory — no `unbooru`/SQL Server needed. |
 | `unbooru-tagger-training` | CLI | Trains the dual-encoder model with TorchSharp, adds new tags, exports to ONNX. |
 | `unbooru-tagger-inference` | CLI | Loads an exported model bundle and tags/localizes/detects on images. |
 | `unbooru-tagger-tests` | xUnit | Test suite covering all of the above. |
@@ -51,8 +52,8 @@ is no Python code in this repo).
 
 - **.NET 10 SDK** (see [`global.json`](global.json); prerelease SDKs are
   allowed via `rollForward: latestMajor`).
-- To build/run **`unbooru-tagger-data`** (and to open the full
-  `.sln`, which references it): a sibling checkout of the
+- To build/run **`unbooru-tagger-data-unbooru-import`** (and to open the
+  full `.sln`, which references it): a sibling checkout of the
   [`unbooru`](https://github.com/da3dsoul/unbooru) repo at `../unbooru`
   relative to this repo, e.g.:
   ```
@@ -60,11 +61,13 @@ is no Python code in this repo).
     unbooru/           <- sibling repo, provides Core.csproj + Abstractions.csproj
     unbooru-tagger/     <- this repo
   ```
-  `unbooru-tagger-core`, `unbooru-tagger-training`, and
-  `unbooru-tagger-inference` do **not** need `unbooru` and can be built
-  standalone.
+  `unbooru-tagger-core`, `unbooru-tagger-training`,
+  `unbooru-tagger-inference`, and `unbooru-tagger-data-booru-downloader`
+  do **not** need `unbooru` and can be built standalone.
 - A SQL Server instance with an `unbooru` database, if you intend to
-  build datasets from `unbooru-tagger-data`.
+  build datasets from `unbooru-tagger-data-unbooru-import`.
+  `unbooru-tagger-data-booru-downloader` is the alternative that needs
+  neither — just network access to Danbooru and/or Gelbooru.
 - To train with GPU acceleration: **Linux with an NVIDIA GPU** — the
   training project pulls in `TorchSharp-cuda-linux` (bundles its own CUDA
   12.8 runtime, just needs a compatible driver) only on Linux. On Windows
@@ -128,12 +131,12 @@ Every command accepts `--model-dir` (default `./model`) and (except
 
 ## Building from source (developers)
 
-Clone this repo, and — if you need `unbooru-tagger-data` or the full
-solution — clone `unbooru` alongside it:
+Clone this repo, and — if you need `unbooru-tagger-data-unbooru-import`
+or the full solution — clone `unbooru` alongside it:
 
 ```sh
 git clone https://github.com/da3dsoul/unbooru-tagger.git
-git clone https://github.com/da3dsoul/unbooru.git   # sibling, only if you need unbooru-tagger-data
+git clone https://github.com/da3dsoul/unbooru.git   # sibling, only if you need unbooru-tagger-data-unbooru-import
 ```
 
 Build everything:
@@ -142,12 +145,13 @@ Build everything:
 dotnet build unbooru-tagger.sln
 ```
 
-Or build a single project (no sibling repo needed for these three):
+Or build a single project (no sibling repo needed for these):
 
 ```sh
 dotnet build unbooru-tagger-core
 dotnet build unbooru-tagger-training
 dotnet build unbooru-tagger-inference
+dotnet build unbooru-tagger-data-booru-downloader
 ```
 
 Run the test suite:
@@ -165,7 +169,7 @@ There is no configuration file anywhere in the solution — connection
 strings, model paths, and hyperparameters are all passed as CLI flags,
 never read from `appsettings.json` or environment variables.
 
-## Building a dataset (`unbooru-tagger-data`)
+## Building a dataset (`unbooru-tagger-data-unbooru-import`)
 
 Requires the `unbooru` sibling repo and a reachable `unbooru` SQL Server
 database.
@@ -174,7 +178,7 @@ database.
 equal-sized sample of non-matching images, for quick iteration:
 
 ```sh
-dotnet run --project unbooru-tagger-data -- build-small-dataset \
+dotnet run --project unbooru-tagger-data-unbooru-import -- build-small-dataset \
   --tags hatsune_miku twintails \
   --connection-string "Server=...;Database=unbooru;..." \
   --out ./data/miku-small \
@@ -189,7 +193,7 @@ preprocessed, memory-mappable cache for full training runs. Interrupted
 runs resume automatically if you re-run against the same `--out`:
 
 ```sh
-dotnet run --project unbooru-tagger-data -- build-large-cache \
+dotnet run --project unbooru-tagger-data-unbooru-import -- build-large-cache \
   --connection-string "Server=...;Database=unbooru;..." \
   --out ./data/large-cache \
   --input-size 224 \
@@ -201,6 +205,54 @@ Writes `images.bin` (preprocessed pixel data) and `tag_rows.jsonl` under
 images per tag when `--max-images` caps the corpus; `--min-tag-images`
 (default 100) is the corpus-wide occurrence count a tag needs to get a
 vocabulary row at all.
+
+## Crawling a dataset from Danbooru/Gelbooru (`unbooru-tagger-data-booru-downloader`)
+
+An alternative to `unbooru-tagger-data-unbooru-import` that needs no
+`unbooru` repo/SQL Server at all — it downloads directly from the Danbooru and
+Gelbooru public APIs into the same trainable dataset directory shape
+`build-large-cache` produces (`images.bin`, `tag_rows.jsonl`,
+`tag_vocabulary.json`), plus its own `crawl.sqlite` for survey results,
+per-tag/site resumability, and cross-site image dedup.
+
+**1. Survey tags** — records each tag's per-site post count and which
+tags are worth crawling (`--min-images`, default 500):
+
+```sh
+dotnet run --project unbooru-tagger-data-booru-downloader -- survey-tags \
+  --output-dir ./data/crawled \
+  --min-images 500
+```
+
+Prints how many tags are eligible and an upper-bound estimate of the
+image slots a crawl would need (before cross-tag/cross-site dedup, which
+only shows up once the crawl actually runs).
+
+**2. Crawl** — pulls up to `--max-images` (default 1000) images per
+eligible tag, rarest tag first, spread across both sites, then
+automatically tops up negative (non-tagged) examples per tag:
+
+```sh
+dotnet run --project unbooru-tagger-data-booru-downloader -- crawl \
+  --output-dir ./data/crawled \
+  --min-images 500 \
+  --max-images 1000 \
+  --input-size 224
+```
+
+Re-running the same command resumes (per-tag/site pagination cursors,
+plus the cache's own resumability). An image satisfying several eligible
+tags at once is only ever downloaded once — both sites return a post's
+full tag list in the same response used to find it, so there's never a
+need to re-fetch or merge tags into an already-cached image. Optional
+`--danbooru-login`/`--danbooru-api-key` and
+`--gelbooru-api-key`/`--gelbooru-user-id` raise each site's rate-limit
+tier; `--rate-danbooru`/`--rate-gelbooru` (defaults 4 and 2 requests/sec)
+cap request rate. `--negative-target` defaults to `2 * --min-images` —
+deliberately more negatives than positives, since an image with many tags
+(ordinary on boorus) becomes a positive for all of them at once, which
+would otherwise skew the surviving negative pool toward sparsely-tagged
+images.
 
 ## Training a model (`unbooru-tagger-training`)
 
