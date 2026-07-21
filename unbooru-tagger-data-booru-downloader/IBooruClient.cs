@@ -13,6 +13,9 @@ public interface IBooruClient
     /// <summary>The site's hard cap on posts per page (200 for Danbooru, 100 for Gelbooru regardless of any requested limit).</summary>
     int PageSize { get; }
 
+    /// <summary>This client's own rate limiter, reused by <c>DatasetCrawler</c> for raw image downloads from the same site/CDN — those were previously unthrottled entirely, which is what let a burst of downloads trip the CDN's own 429s.</summary>
+    IRateLimiter RateLimiter { get; }
+
     /// <summary>Streams every tag sorted by post count descending. Callers should stop enumerating once counts fall below their eligibility threshold — cheap because the ordering means nothing past that point is worth reading.</summary>
     IAsyncEnumerable<BooruTagCount> ListTagsByCountDescendingAsync(CancellationToken cancellationToken = default);
 

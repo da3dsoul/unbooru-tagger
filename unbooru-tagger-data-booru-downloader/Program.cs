@@ -7,6 +7,8 @@ var minImagesOption = new Option<int>("--min-images") { Description = "Only craw
 var maxImagesOption = new Option<int>("--max-images") { Description = "Cap on images pulled per eligible tag (combined across both sites)", DefaultValueFactory = _ => 1000 };
 
 var httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
+// Danbooru/Gelbooru (Cloudflare-fronted) reject requests with no User-Agent as a 403.
+httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("unbooru-tagger-data-booru-downloader/1.0 (+https://github.com/unbooru)");
 
 static Dictionary<string, IBooruClient> BuildClients(
     IReadOnlyList<string> sites,
@@ -52,21 +54,40 @@ var sitesOption = new Option<string[]>("--sites")
     AllowMultipleArgumentsPerToken = true
 };
 
+var danbooruLoginOption = new Option<string?>("--danbooru-login") { Description = "Danbooru username (paired with --danbooru-api-key) for a higher rate-limit tier" };
+var danbooruApiKeyOption = new Option<string?>("--danbooru-api-key") { Description = "Danbooru API key" };
+var gelbooruApiKeyOption = new Option<string?>("--gelbooru-api-key") { Description = "Gelbooru API key — Gelbooru now requires this (paired with --gelbooru-user-id) even for read-only tag/post listing, or requests fail with 401" };
+var gelbooruUserIdOption = new Option<string?>("--gelbooru-user-id") { Description = "Gelbooru user id (paired with --gelbooru-api-key)" };
+var rateDanbooruOption = new Option<double>("--rate-danbooru") { Description = "Danbooru requests/second (site's documented global read limit is 10/s)", DefaultValueFactory = _ => 4.0 };
+var rateGelbooruOption = new Option<double>("--rate-gelbooru") { Description = "Gelbooru requests/second (undocumented limit — stay conservative)", DefaultValueFactory = _ => 2.0 };
+
 var surveyCommand = new Command("survey-tags", "Survey per-site tag post counts and record eligibility (>= --min-images on at least one site)");
 surveyCommand.Options.Add(sitesOption);
 surveyCommand.Options.Add(minImagesOption);
 surveyCommand.Options.Add(maxImagesOption);
 surveyCommand.Options.Add(outputDirOption);
+surveyCommand.Options.Add(danbooruLoginOption);
+surveyCommand.Options.Add(danbooruApiKeyOption);
+surveyCommand.Options.Add(gelbooruApiKeyOption);
+surveyCommand.Options.Add(gelbooruUserIdOption);
+surveyCommand.Options.Add(rateDanbooruOption);
+surveyCommand.Options.Add(rateGelbooruOption);
 surveyCommand.SetAction(async (parseResult, cancellationToken) =>
 {
     var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
     var minImages = parseResult.GetRequiredValue(minImagesOption);
     var maxImages = parseResult.GetRequiredValue(maxImagesOption);
     var sites = parseResult.GetRequiredValue(sitesOption);
+    var rateDanbooru = parseResult.GetRequiredValue(rateDanbooruOption);
+    var rateGelbooru = parseResult.GetRequiredValue(rateGelbooruOption);
 
     using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
-    var clients = BuildClients(sites, httpClient, 4.0, 2.0, null, null, null, null);
+    var clients = BuildClients(
+        sites, httpClient, rateDanbooru, rateGelbooru,
+        parseResult.GetValue(danbooruLoginOption), parseResult.GetValue(danbooruApiKeyOption),
+        parseResult.GetValue(gelbooruApiKeyOption), parseResult.GetValue(gelbooruUserIdOption));
 
+    var stopNotes = new List<string>();
     var summary = await AnsiConsole.Progress()
         .Columns(ProgressBarColumns.Default)
         .StartAsync(async ctx =>
@@ -75,25 +96,33 @@ surveyCommand.SetAction(async (parseResult, cancellationToken) =>
             task.IsIndeterminate = true;
             var progress = new TagSurveyProgress
             {
-                OnSiteTagCount = (site, count) => task.Description = $"Surveying tags... ({site}: {count} eligible-so-far)"
+                OnSiteTagCount = (site, count) => task.Description = $"Surveying tags... ({site}: {count} eligible-so-far)",
+                OnSiteStopped = (site, eligibleCount, tagName, postCount) =>
+                    stopNotes.Add($"{site}: stopped after {eligibleCount} eligible tag(s) — first tag under quota was '{tagName}' ({postCount} < --min-images {minImages})"),
+                OnPersisting = (written, total) =>
+                {
+                    task.IsIndeterminate = false;
+                    task.MaxValue = total;
+                    task.Value = written;
+                    task.Description = $"Persisting survey results to crawl.sqlite... ({written}/{total})";
+                }
             };
             return await TagSurveyor.SurveyAsync(db, clients.Values.ToList(), minImages, maxImages, progress, cancellationToken);
         });
+
+    foreach (var note in stopNotes)
+        AnsiConsole.MarkupLine($"[grey]{Markup.Escape(note)}[/]");
+    if (stopNotes.Any(n => n.Contains("stopped after 0 eligible")))
+        AnsiConsole.MarkupLine("[yellow]A site found zero eligible tags — if that's unexpected, the site's tag-list API may not actually be honoring the sort-by-count-descending request, so this stopped on the very first (effectively random) tag instead of the least popular eligible one.[/]");
 
     Console.WriteLine($"Surveyed {summary.TotalTagsSeen} tags; {summary.EligibleTagCount} eligible at --min-images {minImages}.");
     PrintEstimate(new CrawlEstimate(summary.EligibleTagCount, summary.EstimatedImageSlots, 0, TimeSpan.Zero));
     return 0;
 });
 
-var danbooruLoginOption = new Option<string?>("--danbooru-login") { Description = "Danbooru username (paired with --danbooru-api-key) for a higher rate-limit tier" };
-var danbooruApiKeyOption = new Option<string?>("--danbooru-api-key") { Description = "Danbooru API key" };
-var gelbooruApiKeyOption = new Option<string?>("--gelbooru-api-key") { Description = "Gelbooru API key" };
-var gelbooruUserIdOption = new Option<string?>("--gelbooru-user-id") { Description = "Gelbooru user id (paired with --gelbooru-api-key)" };
-var rateDanbooruOption = new Option<double>("--rate-danbooru") { Description = "Danbooru requests/second (site's documented global read limit is 10/s)", DefaultValueFactory = _ => 4.0 };
-var rateGelbooruOption = new Option<double>("--rate-gelbooru") { Description = "Gelbooru requests/second (undocumented limit — stay conservative)", DefaultValueFactory = _ => 2.0 };
 var negativeTargetOption = new Option<int?>("--negative-target") { Description = "Non-tagged images each eligible tag should end up with (default 2x --min-images — see plan notes on dedup bias)" };
 var inputSizeOption = new Option<int>("--input-size") { Description = "Square input resolution to preprocess images to", DefaultValueFactory = _ => 224 };
-var checkpointIntervalOption = new Option<int>("--checkpoint-interval") { Description = "Images between cache/vocabulary/crawl-state checkpoints", DefaultValueFactory = _ => 500 };
+var vocabCompactIntervalOption = new Option<int>("--vocab-compact-interval") { Description = "Pages between full tag_vocabulary.json compactions (the delta log is still checkpointed every page regardless, same as build-large-cache's option of the same name)", DefaultValueFactory = _ => 20 };
 
 var crawlCommand = new Command("crawl", "Download images for every eligible tag (rarest-first), then top up negatives — writes directly into a trainable dataset directory");
 crawlCommand.Options.Add(sitesOption);
@@ -108,7 +137,7 @@ crawlCommand.Options.Add(gelbooruUserIdOption);
 crawlCommand.Options.Add(rateDanbooruOption);
 crawlCommand.Options.Add(rateGelbooruOption);
 crawlCommand.Options.Add(negativeTargetOption);
-crawlCommand.Options.Add(checkpointIntervalOption);
+crawlCommand.Options.Add(vocabCompactIntervalOption);
 crawlCommand.SetAction(async (parseResult, cancellationToken) =>
 {
     var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
@@ -119,7 +148,7 @@ crawlCommand.SetAction(async (parseResult, cancellationToken) =>
     var rateDanbooru = parseResult.GetRequiredValue(rateDanbooruOption);
     var rateGelbooru = parseResult.GetRequiredValue(rateGelbooruOption);
     var negativeTarget = parseResult.GetValue(negativeTargetOption) ?? minImages * 2;
-    var checkpointInterval = parseResult.GetRequiredValue(checkpointIntervalOption);
+    var vocabCompactInterval = parseResult.GetRequiredValue(vocabCompactIntervalOption);
 
     using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
 
@@ -144,16 +173,28 @@ crawlCommand.SetAction(async (parseResult, cancellationToken) =>
     Console.WriteLine("Estimate (recomputed from the last survey-tags run):");
     PrintEstimate(estimate);
 
-    await AnsiConsole.Progress()
+    var shortfalls = await AnsiConsole.Progress()
         .Columns(ProgressBarColumns.Default)
         .StartAsync(async ctx =>
         {
             var progress = ProgressBarColumns.AddCrawlTasks(ctx);
-            await DatasetCrawler.RunAsync(
+            return await DatasetCrawler.RunAsync(
                 db, clients, httpClient, outputDirectory, inputSize,
-                minImages, maxImages, negativeTarget, checkpointInterval,
+                minImages, maxImages, negativeTarget, vocabCompactInterval,
                 progress, cancellationToken);
         });
+
+    if (shortfalls.Count > 0)
+    {
+        AnsiConsole.MarkupLine($"[yellow]{shortfalls.Count} eligible tag(s) fell short of --max-images {maxImages} — both sites ran out of posts for these before dedup (md5 + perceptual hash) let the tag reach quota:[/]");
+        var shortfallTable = new Table().Border(TableBorder.Rounded);
+        shortfallTable.AddColumn("Tag");
+        shortfallTable.AddColumn("Achieved");
+        shortfallTable.AddColumn("Target");
+        foreach (var shortfall in shortfalls)
+            shortfallTable.AddRow(shortfall.TagName, shortfall.Achieved.ToString(), shortfall.Target.ToString());
+        AnsiConsole.Write(shortfallTable);
+    }
 
     Console.WriteLine($"Done. Dataset written to '{outputDirectory}'.");
     return 0;

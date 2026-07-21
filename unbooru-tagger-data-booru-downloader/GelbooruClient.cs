@@ -37,7 +37,11 @@ public sealed class GelbooruClient(HttpClient http, IRateLimiter rateLimiter, st
     {
         for (var pid = 0; ; pid++)
         {
-            var uri = new Uri($"{_baseUrl}/index.php?page=dapi&s=tag&q=index&json=1&orderby=count&limit=100&pid={pid}{AuthQuery()}");
+            // orderby=count picks the sort field; order=DESC is the separate, required
+            // direction param — Gelbooru's dapi docs split the two, and orderby alone
+            // silently falls back to an unspecified order, breaking the "sorted
+            // descending, stop once under --min-images" assumption TagSurveyor relies on.
+            var uri = new Uri($"{_baseUrl}/index.php?page=dapi&s=tag&q=index&json=1&orderby=count&order=DESC&limit=100&pid={pid}{AuthQuery()}");
             var json = await GetStringAsync(uri, cancellationToken).ConfigureAwait(false);
             using var doc = JsonDocument.Parse(json);
 
@@ -53,18 +57,28 @@ public sealed class GelbooruClient(HttpClient http, IRateLimiter rateLimiter, st
 
     public async Task<BooruPostPage> ListPostsAsync(string tagQuery, string? cursor, CancellationToken cancellationToken = default)
     {
-        var pid = cursor is null ? 0 : int.Parse(cursor, CultureInfo.InvariantCulture);
-        var uri = new Uri($"{_baseUrl}/index.php?page=dapi&s=post&q=index&json=1&tags={Uri.EscapeDataString(tagQuery)}&limit={PageSize}&pid={pid}{AuthQuery()}");
+        // Anchored on the last post id seen (like Danbooru's page=bN), not a raw page
+        // offset (pid) — Gelbooru is a live, constantly-growing site, so a page-number
+        // cursor is unsafe across a resumed crawl: every post added between the last run
+        // and this one shifts what "page 5" means, silently skipping posts that moved
+        // past page 5 or reprocessing ones that moved back to it. id:< combined with an
+        // explicit sort:id:desc keeps every page anchored to real post ids, immune to
+        // however many posts get added in between — same trick, same reasoning as
+        // DanbooruClient's own cursor.
+        var idFilter = cursor is null ? "" : $" id:<{cursor}";
+        var uri = new Uri($"{_baseUrl}/index.php?page=dapi&s=post&q=index&json=1&tags={Uri.EscapeDataString(tagQuery + " sort:id:desc" + idFilter)}&limit={PageSize}{AuthQuery()}");
         var json = await GetStringAsync(uri, cancellationToken).ConfigureAwait(false);
         using var doc = JsonDocument.Parse(json);
 
         var posts = new List<BooruPost>();
         var rawCount = 0;
+        long? lastRawId = null;
         if (doc.RootElement.TryGetProperty("post", out var postsElement) && postsElement.ValueKind == JsonValueKind.Array)
         {
             foreach (var element in postsElement.EnumerateArray())
             {
                 rawCount++;
+                lastRawId = element.GetProperty("id").GetInt64();
 
                 if (!element.TryGetProperty("md5", out var md5Prop) || md5Prop.ValueKind != JsonValueKind.String)
                     continue;
@@ -98,7 +112,7 @@ public sealed class GelbooruClient(HttpClient http, IRateLimiter rateLimiter, st
         // Same reasoning as DanbooruClient: base "more pages exist" on the raw element
         // count, not the filtered posts list, so a filtered-out bad post can't make a
         // genuinely full page look short and stop pagination early.
-        var nextCursor = rawCount == PageSize ? (pid + 1).ToString(CultureInfo.InvariantCulture) : null;
+        var nextCursor = rawCount == PageSize ? lastRawId!.Value.ToString(CultureInfo.InvariantCulture) : null;
         return new BooruPostPage(posts, nextCursor);
     }
 }

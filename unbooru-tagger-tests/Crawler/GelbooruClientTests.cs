@@ -15,6 +15,18 @@ internal sealed class ImmediateRateLimiter : IRateLimiter
     public Task WaitAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 }
 
+/// <summary>Like <see cref="FakeHttpMessageHandler"/> but records every request URI it saw, for asserting on query parameters.</summary>
+internal sealed class RecordingHttpMessageHandler(string responseBody) : HttpMessageHandler
+{
+    public List<Uri> RequestUris { get; } = [];
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        RequestUris.Add(request.RequestUri!);
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(responseBody) });
+    }
+}
+
 public class GelbooruClientTests
 {
     private const string SamplePostJson =
@@ -80,6 +92,77 @@ public class GelbooruClientTests
         var page = await client.ListPostsAsync("1girl", cursor: null);
 
         Assert.Null(page.NextCursor); // only 1 post returned, well under the 100 page size
+    }
+
+    [Fact]
+    public async Task ListTagsByCountDescendingAsync_RequestsCountDescendingOrder()
+    {
+        const string emptyTagResponse = """{ "tag": [] }""";
+        var handler = new RecordingHttpMessageHandler(emptyTagResponse);
+        var httpClient = new HttpClient(handler);
+        var client = new GelbooruClient(httpClient, new ImmediateRateLimiter());
+
+        await foreach (var _ in client.ListTagsByCountDescendingAsync())
+        {
+        }
+
+        Assert.NotEmpty(handler.RequestUris);
+        var query = handler.RequestUris[0].Query;
+        // Gelbooru's dapi splits sort field (orderby) from sort direction (order) —
+        // orderby=count alone silently falls back to an unspecified order.
+        Assert.Contains("orderby=count", query);
+        Assert.Contains("order=DESC", query);
+    }
+
+    [Fact]
+    public async Task ListPostsAsync_FirstPage_RequestsSortByIdDescendingWithNoIdFilter()
+    {
+        var handler = new RecordingHttpMessageHandler(SamplePostJson);
+        var httpClient = new HttpClient(handler);
+        var client = new GelbooruClient(httpClient, new ImmediateRateLimiter());
+
+        await client.ListPostsAsync("1girl", cursor: null);
+
+        var query = Uri.UnescapeDataString(handler.RequestUris[0].Query);
+        Assert.Contains("sort:id:desc", query);
+        Assert.DoesNotContain("id:<", query);
+        // pid was a raw page-number offset — unsafe on a constantly-growing site, since
+        // posts added between two runs shift what "page N" means and can silently skip
+        // or duplicate posts across a resumed crawl. Anchoring on id:< instead means
+        // this request must not use it at all.
+        Assert.DoesNotContain("pid=", query);
+    }
+
+    [Fact]
+    public async Task ListPostsAsync_WithCursor_FiltersToIdsBelowCursor()
+    {
+        var handler = new RecordingHttpMessageHandler(SamplePostJson);
+        var httpClient = new HttpClient(handler);
+        var client = new GelbooruClient(httpClient, new ImmediateRateLimiter());
+
+        await client.ListPostsAsync("1girl", cursor: "999999");
+
+        var query = Uri.UnescapeDataString(handler.RequestUris[0].Query);
+        Assert.Contains("id:<999999", query);
+    }
+
+    [Fact]
+    public async Task ListPostsAsync_NextCursor_IsLastPostIdNotPageOffset()
+    {
+        var ids = Enumerable.Range(0, 100).Select(i => 1000000 - i).ToList(); // descending, like sort:id:desc
+        var postsJson = string.Join(",", ids.Select(id => $$"""
+            { "id": {{id}}, "md5": "md5{{id}}", "file_url": "https://gelbooru.com/images/x/{{id}}.jpg",
+              "tags": "1girl", "rating": "general", "created_at": "Fri Jan 01 00:00:00 +0000 2021",
+              "width": 100, "height": 100 }
+            """));
+        var fullPageJson = $$"""{ "post": [{{postsJson}}] }""";
+
+        var httpClient = new HttpClient(new FakeHttpMessageHandler(fullPageJson));
+        var client = new GelbooruClient(httpClient, new ImmediateRateLimiter());
+
+        var page = await client.ListPostsAsync("1girl", cursor: null);
+
+        Assert.Equal(ids[^1].ToString(), page.NextCursor); // the last (lowest) id in the page, not "page 1"
     }
 
     [Fact]
