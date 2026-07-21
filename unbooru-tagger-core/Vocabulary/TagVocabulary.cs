@@ -69,6 +69,21 @@ public sealed class TagVocabulary
     }
 
     /// <summary>
+    /// Adjusts an already-resolved tag's image count by <paramref name="delta"/>
+    /// (positive or negative) and marks it dirty, without the create-if-missing +1
+    /// <see cref="RecordObservation"/> always does — for a caller that already knows
+    /// whether this is a genuinely new (image, tag) association or a removal, e.g.
+    /// <c>refresh-tags</c> reconciling a tag off an image none of its known sources
+    /// assert anymore, or the same caller crediting a tag it already confirmed exists
+    /// via <see cref="TryGet"/>/<see cref="GetByRowIndex"/>.
+    /// </summary>
+    public void AdjustImageCount(TagRecord record, int delta)
+    {
+        record.ImageCount += delta;
+        MarkDirty(record);
+    }
+
+    /// <summary>
     /// Promotes a tag from <see cref="TagStatus.WarmStartOnly"/> to
     /// <see cref="TagStatus.Trained"/> once it has crossed the minimum-image
     /// threshold (CLAUDE.md: ~10-20 images) and its row has actually been fine-tuned.

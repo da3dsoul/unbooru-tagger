@@ -25,7 +25,8 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
 {
     private readonly FileStream _pixelStream;
     private readonly BinaryWriter _pixelWriter;
-    private readonly StreamWriter _labelWriter;
+    private readonly string _labelPath;
+    private StreamWriter _labelWriter;
     private readonly int _inputSize;
 
     /// <summary>Images durably committed as of the last <see cref="Flush"/> (or resumed from a prior run).</summary>
@@ -53,6 +54,7 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
 
         var pixelPath = Path.Combine(directory, PreprocessedDatasetCache.PixelsFileName);
         var labelPath = Path.Combine(directory, PreprocessedDatasetCache.LabelsFileName);
+        _labelPath = labelPath;
 
         if (resume && File.Exists(pixelPath))
         {
@@ -74,7 +76,7 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
 
             var confirmedLines = File.Exists(labelPath) ? File.ReadLines(labelPath).Take(ImageCount).ToList() : [];
             File.WriteAllLines(labelPath, confirmedLines);
-            _labelWriter = new StreamWriter(new FileStream(labelPath, FileMode.Append, FileAccess.Write));
+            _labelWriter = new StreamWriter(new FileStream(labelPath, FileMode.Append, FileAccess.Write, FileShare.Read));
         }
         else
         {
@@ -83,7 +85,10 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
             _pixelWriter.Write(0); // image count placeholder, patched by Flush/Dispose
             _pixelWriter.Write(inputSize);
 
-            _labelWriter = new StreamWriter(File.Create(labelPath));
+            // FileShare.Read (File.Create's default is exclusive None) so
+            // ReadCommittedTagRows/MergeTagRows can open their own handle on this same
+            // file while this one's still held open, instead of throwing IOException.
+            _labelWriter = new StreamWriter(new FileStream(labelPath, FileMode.Create, FileAccess.Write, FileShare.Read));
             ImageCount = 0;
         }
     }
@@ -99,6 +104,51 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
             _pixelWriter.Write(value);
         _labelWriter.WriteLine(JsonSerializer.Serialize(tagRows));
         ImageCount++;
+    }
+
+    /// <summary>
+    /// Reads the tag-row indices durably committed as of the last <see cref="Flush"/>
+    /// (or resume), keyed by row index — for a caller that needs to know what tags an
+    /// already-written image currently has (e.g. to merge in tags a later duplicate of
+    /// the same image brings from a different source) without maintaining a second
+    /// copy of that state itself.
+    /// </summary>
+    public IReadOnlyList<IReadOnlyList<int>> ReadCommittedTagRows() =>
+        File.ReadLines(_labelPath)
+            .Take(ImageCount)
+            .Select(line => (IReadOnlyList<int>)(JsonSerializer.Deserialize<int[]>(line)
+                             ?? throw new InvalidDataException($"'{_labelPath}' contains an invalid tag-row label line.")))
+            .ToList();
+
+    /// <summary>
+    /// Overwrites the tag-row indices for specific already-committed rows — the only
+    /// way an already-written row's labels change after the fact, e.g. merging in tags
+    /// a duplicate of the same image (crawled from a different site) carries that the
+    /// first copy didn't. <paramref name="tagRowsByIndex"/> gives each row's full,
+    /// already-merged tag set, not just the delta. Every index must already be durably
+    /// committed (&lt; <see cref="ImageCount"/> as of the last <see cref="Flush"/>) —
+    /// call this right after <see cref="Flush"/>, never against a row appended earlier
+    /// in the same not-yet-flushed page.
+    ///
+    /// Requires rewriting the whole labels file: JSONL lines vary in byte length, so an
+    /// existing line can't be patched in place the way the fixed-width pixel file can.
+    /// Only called when there's actually something to merge, not on every checkpoint —
+    /// see the caller for why that keeps this affordable against a large corpus.
+    /// </summary>
+    public void MergeTagRows(IReadOnlyDictionary<int, IReadOnlyList<int>> tagRowsByIndex)
+    {
+        if (tagRowsByIndex.Count == 0)
+            return;
+
+        _labelWriter.Flush();
+        _labelWriter.Dispose();
+
+        var lines = File.ReadLines(_labelPath).Take(ImageCount).ToList();
+        foreach (var (rowIndex, tagRows) in tagRowsByIndex)
+            lines[rowIndex] = JsonSerializer.Serialize(tagRows);
+        File.WriteAllLines(_labelPath, lines);
+
+        _labelWriter = new StreamWriter(new FileStream(_labelPath, FileMode.Append, FileAccess.Write, FileShare.Read));
     }
 
     /// <summary>

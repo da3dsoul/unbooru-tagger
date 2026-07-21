@@ -173,25 +173,44 @@ crawlCommand.SetAction(async (parseResult, cancellationToken) =>
     Console.WriteLine("Estimate (recomputed from the last survey-tags run):");
     PrintEstimate(estimate);
 
-    var shortfalls = await AnsiConsole.Progress()
-        .Columns(ProgressBarColumns.Default)
-        .StartAsync(async ctx =>
-        {
-            var progress = ProgressBarColumns.AddCrawlTasks(ctx);
-            return await DatasetCrawler.RunAsync(
-                db, clients, httpClient, outputDirectory, inputSize,
-                minImages, maxImages, negativeTarget, vocabCompactInterval,
-                progress, cancellationToken);
-        });
-
-    if (shortfalls.Count > 0)
+    CrawlResult result;
+    try
     {
-        AnsiConsole.MarkupLine($"[yellow]{shortfalls.Count} eligible tag(s) fell short of --max-images {maxImages} — both sites ran out of posts for these before dedup (md5 + perceptual hash) let the tag reach quota:[/]");
+        result = await AnsiConsole.Progress()
+            .Columns(ProgressBarColumns.Default)
+            .StartAsync(async ctx =>
+            {
+                var progress = ProgressBarColumns.AddCrawlTasks(ctx);
+                return await DatasetCrawler.RunAsync(
+                    db, clients, httpClient, outputDirectory, inputSize,
+                    minImages, maxImages, negativeTarget, vocabCompactInterval,
+                    progress, cancellationToken);
+            });
+    }
+    catch (AllSitesUnavailableException ex)
+    {
+        AnsiConsole.MarkupLine("[red]Every configured site failed — nothing left to crawl with:[/]");
+        foreach (var (site, reason) in ex.FailedSites)
+            AnsiConsole.MarkupLine($"[red]  {Markup.Escape(site)}: {Markup.Escape(reason)}[/]");
+        Console.Error.WriteLine("Exiting. Per-tag progress is checkpointed, so re-running once connectivity is restored resumes without redoing work.");
+        return 1;
+    }
+
+    if (result.FailedSites.Count > 0)
+    {
+        AnsiConsole.MarkupLine("[yellow]The following site(s) went unavailable partway through this run and were skipped for its remainder — the next run will pick each back up from where it left off:[/]");
+        foreach (var (site, reason) in result.FailedSites)
+            AnsiConsole.MarkupLine($"[yellow]  {Markup.Escape(site)}: {Markup.Escape(reason)}[/]");
+    }
+
+    if (result.Shortfalls.Count > 0)
+    {
+        AnsiConsole.MarkupLine($"[yellow]{result.Shortfalls.Count} eligible tag(s) fell short of --max-images {maxImages} — both sites ran out of posts for these before dedup (md5 + perceptual hash) let the tag reach quota:[/]");
         var shortfallTable = new Table().Border(TableBorder.Rounded);
         shortfallTable.AddColumn("Tag");
         shortfallTable.AddColumn("Achieved");
         shortfallTable.AddColumn("Target");
-        foreach (var shortfall in shortfalls)
+        foreach (var shortfall in result.Shortfalls)
             shortfallTable.AddRow(shortfall.TagName, shortfall.Achieved.ToString(), shortfall.Target.ToString());
         AnsiConsole.Write(shortfallTable);
     }
@@ -200,10 +219,80 @@ crawlCommand.SetAction(async (parseResult, cancellationToken) =>
     return 0;
 });
 
+var resetOption = new Option<bool>("--reset") { Description = "Restart each selected site's refresh sweep from the beginning instead of resuming after the last post it checked — use to re-verify posts a normal refresh already passed, e.g. after a change to how reconciliation works" };
+
+var refreshCommand = new Command("refresh-tags", "Re-fetch previously-crawled posts by id to catch tag edits made on the site since crawl last saw them, reconciling each affected image's tags as the union of every known source's current tags (can both add and remove)");
+refreshCommand.Options.Add(sitesOption);
+refreshCommand.Options.Add(minImagesOption);
+refreshCommand.Options.Add(outputDirOption);
+refreshCommand.Options.Add(inputSizeOption);
+refreshCommand.Options.Add(danbooruLoginOption);
+refreshCommand.Options.Add(danbooruApiKeyOption);
+refreshCommand.Options.Add(gelbooruApiKeyOption);
+refreshCommand.Options.Add(gelbooruUserIdOption);
+refreshCommand.Options.Add(rateDanbooruOption);
+refreshCommand.Options.Add(rateGelbooruOption);
+refreshCommand.Options.Add(resetOption);
+refreshCommand.SetAction(async (parseResult, cancellationToken) =>
+{
+    var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
+    var minImages = parseResult.GetRequiredValue(minImagesOption);
+    var sites = parseResult.GetRequiredValue(sitesOption);
+    var inputSize = parseResult.GetRequiredValue(inputSizeOption);
+    var rateDanbooru = parseResult.GetRequiredValue(rateDanbooruOption);
+    var rateGelbooru = parseResult.GetRequiredValue(rateGelbooruOption);
+    var reset = parseResult.GetRequiredValue(resetOption);
+
+    using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
+
+    var allTags = await db.GetAllSurveyedTagsAsync(cancellationToken);
+    if (allTags.Count == 0)
+    {
+        Console.Error.WriteLine("No surveyed tags found — run 'survey-tags' (and 'crawl') against this --output-dir first.");
+        return 1;
+    }
+
+    var clients = BuildClients(
+        sites, httpClient, rateDanbooru, rateGelbooru,
+        parseResult.GetValue(danbooruLoginOption), parseResult.GetValue(danbooruApiKeyOption),
+        parseResult.GetValue(gelbooruApiKeyOption), parseResult.GetValue(gelbooruUserIdOption));
+
+    RefreshResult result;
+    try
+    {
+        result = await AnsiConsole.Progress()
+            .Columns(ProgressBarColumns.Default)
+            .StartAsync(async ctx =>
+            {
+                var progress = ProgressBarColumns.AddRefreshTasks(ctx);
+                return await TagRefresher.RunAsync(db, clients, outputDirectory, inputSize, minImages, reset, progress, cancellationToken);
+            });
+    }
+    catch (AllSitesUnavailableException ex)
+    {
+        AnsiConsole.MarkupLine("[red]Every configured site failed — nothing left to refresh with:[/]");
+        foreach (var (site, reason) in ex.FailedSites)
+            AnsiConsole.MarkupLine($"[red]  {Markup.Escape(site)}: {Markup.Escape(reason)}[/]");
+        Console.Error.WriteLine("Exiting. Refresh progress is checkpointed, so re-running once connectivity is restored resumes without redoing work.");
+        return 1;
+    }
+
+    if (result.FailedSites.Count > 0)
+    {
+        AnsiConsole.MarkupLine("[yellow]The following site(s) went unavailable partway through this run and were skipped for its remainder — the next run will pick each back up from where it left off:[/]");
+        foreach (var (site, reason) in result.FailedSites)
+            AnsiConsole.MarkupLine($"[yellow]  {Markup.Escape(site)}: {Markup.Escape(reason)}[/]");
+    }
+
+    Console.WriteLine($"Done. Checked {result.SourcesChecked} source(s); {result.ImagesChanged} image(s) had their tags updated.");
+    return 0;
+});
+
 var rootCommand = new RootCommand("unbooru-tagger booru crawler (downloads Danbooru/Gelbooru images+tags directly into a trainable dataset directory)")
 {
     surveyCommand,
-    crawlCommand
+    crawlCommand,
+    refreshCommand
 };
 
 return await rootCommand.Parse(args).InvokeAsync();

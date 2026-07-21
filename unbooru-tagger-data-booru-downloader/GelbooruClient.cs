@@ -115,4 +115,11 @@ public sealed class GelbooruClient(HttpClient http, IRateLimiter rateLimiter, st
         var nextCursor = rawCount == PageSize ? lastRawId!.Value.ToString(CultureInfo.InvariantCulture) : null;
         return new BooruPostPage(posts, nextCursor);
     }
+
+    /// <summary>Gelbooru's dapi supports the same <c>id:N</c> meta-tag syntax as Danbooru, so a single-post lookup is just a one-result tag search — no separate endpoint needed.</summary>
+    public async Task<BooruPost?> GetPostAsync(long postId, CancellationToken cancellationToken = default)
+    {
+        var page = await ListPostsAsync($"id:{postId}", cursor: null, cancellationToken).ConfigureAwait(false);
+        return page.Posts.Count > 0 ? page.Posts[0] : null;
+    }
 }

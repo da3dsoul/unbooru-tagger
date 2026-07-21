@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Data.Sqlite;
 
 namespace UnbooruTagger.Crawler;
@@ -25,13 +26,35 @@ public sealed record PendingNewImage(
     ulong PHash);
 
 /// <summary>A post whose image matched an already-known one (exact md5 or perceptual near-duplicate) — just another provenance row against the canonical image's md5, buffered the same way as <see cref="PendingNewImage"/>.</summary>
+/// <param name="Tags">This source's own eligible tags as observed right now — its per-source snapshot for later reconciliation by <c>refresh-tags</c> (see <see cref="CrawlDatabase.ApplyRefreshBatchAsync"/>), not the merged result written to <c>tag_rows.jsonl</c>.</param>
+/// <param name="FetchedAt">When we actually observed <paramref name="Tags"/> (now) — distinct from <paramref name="PostDate"/>, which is the post's own creation date on the site.</param>
 public sealed record PendingAdditionalSource(
     string CanonicalMd5,
     string Site,
     long PostId,
     string PostUrl,
     string Rating,
-    DateTimeOffset PostDate);
+    DateTimeOffset PostDate,
+    IReadOnlyList<string> Tags,
+    DateTimeOffset FetchedAt);
+
+/// <summary>
+/// One source's current, freshly-refetched tag snapshot — <c>refresh-tags</c>'s unit of
+/// work, applied via <see cref="CrawlDatabase.ApplyRefreshBatchAsync"/>.
+/// </summary>
+/// <param name="Tags">
+/// Always a real (possibly empty) list, never <see langword="null"/> — a deleted/banned
+/// post or one with zero eligible tags is an empty list, a fully <em>known</em> state,
+/// not "unknown". <see langword="null"/> is reserved for <see cref="ImageSourceSnapshot"/>
+/// rows this feature has never touched at all; storing an empty list here instead of
+/// null is exactly what turns "unknown" into "known" the first time a source is
+/// refreshed, which is what lets that source's absence ever actually count toward
+/// dropping a tag.
+/// </param>
+public sealed record RefreshedSourceTags(string Site, long PostId, string CanonicalMd5, IReadOnlyList<string> Tags, DateTimeOffset FetchedAt);
+
+/// <summary>One already-known source's last-captured tag snapshot, for <c>refresh-tags</c> to compute an image's reconciled tag set across every source it has. <see langword="null"/> <c>Tags</c> means this source has never been captured (pre-migration data, or a source recorded before this feature existed) — see <see cref="TagRefresher"/> for how that's handled without risking a premature drop.</summary>
+public sealed record ImageSourceSnapshot(string Site, long PostId, IReadOnlyList<string>? Tags);
 
 /// <summary>
 /// Crawl-only bookkeeping, stored as <c>crawl.sqlite</c> inside the dataset
@@ -107,6 +130,12 @@ public sealed class CrawlDatabase : IDisposable
                 PostDate TEXT NOT NULL,
                 PRIMARY KEY (Site, PostId)
             );
+
+            CREATE TABLE IF NOT EXISTS RefreshProgress (
+                Site TEXT PRIMARY KEY,
+                LastPostId INTEGER NOT NULL DEFAULT 0,
+                Done INTEGER NOT NULL DEFAULT 0
+            );
             """;
 
         var command = _connection.CreateCommand();
@@ -116,6 +145,13 @@ public sealed class CrawlDatabase : IDisposable
         // Added after the initial schema — migrate in place so an interrupted crawl
         // against an older crawl.sqlite can resume instead of needing a fresh one.
         await EnsureColumnAsync("Images", "PHash", "INTEGER NOT NULL DEFAULT 0", cancellationToken).ConfigureAwait(false);
+
+        // NULL (not '[]') on a pre-existing row means "never captured" — refresh-tags
+        // treats that as unknown rather than "confirmed zero tags", so it can never
+        // cause a premature drop from an image whose other sources just haven't been
+        // reached yet. See ImageSourceSnapshot's doc comment.
+        await EnsureColumnAsync("ImageSources", "Tags", "TEXT NULL", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync("ImageSources", "FetchedAt", "TEXT NULL", cancellationToken).ConfigureAwait(false);
     }
 
     private async Task EnsureColumnAsync(string table, string column, string definition, CancellationToken cancellationToken)
@@ -319,10 +355,19 @@ public sealed class CrawlDatabase : IDisposable
     /// referencing cache rows the reopened (and truncated-back-to-last-flush) cache file
     /// no longer has, which is silent, permanent data loss instead: those images would
     /// look already-cached forever and never get retried.
+    ///
+    /// <paramref name="mergedTagCounts"/> is a flat, one-per-occurrence list of tag
+    /// names to bump <c>CombinedPositiveCount</c> for — a duplicate image (matched by
+    /// md5 or perceptual hash) that carries a tag its earlier-seen copy didn't now
+    /// counts as a positive example for that tag too, even though it isn't a new
+    /// <see cref="PendingNewImage"/> row. Same idempotency caveat as everything else
+    /// here: only reached once its checkpoint's <c>PreprocessedDatasetCacheWriter.MergeTagRows</c>
+    /// call has already durably rewritten the corresponding label-file row.
     /// </summary>
     public Task CommitPendingImagesAsync(
         IReadOnlyList<PendingNewImage> newImages,
         IReadOnlyList<PendingAdditionalSource> additionalSources,
+        IReadOnlyList<string> mergedTagCounts,
         CancellationToken cancellationToken = default) =>
         WithLockAsync(async () =>
         {
@@ -339,16 +384,34 @@ public sealed class CrawlDatabase : IDisposable
             var imgDownloadedAt = insertImage.Parameters.Add("$downloadedAt", SqliteType.Text);
             var imgPHash = insertImage.Parameters.Add("$phash", SqliteType.Integer);
 
+            // An upsert, not INSERT OR IGNORE: a post we've already recorded as a source
+            // can turn up again in a later crawl (the same tag gets re-listed, a
+            // near-duplicate check re-matches it, ...), and when it does we have its
+            // current tags for free right there — refreshing Tags/FetchedAt here is what
+            // keeps refresh-tags from being the only way a source's snapshot ever
+            // updates. PostUrl/Rating/PostDate are refreshed too since there's no reason
+            // not to once we're already writing the row.
             var insertSource = _connection.CreateCommand();
             insertSource.Transaction = transaction;
             insertSource.CommandText =
-                "INSERT OR IGNORE INTO ImageSources (Md5, Site, PostId, PostUrl, Rating, PostDate) VALUES ($md5, $site, $postId, $postUrl, $rating, $postDate);";
+                """
+                INSERT INTO ImageSources (Md5, Site, PostId, PostUrl, Rating, PostDate, Tags, FetchedAt)
+                VALUES ($md5, $site, $postId, $postUrl, $rating, $postDate, $tags, $fetchedAt)
+                ON CONFLICT(Site, PostId) DO UPDATE SET
+                    PostUrl = $postUrl,
+                    Rating = $rating,
+                    PostDate = $postDate,
+                    Tags = $tags,
+                    FetchedAt = $fetchedAt;
+                """;
             var srcMd5 = insertSource.Parameters.Add("$md5", SqliteType.Text);
             var srcSite = insertSource.Parameters.Add("$site", SqliteType.Text);
             var srcPostId = insertSource.Parameters.Add("$postId", SqliteType.Integer);
             var srcPostUrl = insertSource.Parameters.Add("$postUrl", SqliteType.Text);
             var srcRating = insertSource.Parameters.Add("$rating", SqliteType.Text);
             var srcPostDate = insertSource.Parameters.Add("$postDate", SqliteType.Text);
+            var srcTags = insertSource.Parameters.Add("$tags", SqliteType.Text);
+            var srcFetchedAt = insertSource.Parameters.Add("$fetchedAt", SqliteType.Text);
 
             var incrementCount = _connection.CreateCommand();
             incrementCount.Transaction = transaction;
@@ -373,6 +436,8 @@ public sealed class CrawlDatabase : IDisposable
                 srcPostUrl.Value = image.PostUrl;
                 srcRating.Value = image.Rating;
                 srcPostDate.Value = image.PostDate.ToString("O");
+                srcTags.Value = JsonSerializer.Serialize(image.EligibleTags);
+                srcFetchedAt.Value = image.DownloadedAt.ToString("O");
                 await insertSource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
 
                 foreach (var tag in image.EligibleTags)
@@ -392,8 +457,155 @@ public sealed class CrawlDatabase : IDisposable
                 srcPostUrl.Value = source.PostUrl;
                 srcRating.Value = source.Rating;
                 srcPostDate.Value = source.PostDate.ToString("O");
+                srcTags.Value = JsonSerializer.Serialize(source.Tags);
+                srcFetchedAt.Value = source.FetchedAt.ToString("O");
                 await insertSource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
+
+            foreach (var tag in mergedTagCounts)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                incName.Value = tag;
+                await incrementCount.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }, cancellationToken);
+
+    /// <summary>Resumable cursor for <c>refresh-tags</c>' per-site sweep through <c>ImageSources</c>, ordered by <c>PostId</c> ascending — same pattern as <see cref="TagProgressState"/>, one row per site instead of per (tag, site, phase).</summary>
+    public Task<(long LastPostId, bool Done)> GetRefreshProgressAsync(string site, CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = "SELECT LastPostId, Done FROM RefreshProgress WHERE Site = $site;";
+            command.Parameters.AddWithValue("$site", site);
+
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                return (0L, false);
+
+            return (reader.GetInt64(0), reader.GetInt32(1) != 0);
+        }, cancellationToken);
+
+    public Task SaveRefreshProgressAsync(string site, long lastPostId, bool done, CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText =
+                """
+                INSERT INTO RefreshProgress (Site, LastPostId, Done)
+                VALUES ($site, $lastPostId, $done)
+                ON CONFLICT(Site) DO UPDATE SET LastPostId = $lastPostId, Done = $done;
+                """;
+            command.Parameters.AddWithValue("$site", site);
+            command.Parameters.AddWithValue("$lastPostId", lastPostId);
+            command.Parameters.AddWithValue("$done", done ? 1 : 0);
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }, cancellationToken);
+
+    /// <summary>The next batch of known sources for <paramref name="site"/> to refetch, ordered by <c>PostId</c> ascending starting just after <paramref name="afterPostId"/> — <c>refresh-tags</c>' unit of work per checkpoint.</summary>
+    public Task<IReadOnlyList<(long PostId, string Md5)>> GetSourcesBatchAsync(string site, long afterPostId, int limit, CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = "SELECT PostId, Md5 FROM ImageSources WHERE Site = $site AND PostId > $after ORDER BY PostId ASC LIMIT $limit;";
+            command.Parameters.AddWithValue("$site", site);
+            command.Parameters.AddWithValue("$after", afterPostId);
+            command.Parameters.AddWithValue("$limit", limit);
+
+            var results = new List<(long, string)>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                results.Add((reader.GetInt64(0), reader.GetString(1)));
+            return (IReadOnlyList<(long PostId, string Md5)>)results;
+        }, cancellationToken);
+
+    /// <summary>Every known source's last-captured tag snapshot for one canonical image — what <c>refresh-tags</c> unions (see <see cref="ImageSourceSnapshot"/>) to reconcile that image's tag set after refetching one of its sources.</summary>
+    public Task<IReadOnlyList<ImageSourceSnapshot>> GetImageSourceSnapshotsAsync(string md5, CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = "SELECT Site, PostId, Tags FROM ImageSources WHERE Md5 = $md5;";
+            command.Parameters.AddWithValue("$md5", md5);
+
+            var results = new List<ImageSourceSnapshot>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var tags = reader.IsDBNull(2) ? null : JsonSerializer.Deserialize<List<string>>(reader.GetString(2));
+                results.Add(new ImageSourceSnapshot(reader.GetString(0), reader.GetInt64(1), tags));
+            }
+            return (IReadOnlyList<ImageSourceSnapshot>)results;
+        }, cancellationToken);
+
+    /// <summary>
+    /// Durably commits one <c>refresh-tags</c> checkpoint: each refetched source's new
+    /// tag snapshot, the net <c>CombinedPositiveCount</c> change per tag that reconciling
+    /// those snapshots produced (positive for a tag newly covered, negative for one no
+    /// source asserts anymore — see <see cref="TagRefresher"/>), and the sweep cursor,
+    /// all in one transaction so a crash never leaves the cursor ahead of the snapshot
+    /// updates it implies already happened.
+    /// </summary>
+    public Task ApplyRefreshBatchAsync(
+        IReadOnlyList<RefreshedSourceTags> refreshedSources,
+        IReadOnlyDictionary<string, int> combinedPositiveCountDeltas,
+        string site,
+        long lastPostId,
+        bool done,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            await using var transaction = _connection.BeginTransaction();
+
+            var updateSource = _connection.CreateCommand();
+            updateSource.Transaction = transaction;
+            updateSource.CommandText = "UPDATE ImageSources SET Tags = $tags, FetchedAt = $fetchedAt WHERE Site = $site AND PostId = $postId;";
+            var updSite = updateSource.Parameters.Add("$site", SqliteType.Text);
+            var updPostId = updateSource.Parameters.Add("$postId", SqliteType.Integer);
+            var updTags = updateSource.Parameters.Add("$tags", SqliteType.Text);
+            var updFetchedAt = updateSource.Parameters.Add("$fetchedAt", SqliteType.Text);
+
+            foreach (var refreshed in refreshedSources)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                updSite.Value = refreshed.Site;
+                updPostId.Value = refreshed.PostId;
+                updTags.Value = JsonSerializer.Serialize(refreshed.Tags);
+                updFetchedAt.Value = refreshed.FetchedAt.ToString("O");
+                await updateSource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            var adjustCount = _connection.CreateCommand();
+            adjustCount.Transaction = transaction;
+            adjustCount.CommandText = "UPDATE Tags SET CombinedPositiveCount = CombinedPositiveCount + $delta WHERE Name = $name;";
+            var adjName = adjustCount.Parameters.Add("$name", SqliteType.Text);
+            var adjDelta = adjustCount.Parameters.Add("$delta", SqliteType.Integer);
+
+            foreach (var (name, delta) in combinedPositiveCountDeltas)
+            {
+                if (delta == 0)
+                    continue;
+
+                cancellationToken.ThrowIfCancellationRequested();
+                adjName.Value = name;
+                adjDelta.Value = delta;
+                await adjustCount.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            var saveProgress = _connection.CreateCommand();
+            saveProgress.Transaction = transaction;
+            saveProgress.CommandText =
+                """
+                INSERT INTO RefreshProgress (Site, LastPostId, Done)
+                VALUES ($site, $lastPostId, $done)
+                ON CONFLICT(Site) DO UPDATE SET LastPostId = $lastPostId, Done = $done;
+                """;
+            saveProgress.Parameters.AddWithValue("$site", site);
+            saveProgress.Parameters.AddWithValue("$lastPostId", lastPostId);
+            saveProgress.Parameters.AddWithValue("$done", done ? 1 : 0);
+            await saveProgress.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }, cancellationToken);
