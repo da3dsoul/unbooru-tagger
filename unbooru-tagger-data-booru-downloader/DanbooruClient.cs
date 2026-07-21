@@ -94,4 +94,11 @@ public sealed class DanbooruClient(HttpClient http, IRateLimiter rateLimiter, st
         var nextCursor = rawCount == PageSize ? lastRawId!.Value.ToString(CultureInfo.InvariantCulture) : null;
         return new BooruPostPage(posts, nextCursor);
     }
+
+    /// <summary><c>id:N</c> is a documented Danbooru meta-tag, so a single-post lookup is just a one-result tag search — no separate endpoint needed.</summary>
+    public async Task<BooruPost?> GetPostAsync(long postId, CancellationToken cancellationToken = default)
+    {
+        var page = await ListPostsAsync($"id:{postId}", cursor: null, cancellationToken).ConfigureAwait(false);
+        return page.Posts.Count > 0 ? page.Posts[0] : null;
+    }
 }

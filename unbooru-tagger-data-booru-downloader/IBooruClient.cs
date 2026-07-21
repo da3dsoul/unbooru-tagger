@@ -26,4 +26,12 @@ public interface IBooruClient
     /// the <see cref="BooruPostPage.NextCursor"/> this same client returned last call.
     /// </summary>
     Task<BooruPostPage> ListPostsAsync(string tagQuery, string? cursor, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Refetches one specific post by id — <c>refresh-tags</c>' way of checking whether a
+    /// previously-crawled post's tags have changed. Returns <see langword="null"/> if the
+    /// post no longer exists (deleted/banned), which callers should treat as this source
+    /// now asserting zero tags rather than an error.
+    /// </summary>
+    Task<BooruPost?> GetPostAsync(long postId, CancellationToken cancellationToken = default);
 }
