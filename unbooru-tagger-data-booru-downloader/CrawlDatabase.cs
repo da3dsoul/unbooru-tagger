@@ -6,6 +6,34 @@ namespace UnbooruTagger.Crawler;
 public sealed record TagProgressState(string? Cursor, int PostsFetched, bool Done);
 
 /// <summary>
+/// One newly-downloaded, not-yet-durable image, buffered by <see cref="DatasetCrawler"/>
+/// until its page's checkpoint commits it — see <see cref="CrawlDatabase.CommitPendingImagesAsync"/>
+/// for why this can't just be written to <c>crawl.sqlite</c> the moment it's appended.
+/// </summary>
+public sealed record PendingNewImage(
+    string Md5,
+    int CacheRowIndex,
+    int Width,
+    int Height,
+    DateTimeOffset DownloadedAt,
+    string Site,
+    long PostId,
+    string PostUrl,
+    string Rating,
+    DateTimeOffset PostDate,
+    IReadOnlyCollection<string> EligibleTags,
+    ulong PHash);
+
+/// <summary>A post whose image matched an already-known one (exact md5 or perceptual near-duplicate) — just another provenance row against the canonical image's md5, buffered the same way as <see cref="PendingNewImage"/>.</summary>
+public sealed record PendingAdditionalSource(
+    string CanonicalMd5,
+    string Site,
+    long PostId,
+    string PostUrl,
+    string Rating,
+    DateTimeOffset PostDate);
+
+/// <summary>
 /// Crawl-only bookkeeping, stored as <c>crawl.sqlite</c> inside the dataset
 /// <c>--output-dir</c> alongside <c>images.bin</c>/<c>tag_rows.jsonl</c>/
 /// <c>tag_vocabulary.json</c>. Never read by training/inference — this is purely this
@@ -84,6 +112,35 @@ public sealed class CrawlDatabase : IDisposable
         var command = _connection.CreateCommand();
         command.CommandText = sql;
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+
+        // Added after the initial schema — migrate in place so an interrupted crawl
+        // against an older crawl.sqlite can resume instead of needing a fresh one.
+        await EnsureColumnAsync("Images", "PHash", "INTEGER NOT NULL DEFAULT 0", cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task EnsureColumnAsync(string table, string column, string definition, CancellationToken cancellationToken)
+    {
+        var checkCommand = _connection.CreateCommand();
+        checkCommand.CommandText = $"PRAGMA table_info({table});";
+        var hasColumn = false;
+        await using (var reader = await checkCommand.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        {
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (string.Equals(reader.GetString(1), column, StringComparison.Ordinal))
+                {
+                    hasColumn = true;
+                    break;
+                }
+            }
+        }
+
+        if (!hasColumn)
+        {
+            var alterCommand = _connection.CreateCommand();
+            alterCommand.CommandText = $"ALTER TABLE {table} ADD COLUMN {column} {definition};";
+            await alterCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private async Task<T> WithLockAsync<T>(Func<Task<T>> action, CancellationToken cancellationToken)
@@ -106,11 +163,25 @@ public sealed class CrawlDatabase : IDisposable
             return true;
         }, cancellationToken);
 
-    /// <summary>Inserts or refreshes one tag's per-site survey counts.</summary>
-    public Task UpsertTagSurveyAsync(string name, int? danbooruCount, int? gelbooruCount, bool eligible, DateTimeOffset surveyedAt, CancellationToken cancellationToken = default) =>
+    /// <summary>
+    /// Upserts every surveyed tag's per-site counts in a single transaction. A
+    /// `survey-tags` run against a large vocabulary can have tens of thousands of
+    /// eligible tags; one auto-committed SQLite write each (its own fsync) is the
+    /// dominant cost of the whole command and gives no visible progress, whereas one
+    /// transaction is a single fsync on commit — <paramref name="onRowWritten"/> lets
+    /// the caller still report per-row progress.
+    /// </summary>
+    public Task UpsertTagSurveysAsync(
+        IEnumerable<(string Name, int? DanbooruCount, int? GelbooruCount, bool Eligible)> entries,
+        DateTimeOffset surveyedAt,
+        Action<int>? onRowWritten,
+        CancellationToken cancellationToken = default) =>
         WithLockAsync(async () =>
         {
+            await using var transaction = _connection.BeginTransaction();
+
             var command = _connection.CreateCommand();
+            command.Transaction = transaction;
             command.CommandText =
                 """
                 INSERT INTO Tags (Name, DanbooruCount, GelbooruCount, Eligible, SurveyedAt, CombinedPositiveCount)
@@ -121,12 +192,29 @@ public sealed class CrawlDatabase : IDisposable
                     Eligible = $eligible,
                     SurveyedAt = $surveyedAt;
                 """;
-            command.Parameters.AddWithValue("$name", name);
-            command.Parameters.AddWithValue("$danbooru", (object?)danbooruCount ?? DBNull.Value);
-            command.Parameters.AddWithValue("$gelbooru", (object?)gelbooruCount ?? DBNull.Value);
-            command.Parameters.AddWithValue("$eligible", eligible ? 1 : 0);
-            command.Parameters.AddWithValue("$surveyedAt", surveyedAt.ToString("O"));
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            var nameParam = command.Parameters.Add("$name", SqliteType.Text);
+            var danbooruParam = command.Parameters.Add("$danbooru", SqliteType.Integer);
+            var gelbooruParam = command.Parameters.Add("$gelbooru", SqliteType.Integer);
+            var eligibleParam = command.Parameters.Add("$eligible", SqliteType.Integer);
+            var surveyedAtParam = command.Parameters.Add("$surveyedAt", SqliteType.Text);
+            surveyedAtParam.Value = surveyedAt.ToString("O");
+
+            var written = 0;
+            foreach (var entry in entries)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                nameParam.Value = entry.Name;
+                danbooruParam.Value = (object?)entry.DanbooruCount ?? DBNull.Value;
+                gelbooruParam.Value = (object?)entry.GelbooruCount ?? DBNull.Value;
+                eligibleParam.Value = entry.Eligible ? 1 : 0;
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+
+                written++;
+                onRowWritten?.Invoke(written);
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }, cancellationToken);
 
     /// <summary>All surveyed tags, eligible or not — the caller filters/orders as needed (see <see cref="TagEligibility"/>/<see cref="CrawlScheduling"/>).</summary>
@@ -188,34 +276,53 @@ public sealed class CrawlDatabase : IDisposable
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }, cancellationToken);
 
-    /// <summary>The cache row index a given md5 was already appended at, or null if this image has never been seen.</summary>
-    public Task<int?> FindCacheRowIndexAsync(string md5, CancellationToken cancellationToken = default) =>
+    /// <summary>
+    /// Every already-cached image's md5/cache-row-index/perceptual-hash, for seeding the
+    /// in-memory dedup index (exact and near-duplicate) a crawl run checks new downloads
+    /// against — see <see cref="PerceptualHash"/> and <see cref="DatasetCrawler"/>'s
+    /// working state. Kept purely in memory during a run rather than re-querying per
+    /// post: with a corpus that can reach millions of rows, a DB round trip per post
+    /// would make dedup checks the dominant cost of the whole crawl.
+    /// </summary>
+    public Task<IReadOnlyList<(string Md5, int CacheRowIndex, ulong PHash)>> GetAllImagesAsync(CancellationToken cancellationToken = default) =>
         WithLockAsync(async () =>
         {
             var command = _connection.CreateCommand();
-            command.CommandText = "SELECT CacheRowIndex FROM Images WHERE Md5 = $md5;";
-            command.Parameters.AddWithValue("$md5", md5);
-            var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-            return result is null ? (int?)null : Convert.ToInt32(result);
+            command.CommandText = "SELECT Md5, CacheRowIndex, PHash FROM Images;";
+            var results = new List<(string, int, ulong)>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                results.Add((reader.GetString(0), reader.GetInt32(1), unchecked((ulong)reader.GetInt64(2))));
+            return (IReadOnlyList<(string Md5, int CacheRowIndex, ulong PHash)>)results;
+        }, cancellationToken);
+
+    /// <summary>Every surveyed tag's durable <c>CombinedPositiveCount</c>, for seeding the in-memory counters a crawl run updates live and only checkpoints periodically (see <see cref="CommitPendingImagesAsync"/>).</summary>
+    public Task<IReadOnlyDictionary<string, int>> GetAllCombinedPositiveCountsAsync(CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = "SELECT Name, CombinedPositiveCount FROM Tags;";
+            var results = new Dictionary<string, int>(StringComparer.Ordinal);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                results[reader.GetString(0)] = reader.GetInt32(1);
+            return (IReadOnlyDictionary<string, int>)results;
         }, cancellationToken);
 
     /// <summary>
-    /// Records a newly-appended image: its dedup row, its provenance, and — for every
-    /// eligible tag it carries — credit toward that tag's <c>CombinedPositiveCount</c>
-    /// (not just whichever tag drove the search that found it).
+    /// Durably commits every image/source buffered since the last checkpoint, in one
+    /// transaction. Deliberately not one write per image (as the crawl processes posts):
+    /// this is called only once the same checkpoint has already flushed the pixel/label
+    /// cache and the vocabulary delta, so a crash before this point just means a
+    /// still-pending image gets redownloaded and reprocessed next run (wasted work, not
+    /// corruption) — writing it durably any earlier would let this dedup index end up
+    /// referencing cache rows the reopened (and truncated-back-to-last-flush) cache file
+    /// no longer has, which is silent, permanent data loss instead: those images would
+    /// look already-cached forever and never get retried.
     /// </summary>
-    public Task RecordNewImageAsync(
-        string md5,
-        int cacheRowIndex,
-        int width,
-        int height,
-        DateTimeOffset downloadedAt,
-        string site,
-        long postId,
-        string postUrl,
-        string rating,
-        DateTimeOffset postDate,
-        IReadOnlyCollection<string> eligibleTagsOnPost,
+    public Task CommitPendingImagesAsync(
+        IReadOnlyList<PendingNewImage> newImages,
+        IReadOnlyList<PendingAdditionalSource> additionalSources,
         CancellationToken cancellationToken = default) =>
         WithLockAsync(async () =>
         {
@@ -224,71 +331,71 @@ public sealed class CrawlDatabase : IDisposable
             var insertImage = _connection.CreateCommand();
             insertImage.Transaction = transaction;
             insertImage.CommandText =
-                "INSERT INTO Images (Md5, CacheRowIndex, Width, Height, DownloadedAt) VALUES ($md5, $row, $w, $h, $downloadedAt);";
-            insertImage.Parameters.AddWithValue("$md5", md5);
-            insertImage.Parameters.AddWithValue("$row", cacheRowIndex);
-            insertImage.Parameters.AddWithValue("$w", width);
-            insertImage.Parameters.AddWithValue("$h", height);
-            insertImage.Parameters.AddWithValue("$downloadedAt", downloadedAt.ToString("O"));
-            await insertImage.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                "INSERT INTO Images (Md5, CacheRowIndex, Width, Height, DownloadedAt, PHash) VALUES ($md5, $row, $w, $h, $downloadedAt, $phash);";
+            var imgMd5 = insertImage.Parameters.Add("$md5", SqliteType.Text);
+            var imgRow = insertImage.Parameters.Add("$row", SqliteType.Integer);
+            var imgWidth = insertImage.Parameters.Add("$w", SqliteType.Integer);
+            var imgHeight = insertImage.Parameters.Add("$h", SqliteType.Integer);
+            var imgDownloadedAt = insertImage.Parameters.Add("$downloadedAt", SqliteType.Text);
+            var imgPHash = insertImage.Parameters.Add("$phash", SqliteType.Integer);
 
             var insertSource = _connection.CreateCommand();
             insertSource.Transaction = transaction;
             insertSource.CommandText =
                 "INSERT OR IGNORE INTO ImageSources (Md5, Site, PostId, PostUrl, Rating, PostDate) VALUES ($md5, $site, $postId, $postUrl, $rating, $postDate);";
-            insertSource.Parameters.AddWithValue("$md5", md5);
-            insertSource.Parameters.AddWithValue("$site", site);
-            insertSource.Parameters.AddWithValue("$postId", postId);
-            insertSource.Parameters.AddWithValue("$postUrl", postUrl);
-            insertSource.Parameters.AddWithValue("$rating", rating);
-            insertSource.Parameters.AddWithValue("$postDate", postDate.ToString("O"));
-            await insertSource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            var srcMd5 = insertSource.Parameters.Add("$md5", SqliteType.Text);
+            var srcSite = insertSource.Parameters.Add("$site", SqliteType.Text);
+            var srcPostId = insertSource.Parameters.Add("$postId", SqliteType.Integer);
+            var srcPostUrl = insertSource.Parameters.Add("$postUrl", SqliteType.Text);
+            var srcRating = insertSource.Parameters.Add("$rating", SqliteType.Text);
+            var srcPostDate = insertSource.Parameters.Add("$postDate", SqliteType.Text);
 
-            foreach (var tag in eligibleTagsOnPost)
+            var incrementCount = _connection.CreateCommand();
+            incrementCount.Transaction = transaction;
+            incrementCount.CommandText = "UPDATE Tags SET CombinedPositiveCount = CombinedPositiveCount + 1 WHERE Name = $name;";
+            var incName = incrementCount.Parameters.Add("$name", SqliteType.Text);
+
+            foreach (var image in newImages)
             {
-                var increment = _connection.CreateCommand();
-                increment.Transaction = transaction;
-                increment.CommandText = "UPDATE Tags SET CombinedPositiveCount = CombinedPositiveCount + 1 WHERE Name = $name;";
-                increment.Parameters.AddWithValue("$name", tag);
-                await increment.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                imgMd5.Value = image.Md5;
+                imgRow.Value = image.CacheRowIndex;
+                imgWidth.Value = image.Width;
+                imgHeight.Value = image.Height;
+                imgDownloadedAt.Value = image.DownloadedAt.ToString("O");
+                imgPHash.Value = unchecked((long)image.PHash);
+                await insertImage.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+
+                srcMd5.Value = image.Md5;
+                srcSite.Value = image.Site;
+                srcPostId.Value = image.PostId;
+                srcPostUrl.Value = image.PostUrl;
+                srcRating.Value = image.Rating;
+                srcPostDate.Value = image.PostDate.ToString("O");
+                await insertSource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+
+                foreach (var tag in image.EligibleTags)
+                {
+                    incName.Value = tag;
+                    await incrementCount.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            foreach (var source in additionalSources)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                srcMd5.Value = source.CanonicalMd5;
+                srcSite.Value = source.Site;
+                srcPostId.Value = source.PostId;
+                srcPostUrl.Value = source.PostUrl;
+                srcRating.Value = source.Rating;
+                srcPostDate.Value = source.PostDate.ToString("O");
+                await insertSource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        }, cancellationToken);
-
-    /// <summary>Adds a provenance row for a post whose image was already recorded under a different site/post — the same artwork cross-posted, so no new <c>Images</c> row or tag credit is needed, just the additional source.</summary>
-    public Task RecordAdditionalSourceAsync(string md5, string site, long postId, string postUrl, string rating, DateTimeOffset postDate, CancellationToken cancellationToken = default) =>
-        WithLockAsync(async () =>
-        {
-            var command = _connection.CreateCommand();
-            command.CommandText =
-                "INSERT OR IGNORE INTO ImageSources (Md5, Site, PostId, PostUrl, Rating, PostDate) VALUES ($md5, $site, $postId, $postUrl, $rating, $postDate);";
-            command.Parameters.AddWithValue("$md5", md5);
-            command.Parameters.AddWithValue("$site", site);
-            command.Parameters.AddWithValue("$postId", postId);
-            command.Parameters.AddWithValue("$postUrl", postUrl);
-            command.Parameters.AddWithValue("$rating", rating);
-            command.Parameters.AddWithValue("$postDate", postDate.ToString("O"));
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }, cancellationToken);
-
-    public Task<int> GetCombinedPositiveCountAsync(string tagName, CancellationToken cancellationToken = default) =>
-        WithLockAsync(async () =>
-        {
-            var command = _connection.CreateCommand();
-            command.CommandText = "SELECT CombinedPositiveCount FROM Tags WHERE Name = $name;";
-            command.Parameters.AddWithValue("$name", tagName);
-            var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-            return result is null ? 0 : Convert.ToInt32(result);
-        }, cancellationToken);
-
-    public Task<int> GetTotalImageCountAsync(CancellationToken cancellationToken = default) =>
-        WithLockAsync(async () =>
-        {
-            var command = _connection.CreateCommand();
-            command.CommandText = "SELECT COUNT(*) FROM Images;";
-            var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-            return Convert.ToInt32(result);
         }, cancellationToken);
 
     public void Dispose()

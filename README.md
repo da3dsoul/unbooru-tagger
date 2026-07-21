@@ -216,12 +216,17 @@ Gelbooru public APIs into the same trainable dataset directory shape
 per-tag/site resumability, and cross-site image dedup.
 
 **1. Survey tags** — records each tag's per-site post count and which
-tags are worth crawling (`--min-images`, default 500):
+tags are worth crawling (`--min-images`, default 500). Gelbooru requires
+`--gelbooru-api-key`/`--gelbooru-user-id` (from your Gelbooru account's
+API settings page) even for this read-only listing — omitting them fails
+with a 401:
 
 ```sh
 dotnet run --project unbooru-tagger-data-booru-downloader -- survey-tags \
   --output-dir ./data/crawled \
-  --min-images 500
+  --min-images 500 \
+  --gelbooru-api-key <key> \
+  --gelbooru-user-id <user-id>
 ```
 
 Prints how many tags are eligible and an upper-bound estimate of the
@@ -237,16 +242,26 @@ dotnet run --project unbooru-tagger-data-booru-downloader -- crawl \
   --output-dir ./data/crawled \
   --min-images 500 \
   --max-images 1000 \
-  --input-size 224
+  --input-size 224 \
+  --gelbooru-api-key <key> \
+  --gelbooru-user-id <user-id>
 ```
 
 Re-running the same command resumes (per-tag/site pagination cursors,
 plus the cache's own resumability). An image satisfying several eligible
 tags at once is only ever downloaded once — both sites return a post's
 full tag list in the same response used to find it, so there's never a
-need to re-fetch or merge tags into an already-cached image. Optional
-`--danbooru-login`/`--danbooru-api-key` and
-`--gelbooru-api-key`/`--gelbooru-user-id` raise each site's rate-limit
+need to re-fetch or merge tags into an already-cached image. Dedup
+happens in two layers: an exact md5 check before ever downloading, plus
+a 64-bit DCT perceptual hash (`PerceptualHash`) computed after download
+and compared (Hamming distance <= 6) against every previously-cached
+image — this is what catches the same source image cross-posted to both
+sites after a re-encode/re-compress, which changes the md5 but not the
+content. Either way, the post is recorded as an additional source of the
+existing cache row rather than appended as a new image.
+`--gelbooru-api-key`/`--gelbooru-user-id` are required, not optional —
+Gelbooru rejects unauthenticated API requests with a 401. Optional
+`--danbooru-login`/`--danbooru-api-key` raises Danbooru's rate-limit
 tier; `--rate-danbooru`/`--rate-gelbooru` (defaults 4 and 2 requests/sec)
 cap request rate. `--negative-target` defaults to `2 * --min-images` —
 deliberately more negatives than positives, since an image with many tags

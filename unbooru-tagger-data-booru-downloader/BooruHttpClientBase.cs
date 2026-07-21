@@ -1,37 +1,29 @@
-using System.Net;
-
 namespace UnbooruTagger.Crawler;
 
 /// <summary>
-/// Shared rate-limited-GET-with-429-retry plumbing for <see cref="DanbooruClient"/> and
-/// <see cref="GelbooruClient"/>. Honors <c>Retry-After</c> when the site sends it,
-/// otherwise backs off exponentially starting at <see cref="InitialBackoff"/>, giving up
-/// on this one page (not the whole tag/site) after <see cref="MaxRetries"/> attempts.
+/// Shared rate-limited-GET plumbing for <see cref="DanbooruClient"/> and
+/// <see cref="GelbooruClient"/>. 429 retry itself lives in <see cref="TransientHttpRetry"/>,
+/// shared with <see cref="DatasetCrawler"/>'s raw image downloads — those go through the
+/// same per-site <see cref="RateLimiter"/> (exposed via <see cref="IBooruClient"/>) since
+/// they hit the same site/CDN and are subject to the same throttling in practice.
 /// </summary>
 public abstract class BooruHttpClientBase(HttpClient http, IRateLimiter rateLimiter)
 {
-    private const int MaxRetries = 5;
-    private static readonly TimeSpan InitialBackoff = TimeSpan.FromSeconds(5);
+    /// <summary>The same per-site limiter that gates this client's own JSON listing calls — reused for raw image downloads too (see <see cref="IBooruClient.RateLimiter"/>).</summary>
+    public IRateLimiter RateLimiter { get; } = rateLimiter;
 
     protected async Task<string> GetStringAsync(Uri uri, CancellationToken cancellationToken)
     {
-        for (var attempt = 1; ; attempt++)
-        {
-            await rateLimiter.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-            using var response = await http.GetAsync(uri, cancellationToken).ConfigureAwait(false);
-            if (response.StatusCode != HttpStatusCode.TooManyRequests)
+        using var response = await TransientHttpRetry.SendWithRetryAsync(
+            async () =>
             {
-                response.EnsureSuccessStatusCode();
-                return await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-            }
+                await RateLimiter.WaitAsync(cancellationToken).ConfigureAwait(false);
+                return await http.GetAsync(uri, cancellationToken).ConfigureAwait(false);
+            },
+            uri,
+            cancellationToken).ConfigureAwait(false);
 
-            if (attempt >= MaxRetries)
-                throw new HttpRequestException($"Rate-limited (429) after {MaxRetries} attempts: {uri}");
-
-            var delay = response.Headers.RetryAfter?.Delta
-                        ?? TimeSpan.FromSeconds(InitialBackoff.TotalSeconds * Math.Pow(2, attempt - 1));
-            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
-        }
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
     }
 }
