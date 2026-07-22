@@ -4,7 +4,7 @@ using UnbooruTagger.Crawler;
 
 var outputDirOption = new Option<string>("--output-dir") { Description = "Dataset directory — gets images.bin/tag_rows.jsonl/tag_vocabulary.json (same format build-large-cache produces) plus crawl.sqlite", Required = true };
 var minImagesOption = new Option<int>("--min-images") { Description = "Only crawl tags with at least this many posts on at least one site", DefaultValueFactory = _ => 500 };
-var maxImagesOption = new Option<int>("--max-images") { Description = "Cap on images pulled per eligible tag (combined across both sites)", DefaultValueFactory = _ => 1000 };
+var maxImagesOption = new Option<int>("--max-images") { Description = "Target images pulled per eligible tag, combined across all sites — each site still searches until it personally accounts for its own even share (ceil(--max-images / site count)), even after the combined total looks met, so one faster/bigger site can't starve a slower one out of ever contributing; a tag's actual combined count can end up slightly over this target as a result", DefaultValueFactory = _ => 1000 };
 
 var httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
 // Danbooru/Gelbooru (Cloudflare-fronted) reject requests with no User-Agent as a 403.
@@ -173,35 +173,16 @@ crawlCommand.SetAction(async (parseResult, cancellationToken) =>
     Console.WriteLine("Estimate (recomputed from the last survey-tags run):");
     PrintEstimate(estimate);
 
-    CrawlResult result;
-    try
-    {
-        result = await AnsiConsole.Progress()
-            .Columns(ProgressBarColumns.Default)
-            .StartAsync(async ctx =>
-            {
-                var progress = ProgressBarColumns.AddCrawlTasks(ctx);
-                return await DatasetCrawler.RunAsync(
-                    db, clients, httpClient, outputDirectory, inputSize,
-                    minImages, maxImages, negativeTarget, vocabCompactInterval,
-                    progress, cancellationToken);
-            });
-    }
-    catch (AllSitesUnavailableException ex)
-    {
-        AnsiConsole.MarkupLine("[red]Every configured site failed — nothing left to crawl with:[/]");
-        foreach (var (site, reason) in ex.FailedSites)
-            AnsiConsole.MarkupLine($"[red]  {Markup.Escape(site)}: {Markup.Escape(reason)}[/]");
-        Console.Error.WriteLine("Exiting. Per-tag progress is checkpointed, so re-running once connectivity is restored resumes without redoing work.");
-        return 1;
-    }
-
-    if (result.FailedSites.Count > 0)
-    {
-        AnsiConsole.MarkupLine("[yellow]The following site(s) went unavailable partway through this run and were skipped for its remainder — the next run will pick each back up from where it left off:[/]");
-        foreach (var (site, reason) in result.FailedSites)
-            AnsiConsole.MarkupLine($"[yellow]  {Markup.Escape(site)}: {Markup.Escape(reason)}[/]");
-    }
+    var result = await AnsiConsole.Progress()
+        .Columns(ProgressBarColumns.Default)
+        .StartAsync(async ctx =>
+        {
+            var progress = ProgressBarColumns.AddCrawlTasks(ctx, sites);
+            return await DatasetCrawler.RunAsync(
+                db, clients, httpClient, outputDirectory, inputSize,
+                minImages, maxImages, negativeTarget, vocabCompactInterval,
+                progress, cancellationToken);
+        });
 
     if (result.Shortfalls.Count > 0)
     {
@@ -214,6 +195,10 @@ crawlCommand.SetAction(async (parseResult, cancellationToken) =>
             shortfallTable.AddRow(shortfall.TagName, shortfall.Achieved.ToString(), shortfall.Target.ToString());
         AnsiConsole.Write(shortfallTable);
     }
+
+    var errorLogPath = CrawlErrorLog.ForDirectory(outputDirectory).LogPath;
+    if (File.Exists(errorLogPath))
+        AnsiConsole.MarkupLine($"[yellow]One or more sites hit an error during this run (each retried automatically) — see '{Markup.Escape(errorLogPath)}' for a durable record.[/]");
 
     Console.WriteLine($"Done. Dataset written to '{outputDirectory}'.");
     return 0;
@@ -264,7 +249,7 @@ refreshCommand.SetAction(async (parseResult, cancellationToken) =>
             .Columns(ProgressBarColumns.Default)
             .StartAsync(async ctx =>
             {
-                var progress = ProgressBarColumns.AddRefreshTasks(ctx);
+                var progress = ProgressBarColumns.AddRefreshTasks(ctx, sites);
                 return await TagRefresher.RunAsync(db, clients, outputDirectory, inputSize, minImages, reset, progress, cancellationToken);
             });
     }

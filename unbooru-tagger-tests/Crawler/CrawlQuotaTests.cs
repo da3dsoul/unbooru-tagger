@@ -79,26 +79,4 @@ public class CrawlSchedulingTests
 
         Assert.Equal(["apple", "zebra"], ordered);
     }
-
-    [Fact]
-    public void PickLeastLoadedSite_PicksFewestRequestsSoFar()
-    {
-        var requests = new Dictionary<string, int> { ["danbooru"] = 10, ["gelbooru"] = 3 };
-
-        Assert.Equal("gelbooru", CrawlScheduling.PickLeastLoadedSite(requests));
-    }
-
-    [Fact]
-    public void PickLeastLoadedSite_BreaksTiesByNameForDeterminism()
-    {
-        var requests = new Dictionary<string, int> { ["danbooru"] = 5, ["gelbooru"] = 5 };
-
-        Assert.Equal("danbooru", CrawlScheduling.PickLeastLoadedSite(requests));
-    }
-
-    [Fact]
-    public void PickLeastLoadedSite_ThrowsWhenEmpty()
-    {
-        Assert.Throws<ArgumentException>(() => CrawlScheduling.PickLeastLoadedSite(new Dictionary<string, int>()));
-    }
 }

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using UnbooruTagger.Core.Dataset;
 using UnbooruTagger.Core.Encoding;
 using UnbooruTagger.Core.Vocabulary;
@@ -13,16 +14,8 @@ namespace UnbooruTagger.Crawler;
 /// </summary>
 public sealed record TagShortfall(string TagName, int Achieved, int Target);
 
-/// <summary>
-/// <see cref="DatasetCrawler.RunAsync"/>'s outcome: the usual per-tag shortfalls, plus
-/// any site that went unavailable partway through and was dropped for the rest of the
-/// run (see <see cref="DatasetCrawler.RunTagPhaseAsync"/>). Empty when every configured
-/// site stayed healthy the whole run. Per-(tag,site,phase) progress for a dropped site
-/// is left exactly where its last successful page left it — not marked done — so the
-/// next run picks that site back up automatically instead of needing anything special
-/// to "resume" it.
-/// </summary>
-public sealed record CrawlResult(IReadOnlyList<TagShortfall> Shortfalls, IReadOnlyDictionary<string, string> FailedSites);
+/// <summary><see cref="DatasetCrawler.RunAsync"/>'s outcome. A site that failed at some point during the run never shows up here — it's retried with backoff until it succeeds or the run is cancelled (see <see cref="DatasetCrawler.RunSiteTagPhaseAsync"/>), not dropped; check <see cref="CrawlErrorLog"/> for a durable record of what happened while you weren't watching.</summary>
+public sealed record CrawlResult(IReadOnlyList<TagShortfall> Shortfalls);
 
 /// <summary>Up-front, pre-dedup estimate of what a crawl will cost — printed by <c>survey-tags</c> and recomputed as the first step of <c>crawl</c>.</summary>
 public sealed record CrawlEstimate(
@@ -40,12 +33,40 @@ public sealed record CrawlEstimate(
 /// successful checkpoint left off), then updated immediately as posts are processed —
 /// only the <em>durable</em> copy of new images/sources lags, deliberately, until the
 /// next per-page checkpoint (see <see cref="DatasetCrawler.RunAsync"/>).
+///
+/// One concurrent worker task runs per configured site (see <see cref="DatasetCrawler.RunAsync"/>),
+/// all sharing this SAME instance — every field except <see cref="CombinedPositiveCounts"/>
+/// is only ever touched while holding <c>RunAsync</c>'s <c>stateLock</c>, so a plain
+/// <see cref="Dictionary{TKey,TValue}"/>/<see cref="List{T}"/> is fine for those.
+/// <see cref="CombinedPositiveCounts"/> is the one field read <em>without</em> that lock
+/// too — every site's own <c>shouldContinue</c>/tag-progress check reads it on every
+/// loop iteration, and taking a full lock for just that read would serialize the two
+/// sites' otherwise-independent hot loops — so it's a
+/// <see cref="ConcurrentDictionary{TKey,TValue}"/> instead: safe for that unsynchronized
+/// read to happen alongside a write elsewhere, at the cost of the read possibly seeing
+/// a value from a moment ago (already true of the pre-concurrency single-threaded
+/// design too — a page's quota check only ever reflected state as of its last check).
 /// </summary>
 internal sealed class CrawlWorkingState
 {
     public required Dictionary<string, int> KnownImages { get; init; }
     public required List<(ulong Hash, string Md5)> HashIndex { get; init; }
-    public required Dictionary<string, int> CombinedPositiveCounts { get; init; }
+    public required ConcurrentDictionary<string, int> CombinedPositiveCounts { get; init; }
+
+    /// <summary>
+    /// Per (site, tag), how many images <em>that site itself</em> is the reason count
+    /// toward <see cref="CombinedPositiveCounts"/> — either a brand-new row it was first
+    /// to find, or a merge where its copy carried a tag an earlier-seen copy didn't (see
+    /// <see cref="DatasetCrawler.MergeDuplicateTags"/>). A site "catching up" to an image
+    /// the other site already found (a plain additional-source record, nothing new)
+    /// never increments this. This is the fairness floor's own counter — see
+    /// <see cref="DatasetCrawler.RunAsync"/>'s doc comment for why
+    /// <see cref="CombinedPositiveCounts"/> alone let a faster site starve a slower one
+    /// out of ever discovering anything of its own. One <see cref="ConcurrentDictionary{TKey,TValue}"/>
+    /// per configured site, set up once before any site worker starts, so no locking is
+    /// needed to add/remove a site's own entry later.
+    /// </summary>
+    public required IReadOnlyDictionary<string, ConcurrentDictionary<string, int>> SitePositiveCounts { get; init; }
 
     /// <summary>
     /// Each already-known image's current, live tag-row-index set, keyed by its cache
@@ -71,12 +92,38 @@ internal sealed class CrawlWorkingState
 
 /// <summary>
 /// Implements the <c>crawl</c> command: a rarest-eligible-tag-first positive pass across
-/// both sites, followed by an automatic negative top-up pass. Downloads never persist
-/// as a raw-file corpus — each new (post-dedup) image goes to a <c>.tmp</c> scratch file
-/// just long enough to decode/normalize via <see cref="ImagePreprocessing.LoadAndNormalize(string, int)"/>
-/// and append to the same <see cref="PreprocessedDatasetCacheWriter"/>/<see cref="TagVocabulary"/>
-/// format <c>build-large-cache</c> produces, so <c>--output-dir</c> is immediately a
-/// trainable dataset directory, not a raw dump needing a separate import step.
+/// every configured site, followed by an automatic negative top-up pass. Downloads never
+/// persist as a raw-file corpus — each new (post-dedup) image goes to a <c>.tmp</c>
+/// scratch file just long enough to decode/normalize via
+/// <see cref="ImagePreprocessing.LoadAndNormalize(string, int)"/> and append to the same
+/// <see cref="PreprocessedDatasetCacheWriter"/>/<see cref="TagVocabulary"/> format
+/// <c>build-large-cache</c> produces, so <c>--output-dir</c> is immediately a trainable
+/// dataset directory, not a raw dump needing a separate import step.
+///
+/// Each configured site runs as its own concurrent worker (see <see cref="RunSiteTagPhaseAsync"/>),
+/// walking every eligible tag independently at whatever pace its own rate limit allows,
+/// rather than the two sites taking turns fetching one page at a time — that used to
+/// bottleneck the whole run on round-robin fairness even though the sites' rate limits
+/// are already independent. Every site worker shares the same <see cref="CrawlWorkingState"/>,
+/// <see cref="TagVocabulary"/>, and <see cref="PreprocessedDatasetCacheWriter"/>, guarded
+/// by one <see cref="SemaphoreSlim"/> (<c>stateLock</c> in <see cref="RunAsync"/>) so a
+/// post's dedup check and any commit to shared state is always serialized — the slow
+/// part (the network download itself) deliberately happens outside the lock so the two
+/// sites' downloads can actually overlap; see <see cref="ProcessPostAsync"/> for the
+/// check-download-recheck pattern that keeps that safe against two sites discovering the
+/// same image at nearly the same moment.
+///
+/// A site's worker never gives up: a page fetch or download that exhausts
+/// <see cref="TransientHttpRetry"/>'s own short-term retries logs the failure to
+/// <see cref="CrawlErrorLog"/>, shows a clear "ERROR ... retrying at HH:mm:ss" status on
+/// that site's own progress row, waits (20 minutes by default), and tries the exact same
+/// page again — indefinitely, since this is meant to run unattended for hours/days and a
+/// temporary outage (a router reboot, a site's maintenance window) shouldn't need a human
+/// to notice and restart it. Each site's positive-then-negative work runs as one
+/// self-contained worker rather than the whole run barrier-syncing every site between
+/// phases, specifically so one site stuck retrying can never block the other's progress —
+/// a hard cross-site barrier plus a site that never gives up would otherwise deadlock the
+/// entire run the moment one site had a real, lasting outage.
 ///
 /// Checkpoints once per page (cache flush, vocabulary delta, buffered dedup/count
 /// writes, then the pagination cursor — in that order) rather than every N images, the
@@ -93,13 +140,24 @@ public static class DatasetCrawler
 
     /// <summary>
     /// Max <see cref="PerceptualHash.HammingDistance"/> (out of 64 bits) for two images to
-    /// be treated as the same cross-site re-encode. Kept low/"strict" on purpose: this
-    /// index only needs to catch the same source file re-compressed/resized by a
-    /// different site, which typically differs by a handful of bits at most — a looser
-    /// threshold risks collapsing two genuinely different (but visually similar) images
-    /// into one, silently dropping a real training example instead of a true duplicate.
+    /// be treated as the same cross-site re-encode. Calibrated against measured data, not
+    /// folklore: an experiment re-encoding a synthetic test image at JPEG quality 95→30
+    /// measured pure recompression noise at 0-2 bits, while cropping (3-15% off an edge),
+    /// swapped text overlays, and genuinely different images all measured 8+ — so 2 is the
+    /// tightest value that still absorbs realistic recompression noise with a small margin,
+    /// without room left for a crop/edit/different-image false positive. Note this can't be
+    /// airtight either way: this hash only looks at the low-frequency 8x8 DCT block (that's
+    /// what makes it survive recompression at all), so a small enough localized edit (e.g. a
+    /// small added element) can leave the hash completely unchanged regardless of how tight
+    /// this threshold is — a limitation of the hash itself, not something a distance
+    /// cutoff can fix. A looser threshold also risks collapsing two genuinely different
+    /// (but visually similar) images into one, silently dropping a real training example
+    /// instead of a true duplicate — the previous default of 6 traded more of that risk for
+    /// more tolerance of resize-driven noise (two sites serving the same source at
+    /// meaningfully different resolutions measured as high as 8 in the same experiment);
+    /// 2 accepts missing that case in exchange for tighter precision.
     /// </summary>
-    private const int MaxHammingDistance = 6;
+    private const int MaxHammingDistance = 2;
 
     public static CrawlEstimate Estimate(
         IReadOnlyList<TagSurveyResult> allTags,
@@ -133,17 +191,27 @@ public static class DatasetCrawler
         int negativeTarget,
         int vocabCompactIntervalPages,
         CrawlProgressReporter? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<TimeSpan, CancellationToken, Task>? retryDelay = null)
     {
+        retryDelay ??= Task.Delay;
+        var errorLog = CrawlErrorLog.ForDirectory(outputDirectory);
         var sites = clientsBySite.Keys.ToList();
-        var requestsBySite = new Dictionary<string, int>(StringComparer.Ordinal);
 
-        progress?.ReportPhase("Loading tag survey...");
+        // Setup below is shared, one-time work before any site worker starts — every
+        // site's row briefly shows the same status rather than picking one arbitrarily.
+        void ReportSetupPhase(string phase)
+        {
+            foreach (var siteReporter in progress?.Sites.Values ?? [])
+                siteReporter.ReportPhase(phase);
+        }
+
+        ReportSetupPhase("Loading tag survey...");
         var allTags = await db.GetAllSurveyedTagsAsync(cancellationToken).ConfigureAwait(false);
         var eligibleTags = CrawlScheduling.RarestFirst(allTags.Where(t => TagEligibility.IsEligible(t, minImages))).ToList();
         var estimatedTotal = TagEligibility.EstimateImageSlots(eligibleTags, minImages, maxImages);
 
-        progress?.ReportPhase("Loading tag vocabulary...");
+        ReportSetupPhase("Loading tag vocabulary...");
         var vocabularyPath = Path.Combine(outputDirectory, "tag_vocabulary.json");
         var vocabularyDeltaPath = Path.Combine(outputDirectory, "tag_vocabulary.delta.jsonl");
         var vocabulary = File.Exists(vocabularyPath)
@@ -159,7 +227,7 @@ public static class DatasetCrawler
         foreach (var leftover in Directory.EnumerateFiles(tempDir))
             File.Delete(leftover); // safe: nothing durable is recorded until after a successful checkpoint
 
-        progress?.ReportPhase("Opening cache writer...");
+        ReportSetupPhase("Opening cache writer...");
         using var writer = PreprocessedDatasetCacheWriter.OpenOrCreate(outputDirectory, inputSize);
 
         // Seeded once from durable state (accurate as of the last successful checkpoint,
@@ -167,7 +235,7 @@ public static class DatasetCrawler
         // truncate-to-last-flush resume logic), then kept live in memory from here on —
         // see CrawlWorkingState's own doc comment for why the durable copies deliberately
         // lag behind these during a run.
-        progress?.ReportPhase("Loading dedup index and tag counters...");
+        ReportSetupPhase("Loading dedup index and tag counters...");
         var existingImages = await db.GetAllImagesAsync(cancellationToken).ConfigureAwait(false);
         CacheConsistency.Validate(existingImages, writer.ImageCount, outputDirectory);
         var combinedPositiveCounts = await db.GetAllCombinedPositiveCountsAsync(cancellationToken).ConfigureAwait(false);
@@ -176,166 +244,180 @@ public static class DatasetCrawler
         {
             KnownImages = existingImages.ToDictionary(e => e.Md5, e => e.CacheRowIndex, StringComparer.Ordinal),
             HashIndex = existingImages.Select(e => (e.PHash, e.Md5)).ToList(),
-            CombinedPositiveCounts = new Dictionary<string, int>(combinedPositiveCounts, StringComparer.Ordinal),
+            CombinedPositiveCounts = new ConcurrentDictionary<string, int>(combinedPositiveCounts, StringComparer.Ordinal),
             ImageTagRowsByCacheRow = existingImages.ToDictionary(
                 e => e.CacheRowIndex,
                 e => new HashSet<int>(committedTagRows[e.CacheRowIndex])),
+            // Always starts fresh, even on a resumed run — crawl.sqlite only persists
+            // the combined-across-sites count, not a per-site breakdown, so there's
+            // nothing durable to seed this from. Worst case on resume: the one tag each
+            // site was mid-page on when the process last stopped searches a bit more
+            // (or less) against its floor than it "truly" needed to — a minor
+            // imprecision, not a correctness issue, since a genuinely-exhausted tag's
+            // per-(tag,site,phase) Done flag still short-circuits the loop regardless.
+            SitePositiveCounts = sites.ToDictionary(site => site, _ => new ConcurrentDictionary<string, int>(StringComparer.Ordinal), StringComparer.Ordinal),
         };
 
+        // Guards every touch of state/vocabulary/writer once a post's dedup check needs
+        // to commit something — see this class's own doc comment for why the download
+        // itself deliberately happens outside this lock.
+        using var stateLock = new SemaphoreSlim(1, 1);
         var pageCounter = 0;
 
-        async Task CheckpointAsync()
+        // Deliberately CancellationToken.None throughout this method, never the run's
+        // own token: once a checkpoint starts, Flush() has already made the cache file
+        // durable, and the matching CommitPendingImagesAsync MUST follow through no
+        // matter what — a cancellation landing in between (e.g. Ctrl+C mid-checkpoint)
+        // used to let CommitPendingImagesAsync throw OperationCanceledException before
+        // it even started, leaving the cache ahead of crawl.sqlite with no record of
+        // what it just durably wrote. Observed for real: a live dataset with 557 images
+        // sitting in images.bin/tag_rows.jsonl that crawl.sqlite had never heard of,
+        // traced to exactly this window. The *next* page fetch/download still honors
+        // the real token normally (see RunSiteTagPhaseAsync) — this only shields the
+        // narrow, already-in-flight commit, not the whole run.
+        async Task CheckpointAsync(SiteProgressReporter? siteReporter)
         {
-            progress?.ReportPhase("Checkpointing (cache, vocabulary, dedup index)...");
-
-            // Order matters for crash-consistency: the cache/vocabulary files must be
-            // durable before the dedup index is, and the dedup index durable before the
-            // pagination cursor advances past the posts it covers — see this class's own
-            // doc comment and CommitPendingImagesAsync's for exactly what a crash between
-            // any two of these costs (always just re-fetched/duplicated work, never a
-            // silently-corrupted resume). MergeTagRows must run after Flush (it only
-            // touches rows Flush just made durable) and before CommitPendingImagesAsync
-            // (whose CombinedPositiveCount bump for a merge should only become durable
-            // once the label file actually reflects it).
-            vocabulary.SaveDelta(vocabularyDeltaPath);
-            writer.Flush();
-
-            if (state.DirtyCacheRows.Count > 0)
+            await stateLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            try
             {
-                writer.MergeTagRows(state.DirtyCacheRows.ToDictionary(
-                    row => row,
-                    IReadOnlyList<int> (row) => state.ImageTagRowsByCacheRow[row].ToList()));
-                state.DirtyCacheRows.Clear();
+                siteReporter?.ReportPhase("Checkpointing (cache, vocabulary, dedup index)...");
+
+                // Order matters for crash-consistency: the cache/vocabulary files must be
+                // durable before the dedup index is, and the dedup index durable before the
+                // pagination cursor advances past the posts it covers — see this class's own
+                // doc comment and CommitPendingImagesAsync's for exactly what a crash between
+                // any two of these costs (always just re-fetched/duplicated work, never a
+                // silently-corrupted resume). MergeTagRows must run after Flush (it only
+                // touches rows Flush just made durable) and before CommitPendingImagesAsync
+                // (whose CombinedPositiveCount bump for a merge should only become durable
+                // once the label file actually reflects it).
+                vocabulary.SaveDelta(vocabularyDeltaPath);
+                writer.Flush();
+
+                if (state.DirtyCacheRows.Count > 0)
+                {
+                    writer.MergeTagRows(state.DirtyCacheRows.ToDictionary(
+                        row => row,
+                        IReadOnlyList<int> (row) => state.ImageTagRowsByCacheRow[row].ToList()));
+                    state.DirtyCacheRows.Clear();
+                }
+
+                if (state.PendingNewImages.Count > 0 || state.PendingAdditionalSources.Count > 0 || state.PendingMergedTagCounts.Count > 0)
+                {
+                    await db.CommitPendingImagesAsync(state.PendingNewImages, state.PendingAdditionalSources, state.PendingMergedTagCounts, CancellationToken.None).ConfigureAwait(false);
+                    state.PendingNewImages.Clear();
+                    state.PendingAdditionalSources.Clear();
+                    state.PendingMergedTagCounts.Clear();
+                }
+
+                pageCounter++;
+                if (pageCounter % vocabCompactIntervalPages == 0)
+                {
+                    vocabulary.Save(vocabularyPath);
+                    File.Delete(vocabularyDeltaPath);
+                }
             }
-
-            if (state.PendingNewImages.Count > 0 || state.PendingAdditionalSources.Count > 0 || state.PendingMergedTagCounts.Count > 0)
+            finally
             {
-                await db.CommitPendingImagesAsync(state.PendingNewImages, state.PendingAdditionalSources, state.PendingMergedTagCounts, cancellationToken).ConfigureAwait(false);
-                state.PendingNewImages.Clear();
-                state.PendingAdditionalSources.Clear();
-                state.PendingMergedTagCounts.Clear();
-            }
-
-            pageCounter++;
-            if (pageCounter % vocabCompactIntervalPages == 0)
-            {
-                progress?.ReportPhase("Compacting vocabulary...");
-                vocabulary.Save(vocabularyPath);
-                File.Delete(vocabularyDeltaPath);
+                stateLock.Release();
             }
         }
 
         var shortfalls = new List<TagShortfall>();
 
-        // Site -> failure reason. Shared across every tag/phase for the life of this
-        // run: once a site fails it stays dropped rather than being retried (and
-        // exhausting a full backoff budget) on every subsequent tag — see
-        // RunTagPhaseAsync/SiteAvailability.MarkUnavailable. Never persisted; a fresh
-        // process starts with every site available again, so a dropped site is
-        // automatically retried on the next run from wherever its per-(tag,site,phase)
-        // cursor left off.
-        var unavailableSites = new Dictionary<string, string>(StringComparer.Ordinal);
+        // Guarantees each site a fair shot at contributing something of its own before
+        // a shared quota can close a tag out from under it. Without this, a site that's
+        // simply faster (more requests/sec, a bigger page size) systematically wins the
+        // race to satisfy CombinedPositiveCounts on every tag with meaningful overlap,
+        // and the slower site's own pagination never gets far enough to reach content
+        // the faster site doesn't already have — observed for real on a live crawl as
+        // zero images across a 15,944-image corpus where gelbooru was the sole source,
+        // despite gelbooru's own requests clearly going out and its own tags-completed
+        // count climbing the whole time. Each site keeps searching a tag until EITHER it
+        // personally accounts for its own even share of --max-images, OR the site
+        // genuinely runs out of its own posts for that tag (Done) — regardless of how
+        // far ahead of --max-images the *combined* count from other sites already is.
+        // Trade-off: a tag can end up with more than --max-images total once every site
+        // insists on searching for its own floor, since floors aren't reduced by what
+        // other sites already found.
+        var perSiteFloor = (maxImages + sites.Count - 1) / sites.Count;
 
-        try
+        // One self-contained worker per site: its own full positive pass over every
+        // eligible tag, then its own full negative pass — no cross-site barrier between
+        // the two phases (see this class's own doc comment for why: a site that never
+        // gives up retrying plus a hard barrier would deadlock the whole run the moment
+        // one site had a real outage). The tradeoff is that a fast site's negative
+        // top-up can start before a slow (or currently-retrying) site finishes
+        // contributing to the shared corpus, so its negative-shortfall arithmetic sees
+        // a smaller-than-final total image count and may pull a few more negatives than
+        // strictly needed — a minor quality cost against the alternative of the run
+        // being able to hang indefinitely.
+        async Task RunSiteWorkerAsync(string site)
         {
-            progress?.ReportOverall(writer.ImageCount, Math.Max(estimatedTotal, writer.ImageCount));
-            progress?.ReportTagsCompleted("Positive pass", 0, eligibleTags.Count);
+            var siteReporter = progress?.Sites.GetValueOrDefault(site);
+            var client = clientsBySite[site];
+            var mySitePositiveCounts = state.SitePositiveCounts[site];
 
+            siteReporter?.ReportTagsCompleted(0, eligibleTags.Count);
             var tagIndex = 0;
             foreach (var tag in eligibleTags)
             {
                 tagIndex++;
                 cancellationToken.ThrowIfCancellationRequested();
 
-                progress?.ReportPhase($"Positive crawl: tag '{tag.Name}' ({tagIndex}/{eligibleTags.Count} eligible, target {maxImages})");
+                siteReporter?.ReportPhase($"{PositivePhase} crawl: tag '{tag.Name}' ({tagIndex}/{eligibleTags.Count} eligible)");
 
-                // The tag's own realistic ceiling, not the raw --max-images target: many
-                // (especially rarer) eligible tags simply don't have --max-images posts
-                // available on either site at all, in which case the tag's own progress
-                // row should read "done at its real max" rather than stall short of a
-                // target it could never reach — this is the same min(maxImages, count)
-                // TagEligibility.EstimateImageSlots already uses per tag.
-                var tagCeiling = Math.Min(maxImages, tag.BestCount);
+                await RunSiteTagPhaseAsync(
+                    site, client, PositivePhase, tag.Name, tag.Name,
+                    () => mySitePositiveCounts.GetValueOrDefault(tag.Name) < perSiteFloor
+                          || CrawlQuota.ShouldContinueFetching(state.CombinedPositiveCount(tag.Name), maxImages),
+                    db, vocabulary, writer, eligibleTagSet, tempDir, inputSize, downloadClient,
+                    state, stateLock, siteReporter, progress?.ReportOverall, estimatedTotal, CheckpointAsync,
+                    errorLog, retryDelay, () => mySitePositiveCounts.GetValueOrDefault(tag.Name), perSiteFloor, cancellationToken).ConfigureAwait(false);
 
-                await RunTagPhaseAsync(
-                    PositivePhase,
-                    tag.Name,
-                    tag.Name,
-                    () => CrawlQuota.ShouldContinueFetching(state.CombinedPositiveCount(tag.Name), maxImages),
-                    sites,
-                    clientsBySite,
-                    requestsBySite,
-                    db,
-                    vocabulary,
-                    writer,
-                    eligibleTagSet,
-                    tempDir,
-                    inputSize,
-                    downloadClient,
-                    state,
-                    progress,
-                    estimatedTotal,
-                    CheckpointAsync,
-                    unavailableSites,
-                    () => state.CombinedPositiveCount(tag.Name),
-                    tagCeiling,
-                    cancellationToken).ConfigureAwait(false);
-
-                var finalCount = state.CombinedPositiveCount(tag.Name);
-                if (finalCount < maxImages)
-                    shortfalls.Add(new TagShortfall(tag.Name, finalCount, maxImages));
-
-                progress?.ReportTagsCompleted("Positive pass", tagIndex, eligibleTags.Count);
+                siteReporter?.ReportTagsCompleted(tagIndex, eligibleTags.Count);
             }
 
-            progress?.ReportPhase($"Entering negative top-up phase — target {negativeTarget} non-tagged images per eligible tag");
-
+            siteReporter?.ReportTagsCompleted(0, eligibleTags.Count);
             tagIndex = 0;
-            progress?.ReportTagsCompleted("Negative pass", 0, eligibleTags.Count);
             foreach (var tag in eligibleTags)
             {
                 tagIndex++;
                 cancellationToken.ThrowIfCancellationRequested();
 
                 var negativeQuery = $"-{tag.Name}";
-                progress?.ReportPhase($"Negative top-up: tag '{tag.Name}' ({tagIndex}/{eligibleTags.Count})");
+                siteReporter?.ReportPhase($"{NegativePhase} crawl: tag '{tag.Name}' ({tagIndex}/{eligibleTags.Count})");
 
-                await RunTagPhaseAsync(
-                    NegativePhase,
-                    tag.Name,
-                    negativeQuery,
+                await RunSiteTagPhaseAsync(
+                    site, client, NegativePhase, tag.Name, negativeQuery,
                     () => CrawlQuota.NegativeShortfall(writer.ImageCount, state.CombinedPositiveCount(tag.Name), negativeTarget) > 0,
-                    sites,
-                    clientsBySite,
-                    requestsBySite,
-                    db,
-                    vocabulary,
-                    writer,
-                    eligibleTagSet,
-                    tempDir,
-                    inputSize,
-                    downloadClient,
-                    state,
-                    progress,
-                    estimatedTotal,
-                    CheckpointAsync,
-                    unavailableSites,
-                    () => writer.ImageCount - state.CombinedPositiveCount(tag.Name),
-                    negativeTarget,
-                    cancellationToken).ConfigureAwait(false);
+                    db, vocabulary, writer, eligibleTagSet, tempDir, inputSize, downloadClient,
+                    state, stateLock, siteReporter, progress?.ReportOverall, estimatedTotal, CheckpointAsync,
+                    errorLog, retryDelay, () => writer.ImageCount - state.CombinedPositiveCount(tag.Name), negativeTarget, cancellationToken).ConfigureAwait(false);
 
-                progress?.ReportTagsCompleted("Negative pass", tagIndex, eligibleTags.Count);
+                siteReporter?.ReportTagsCompleted(tagIndex, eligibleTags.Count);
+            }
+        }
+
+        try
+        {
+            progress?.ReportOverall(writer.ImageCount, Math.Max(estimatedTotal, writer.ImageCount));
+
+            await Task.WhenAll(sites.Select(RunSiteWorkerAsync)).ConfigureAwait(false);
+
+            foreach (var tag in eligibleTags)
+            {
+                var finalCount = state.CombinedPositiveCount(tag.Name);
+                if (finalCount < maxImages)
+                    shortfalls.Add(new TagShortfall(tag.Name, finalCount, maxImages));
             }
 
-            progress?.ReportPhase("Compacting vocabulary...");
             vocabulary.Save(vocabularyPath);
             if (File.Exists(vocabularyDeltaPath))
                 File.Delete(vocabularyDeltaPath);
             writer.Flush();
 
-            progress?.ReportPhase("Done.");
-
-            return new CrawlResult(shortfalls, unavailableSites);
+            return new CrawlResult(shortfalls);
         }
         finally
         {
@@ -343,28 +425,54 @@ public static class DatasetCrawler
         }
     }
 
+    /// <summary>Backoff between a site failure and retrying the exact same page — see this class's own doc comment for why a site never gives up outright.</summary>
+    internal static readonly TimeSpan SiteRetryDelay = TimeSpan.FromMinutes(20);
+
     /// <summary>
-    /// Shared loop for both the positive crawl and the negative top-up: repeatedly picks
-    /// the least-loaded site that hasn't exhausted this tag/phase's pagination and hasn't
-    /// gone unavailable this run, fetches one page, processes each post (dedup-skip or
-    /// download+append), checkpoints, and only then persists per-(tag,site,phase) cursor
-    /// progress — until either <paramref name="shouldContinue"/> says the target is met
-    /// or every remaining site is exhausted/unavailable for this tag/phase.
+    /// Logs <paramref name="ex"/> to <paramref name="errorLog"/>, puts a clear
+    /// "ERROR ... retrying at HH:mm:ss" status on <paramref name="siteReporter"/>'s own
+    /// phase row (left in place for the whole wait, since nothing else touches that
+    /// site's row while it's asleep), and waits <see cref="SiteRetryDelay"/> before
+    /// returning so the caller can retry the same operation.
+    /// </summary>
+    private static async Task HandleSiteFailureAsync(
+        string site,
+        Exception ex,
+        CrawlErrorLog errorLog,
+        SiteProgressReporter? siteReporter,
+        Func<TimeSpan, CancellationToken, Task> retryDelay,
+        CancellationToken cancellationToken)
+    {
+        errorLog.Log(site, ex.Message);
+
+        var retryAt = DateTimeOffset.Now + SiteRetryDelay;
+        siteReporter?.ReportPhase($"ERROR: {ex.Message} — retrying at {retryAt:HH:mm:ss} ({SiteRetryDelay.TotalMinutes:0} min)");
+
+        await retryDelay(SiteRetryDelay, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// One site's dedicated worker for one tag/phase: fetches pages for
+    /// <paramref name="tagQuery"/> from <paramref name="site"/> only (no more picking
+    /// between sites — each site is its own concurrent worker now, see this class's own
+    /// doc comment), processing each post and checkpointing every page, until either
+    /// <paramref name="shouldContinue"/> says the target is met or this site's own
+    /// pagination for this tag/phase is exhausted.
     ///
     /// A page fetch or post download that fails outright (not the transient blips
     /// <see cref="TransientHttpRetry"/> already retries — this is what's left once that's
-    /// exhausted) marks its site unavailable in <paramref name="unavailableSites"/> and
-    /// moves on to whatever site is left, rather than taking the whole run down; see
-    /// <see cref="SiteAvailability.MarkUnavailable"/> for what happens once none are left.
+    /// exhausted) never gives up on this site: <see cref="HandleSiteFailureAsync"/> logs
+    /// it, shows it, waits, and this method retries the exact same page — the pagination
+    /// cursor is never advanced past a page that didn't fully succeed, so a retry (or a
+    /// resumed run after a crash) can't skip anything.
     /// </summary>
-    private static async Task RunTagPhaseAsync(
+    private static async Task RunSiteTagPhaseAsync(
+        string site,
+        IBooruClient client,
         string phase,
         string progressTagName,
         string tagQuery,
         Func<bool> shouldContinue,
-        IReadOnlyList<string> sites,
-        IReadOnlyDictionary<string, IBooruClient> clientsBySite,
-        Dictionary<string, int> requestsBySite,
         CrawlDatabase db,
         TagVocabulary vocabulary,
         PreprocessedDatasetCacheWriter writer,
@@ -373,80 +481,81 @@ public static class DatasetCrawler
         int inputSize,
         HttpClient downloadClient,
         CrawlWorkingState state,
-        CrawlProgressReporter? progress,
+        SemaphoreSlim stateLock,
+        SiteProgressReporter? siteReporter,
+        Action<long, long>? reportOverall,
         long estimatedTotal,
-        Func<Task> checkpointAsync,
-        Dictionary<string, string> unavailableSites,
+        Func<SiteProgressReporter?, Task> checkpointAsync,
+        CrawlErrorLog errorLog,
+        Func<TimeSpan, CancellationToken, Task> retryDelay,
         Func<int> currentTagProgress,
         int tagProgressTarget,
         CancellationToken cancellationToken)
     {
-        progress?.ReportTagProgress(progressTagName, currentTagProgress(), tagProgressTarget);
+        siteReporter?.ReportTagProgress(progressTagName, currentTagProgress(), tagProgressTarget);
 
-        while (shouldContinue())
+        // Only the positive phase searches FOR a specific tag — the negative phase's
+        // tagQuery excludes it, so a post landing here says nothing about whether this
+        // site should get fairness-floor credit for progressTagName (see ProcessPostAsync).
+        var searchedTag = phase == PositivePhase ? progressTagName : null;
+
+        var tagProgress = await db.GetTagProgressAsync(progressTagName, site, phase, cancellationToken).ConfigureAwait(false);
+
+        while (!tagProgress.Done && shouldContinue())
         {
             cancellationToken.ThrowIfCancellationRequested();
-
-            var candidateSites = new List<string>();
-            foreach (var site in sites)
-            {
-                if (unavailableSites.ContainsKey(site))
-                    continue;
-
-                var siteProgress = await db.GetTagProgressAsync(progressTagName, site, phase, cancellationToken).ConfigureAwait(false);
-                if (!siteProgress.Done)
-                    candidateSites.Add(site);
-            }
-
-            if (candidateSites.Count == 0)
-                break; // remaining sites exhausted (or all unavailable) without meeting the target for this tag/phase
-
-            var chosenSite = CrawlScheduling.PickLeastLoadedSite(
-                candidateSites.ToDictionary(s => s, s => requestsBySite.GetValueOrDefault(s, 0)));
-
-            var tagProgress = await db.GetTagProgressAsync(progressTagName, chosenSite, phase, cancellationToken).ConfigureAwait(false);
-            var client = clientsBySite[chosenSite];
 
             BooruPostPage page;
             try
             {
-                progress?.ReportPhase($"{phase} crawl: tag '{progressTagName}', fetching page from {chosenSite}...");
+                siteReporter?.ReportPhase($"{phase} crawl: tag '{progressTagName}', fetching page...");
                 page = await client.ListPostsAsync(tagQuery, tagProgress.Cursor, cancellationToken).ConfigureAwait(false);
-                requestsBySite[chosenSite] = requestsBySite.GetValueOrDefault(chosenSite, 0) + 1;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                SiteAvailability.MarkUnavailable(chosenSite, ex, sites, unavailableSites, msg => progress?.ReportPhase(msg));
-                continue;
+                await HandleSiteFailureAsync(site, ex, errorLog, siteReporter, retryDelay, cancellationToken).ConfigureAwait(false);
+                continue; // retry the same page fetch now that the cooldown's passed
             }
 
-            var pageIncomplete = false;
-            progress?.ReportPhase($"{phase} crawl: tag '{progressTagName}', processing {page.Posts.Count} posts from {chosenSite}...");
+            var pageFailed = false;
+            siteReporter?.ReportPhase($"{phase} crawl: tag '{progressTagName}', processing {page.Posts.Count} posts...");
             for (var i = 0; i < page.Posts.Count; i++)
             {
                 if (!shouldContinue())
                     break;
 
-                progress?.ReportPhaseProgress(i, page.Posts.Count);
+                siteReporter?.ReportPhaseProgress(i, page.Posts.Count);
 
                 bool appended;
                 try
                 {
                     appended = await ProcessPostAsync(
-                        page.Posts[i], chosenSite, client.RateLimiter, vocabulary, writer, eligibleTagSet, tempDir, inputSize, downloadClient, state, cancellationToken).ConfigureAwait(false);
+                        page.Posts[i], site, searchedTag, client.RateLimiter, vocabulary, writer, eligibleTagSet, tempDir, inputSize, downloadClient, state, stateLock, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Exit requested mid-page: whatever posts already got appended this
+                    // page must be durably committed before we honor it, or the cache
+                    // file (made durable by this same checkpoint's own Flush call) ends
+                    // up ahead of crawl.sqlite with no record of what it just wrote —
+                    // exactly the gap a live dataset hit for real. checkpointAsync
+                    // itself can't be cut short by this same cancellation (see its own
+                    // doc comment), so this reliably finishes before the exit proceeds.
+                    await checkpointAsync(siteReporter).ConfigureAwait(false);
+                    throw;
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     // The rest of this page is presumed unreachable too (same dead
                     // site/CDN) — stop processing it rather than retrying each
                     // remaining post individually against a site that's already down.
-                    SiteAvailability.MarkUnavailable(chosenSite, ex, sites, unavailableSites, msg => progress?.ReportPhase(msg));
-                    pageIncomplete = true;
+                    await HandleSiteFailureAsync(site, ex, errorLog, siteReporter, retryDelay, cancellationToken).ConfigureAwait(false);
+                    pageFailed = true;
                     break;
                 }
 
                 if (appended)
-                    progress?.ReportOverall(writer.ImageCount, Math.Max(estimatedTotal, writer.ImageCount));
+                    reportOverall?.Invoke(writer.ImageCount, Math.Max(estimatedTotal, writer.ImageCount));
 
                 // Unconditional, not just on a fresh append: a dedup-matched duplicate
                 // can still credit this tag via ProcessPostAsync's merge path (a known
@@ -455,25 +564,30 @@ public static class DatasetCrawler
                 // starting count through however many merge-only credits happened
                 // since, which is exactly what made it look frozen at 0 on a page full
                 // of already-known images.
-                progress?.ReportTagProgress(progressTagName, currentTagProgress(), tagProgressTarget);
+                siteReporter?.ReportTagProgress(progressTagName, currentTagProgress(), tagProgressTarget);
             }
-            progress?.ReportPhaseProgress(page.Posts.Count, page.Posts.Count);
+            siteReporter?.ReportPhaseProgress(page.Posts.Count, page.Posts.Count);
 
             // Checkpoint (durably commit this page's work) before advancing the cursor
             // past it — see this file's class-level doc comment on why that ordering is
             // what makes a crash mid-run recoverable instead of silently lossy. Applies
             // even when the page died partway through: whatever posts did get appended
             // before the failure are durable either way.
-            await checkpointAsync().ConfigureAwait(false);
+            await checkpointAsync(siteReporter).ConfigureAwait(false);
 
-            if (pageIncomplete)
-                continue; // don't advance the cursor past a page this site didn't finish serving
+            if (pageFailed)
+                continue; // retry the same page (cursor wasn't advanced) now that the cooldown's passed
 
+            // CancellationToken.None: the checkpoint just above already committed this
+            // page's images durably — advancing the cursor to match is the other half
+            // of that same atomic unit of work, not a new one an exit request should be
+            // able to cut off. Worst case otherwise is mild (this page gets refetched
+            // and its now-known posts correctly recognized as duplicates, not orphaned),
+            // but there's no reason not to close this out cleanly too.
             var done = page.NextCursor is null;
-            await db.SaveTagProgressAsync(
-                progressTagName, chosenSite, phase,
-                new TagProgressState(page.NextCursor, tagProgress.PostsFetched + page.Posts.Count, done),
-                cancellationToken).ConfigureAwait(false);
+            var nextTagProgress = new TagProgressState(page.NextCursor, tagProgress.PostsFetched + page.Posts.Count, done);
+            await db.SaveTagProgressAsync(progressTagName, site, phase, nextTagProgress, CancellationToken.None).ConfigureAwait(false);
+            tagProgress = nextTagProgress;
         }
     }
 
@@ -484,10 +598,20 @@ public static class DatasetCrawler
     /// everything durable is deferred to the caller's next checkpoint. Returns whether a
     /// new image was actually appended (for overall-progress bookkeeping) — any dedup
     /// skip or an undecodable download return false.
+    ///
+    /// Only the fast dedup-check-and-commit parts run under <paramref name="stateLock"/>;
+    /// the slow part (the network download and phash/normalize work) deliberately runs
+    /// unlocked so two sites' downloads can actually overlap. That means a post can be
+    /// checked "not yet known", downloaded, and only THEN find another site's worker
+    /// already committed the exact same image (or a near-duplicate) while this one's
+    /// download was in flight — the lock is re-acquired and every check re-run right
+    /// before the final commit specifically to catch that race, rather than trusting the
+    /// stale answer from the first check.
     /// </summary>
     private static async Task<bool> ProcessPostAsync(
         BooruPost post,
         string site,
+        string? searchedTag,
         IRateLimiter rateLimiter,
         TagVocabulary vocabulary,
         PreprocessedDatasetCacheWriter writer,
@@ -496,14 +620,23 @@ public static class DatasetCrawler
         int inputSize,
         HttpClient downloadClient,
         CrawlWorkingState state,
+        SemaphoreSlim stateLock,
         CancellationToken cancellationToken)
     {
-        if (state.KnownImages.TryGetValue(post.Md5, out _))
+        await stateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            var observedTags = MergeDuplicateTags(post, post.Md5, vocabulary, eligibleTagSet, state);
-            state.PendingAdditionalSources.Add(new PendingAdditionalSource(
-                post.Md5, site, post.PostId, post.FileUrl.ToString(), post.Rating, post.CreatedAt, observedTags, DateTimeOffset.UtcNow));
-            return false;
+            if (state.KnownImages.TryGetValue(post.Md5, out _))
+            {
+                var observedTags = MergeDuplicateTags(post, post.Md5, site, searchedTag, vocabulary, eligibleTagSet, state);
+                state.PendingAdditionalSources.Add(new PendingAdditionalSource(
+                    post.Md5, site, post.PostId, post.FileUrl.ToString(), post.Rating, post.CreatedAt, observedTags, DateTimeOffset.UtcNow));
+                return false;
+            }
+        }
+        finally
+        {
+            stateLock.Release();
         }
 
         var tempPath = Path.Combine(tempDir, $"{Guid.NewGuid():N}.img");
@@ -514,11 +647,24 @@ public static class DatasetCrawler
             // unthrottled GetStreamAsync, which fired a whole page's worth of downloads
             // back-to-back with no pacing at all and no retry, so a single 429 from the
             // CDN crashed the entire run instead of just backing off.
+            //
+            // Referer set to the file's own origin on every request: Gelbooru's CDN
+            // enforces hotlink protection (a bare request — no Referer at all — gets
+            // 302'd to gelbooru.com/hotlink.php, which itself redirects to the normal
+            // HTML post page; EnsureSuccessStatusCode below doesn't catch this since
+            // the final response is a real 200, just of the wrong content, so it silently
+            // looked like a corrupt/undecodable file with no indication a real image was
+            // ever reachable). Confirmed empirically: either the CDN host itself or the
+            // main site as Referer satisfies Gelbooru's check; Danbooru doesn't require
+            // one at all but is unaffected by always sending it, so no per-site branch
+            // is needed here.
             using var response = await TransientHttpRetry.SendWithRetryAsync(
                 async () =>
                 {
                     await rateLimiter.WaitAsync(cancellationToken).ConfigureAwait(false);
-                    return await downloadClient.GetAsync(post.FileUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+                    using var request = new HttpRequestMessage(HttpMethod.Get, post.FileUrl);
+                    request.Headers.Referrer = new Uri($"{post.FileUrl.Scheme}://{post.FileUrl.Host}/");
+                    return await downloadClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
                 },
                 post.FileUrl,
                 cancellationToken).ConfigureAwait(false);
@@ -544,41 +690,63 @@ public static class DatasetCrawler
                 return false;
             }
 
-            var duplicate = state.HashIndex.FirstOrDefault(entry => PerceptualHash.HammingDistance(entry.Hash, phash) <= MaxHammingDistance);
-            if (duplicate.Md5 is not null)
+            await stateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
             {
-                // Same artwork, re-encoded by this site — attribute it as another source
-                // of the already-cached (canonical) image rather than appending a
-                // near-identical duplicate under a different md5.
-                var observedTags = MergeDuplicateTags(post, duplicate.Md5, vocabulary, eligibleTagSet, state);
-                state.PendingAdditionalSources.Add(new PendingAdditionalSource(
-                    duplicate.Md5, site, post.PostId, post.FileUrl.ToString(), post.Rating, post.CreatedAt, observedTags, DateTimeOffset.UtcNow));
-                return false;
-            }
+                // Re-check everything: another site's worker may have committed this
+                // exact post (or a near-duplicate) while this download was in flight.
+                if (state.KnownImages.TryGetValue(post.Md5, out _))
+                {
+                    var observedTags = MergeDuplicateTags(post, post.Md5, site, searchedTag, vocabulary, eligibleTagSet, state);
+                    state.PendingAdditionalSources.Add(new PendingAdditionalSource(
+                        post.Md5, site, post.PostId, post.FileUrl.ToString(), post.Rating, post.CreatedAt, observedTags, DateTimeOffset.UtcNow));
+                    return false;
+                }
 
-            var eligibleTagsOnPost = post.Tags.Where(eligibleTagSet.Contains).Distinct(StringComparer.Ordinal).ToList();
-            var tagRows = new List<int>(eligibleTagsOnPost.Count);
-            foreach (var tagName in eligibleTagsOnPost)
+                var duplicate = state.HashIndex.FirstOrDefault(entry => PerceptualHash.HammingDistance(entry.Hash, phash) <= MaxHammingDistance);
+                if (duplicate.Md5 is not null)
+                {
+                    // Same artwork, re-encoded by this site — attribute it as another source
+                    // of the already-cached (canonical) image rather than appending a
+                    // near-identical duplicate under a different md5.
+                    var observedTags = MergeDuplicateTags(post, duplicate.Md5, site, searchedTag, vocabulary, eligibleTagSet, state);
+                    state.PendingAdditionalSources.Add(new PendingAdditionalSource(
+                        duplicate.Md5, site, post.PostId, post.FileUrl.ToString(), post.Rating, post.CreatedAt, observedTags, DateTimeOffset.UtcNow));
+                    return false;
+                }
+
+                var eligibleTagsOnPost = post.Tags.Where(eligibleTagSet.Contains).Distinct(StringComparer.Ordinal).ToList();
+                var tagRows = new List<int>(eligibleTagsOnPost.Count);
+                foreach (var tagName in eligibleTagsOnPost)
+                {
+                    var record = vocabulary.RecordObservation(tagName);
+                    tagRows.Add(record.RowIndex);
+                }
+
+                writer.Append(pixels, tagRows);
+                var cacheRowIndex = writer.ImageCount - 1;
+
+                state.KnownImages[post.Md5] = cacheRowIndex;
+                state.HashIndex.Add((phash, post.Md5));
+                state.ImageTagRowsByCacheRow[cacheRowIndex] = new HashSet<int>(tagRows);
+                var mySitePositiveCounts = state.SitePositiveCounts[site];
+                foreach (var tagName in eligibleTagsOnPost)
+                {
+                    state.CombinedPositiveCounts[tagName] = state.CombinedPositiveCount(tagName) + 1;
+                    mySitePositiveCounts[tagName] = mySitePositiveCounts.GetValueOrDefault(tagName) + 1;
+                }
+
+                state.PendingNewImages.Add(new PendingNewImage(
+                    post.Md5, cacheRowIndex, post.Width, post.Height, DateTimeOffset.UtcNow,
+                    site, post.PostId, post.FileUrl.ToString(), post.Rating, post.CreatedAt,
+                    eligibleTagsOnPost, phash));
+
+                return true;
+            }
+            finally
             {
-                var record = vocabulary.RecordObservation(tagName);
-                tagRows.Add(record.RowIndex);
+                stateLock.Release();
             }
-
-            writer.Append(pixels, tagRows);
-            var cacheRowIndex = writer.ImageCount - 1;
-
-            state.KnownImages[post.Md5] = cacheRowIndex;
-            state.HashIndex.Add((phash, post.Md5));
-            state.ImageTagRowsByCacheRow[cacheRowIndex] = new HashSet<int>(tagRows);
-            foreach (var tagName in eligibleTagsOnPost)
-                state.CombinedPositiveCounts[tagName] = state.CombinedPositiveCount(tagName) + 1;
-
-            state.PendingNewImages.Add(new PendingNewImage(
-                post.Md5, cacheRowIndex, post.Width, post.Height, DateTimeOffset.UtcNow,
-                site, post.PostId, post.FileUrl.ToString(), post.Rating, post.CreatedAt,
-                eligibleTagsOnPost, phash));
-
-            return true;
         }
         finally
         {
@@ -595,16 +763,37 @@ public static class DatasetCrawler
     /// in-memory tag set and marks the row dirty for the next checkpoint's
     /// <see cref="PreprocessedDatasetCacheWriter.MergeTagRows"/> call; a no-op when the
     /// duplicate's tags are already a subset of what the image already has (the common
-    /// case — most cross-site duplicates agree).
+    /// case — most cross-site duplicates agree). Always called while holding
+    /// <c>stateLock</c> — see <see cref="ProcessPostAsync"/>.
     /// Returns this post's own eligible tags (not just the newly-added ones) so the
     /// caller can record them as this source's fresh snapshot — the ingredient
     /// <c>refresh-tags</c> later reconciles across every source of an image, including
     /// possible removal (see <see cref="TagRefresher"/>); this additive merge itself
     /// never removes anything, since it can't afford to check every other source mid-crawl.
+    ///
+    /// <paramref name="site"/>'s own <see cref="CrawlWorkingState.SitePositiveCounts"/>
+    /// entry is credited for each newly-added tag too: this site's copy demonstrably
+    /// carried a tag an earlier-seen copy of the same image didn't, which is exactly the
+    /// kind of find the per-site fairness floor (see <see cref="RunAsync"/>) exists to
+    /// recognize — it's not "catching up" to something already known, it's this site
+    /// answering a question about the image the other one's copy didn't.
+    ///
+    /// Separately, <paramref name="searchedTag"/> (the tag this site's positive-phase
+    /// search is actually FOR, or null during the negative phase — see
+    /// <see cref="RunSiteTagPhaseAsync"/>) also gets one fairness-floor credit here even
+    /// when it's already on the canonical image and so ISN'T in the newly-added set
+    /// above: this site still did real, correct work returning a genuinely matching
+    /// post, and CombinedPositiveCounts must NOT also move for it (that field means
+    /// "unique tag-image associations", and this isn't a new one). Without this, a site
+    /// whose search results page happens to be entirely redundant with what's already
+    /// known gets zero credit for any of it and grinds through its own remaining
+    /// pagination stuck at 0/floor — indistinguishable from that site not trying at all.
     /// </summary>
     private static IReadOnlyList<string> MergeDuplicateTags(
         BooruPost post,
         string canonicalMd5,
+        string site,
+        string? searchedTag,
         TagVocabulary vocabulary,
         HashSet<string> eligibleTagSet,
         CrawlWorkingState state)
@@ -621,6 +810,8 @@ public static class DatasetCrawler
                 (newlyAddedTags ??= []).Add(tagName);
         }
 
+        var mySitePositiveCounts = state.SitePositiveCounts[site];
+
         if (newlyAddedTags is not null)
         {
             state.DirtyCacheRows.Add(cacheRowIndex);
@@ -628,7 +819,15 @@ public static class DatasetCrawler
             {
                 state.PendingMergedTagCounts.Add(tagName);
                 state.CombinedPositiveCounts[tagName] = state.CombinedPositiveCount(tagName) + 1;
+                mySitePositiveCounts[tagName] = mySitePositiveCounts.GetValueOrDefault(tagName) + 1;
             }
+        }
+
+        if (searchedTag is not null
+            && (newlyAddedTags is null || !newlyAddedTags.Contains(searchedTag, StringComparer.Ordinal))
+            && observedTags.Contains(searchedTag, StringComparer.Ordinal))
+        {
+            mySitePositiveCounts[searchedTag] = mySitePositiveCounts.GetValueOrDefault(searchedTag) + 1;
         }
 
         return observedTags;
