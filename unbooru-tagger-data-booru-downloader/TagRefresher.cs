@@ -1,9 +1,17 @@
+using System.Collections.Concurrent;
 using UnbooruTagger.Core.Dataset;
 using UnbooruTagger.Core.Vocabulary;
 
 namespace UnbooruTagger.Crawler;
 
-/// <summary><see cref="TagRefresher.RunAsync"/>'s outcome — how much work happened, and any site that went unavailable partway through (same shape/meaning as <see cref="CrawlResult.FailedSites"/>).</summary>
+/// <summary>
+/// <see cref="TagRefresher.RunAsync"/>'s outcome — how much work happened, and any site
+/// that went unavailable partway through and was dropped for the rest of the run (see
+/// <see cref="SiteAvailability.MarkUnavailable"/>). Unlike <see cref="DatasetCrawler"/>'s
+/// per-site workers, a refresh sweep still gives up on a site outright rather than
+/// retrying with backoff — resumable via <c>RefreshProgress</c> either way, so a later
+/// re-run picks a dropped site back up from where it left off.
+/// </summary>
 public sealed record RefreshResult(int SourcesChecked, int ImagesChanged, IReadOnlyDictionary<string, string> FailedSites);
 
 /// <summary>
@@ -47,21 +55,29 @@ public static class TagRefresher
     {
         var sites = clientsBySite.Keys.ToList();
 
-        progress?.ReportPhase("Loading tag survey...");
+        // Setup below is shared, one-time work before any site's sweep starts — every
+        // site's row briefly shows the same status rather than picking one arbitrarily.
+        void ReportSetupPhase(string phase)
+        {
+            foreach (var siteReporter in progress?.Sites.Values ?? [])
+                siteReporter.ReportPhase(phase);
+        }
+
+        ReportSetupPhase("Loading tag survey...");
         var allTags = await db.GetAllSurveyedTagsAsync(cancellationToken).ConfigureAwait(false);
         var eligibleTagSet = allTags.Where(t => TagEligibility.IsEligible(t, minImages)).Select(t => t.Name).ToHashSet(StringComparer.Ordinal);
 
-        progress?.ReportPhase("Loading tag vocabulary...");
+        ReportSetupPhase("Loading tag vocabulary...");
         var vocabularyPath = Path.Combine(outputDirectory, "tag_vocabulary.json");
         var vocabularyDeltaPath = Path.Combine(outputDirectory, "tag_vocabulary.delta.jsonl");
         var vocabulary = File.Exists(vocabularyPath)
             ? TagVocabulary.Load(vocabularyPath, vocabularyDeltaPath)
             : TagVocabulary.CreateEmpty();
 
-        progress?.ReportPhase("Opening cache writer...");
+        ReportSetupPhase("Opening cache writer...");
         using var writer = PreprocessedDatasetCacheWriter.OpenOrCreate(outputDirectory, inputSize);
 
-        progress?.ReportPhase("Loading dedup index and tag rows...");
+        ReportSetupPhase("Loading dedup index and tag rows...");
         var existingImages = await db.GetAllImagesAsync(cancellationToken).ConfigureAwait(false);
         CacheConsistency.Validate(existingImages, writer.ImageCount, outputDirectory);
         var knownImages = existingImages.ToDictionary(e => e.Md5, e => e.CacheRowIndex, StringComparer.Ordinal);
@@ -74,12 +90,12 @@ public static class TagRefresher
         var imagesChanged = new HashSet<int>();
         var refreshedSourcesBuffer = new List<RefreshedSourceTags>();
         var combinedPositiveCountDeltas = new Dictionary<string, int>(StringComparer.Ordinal);
-        var unavailableSites = new Dictionary<string, string>(StringComparer.Ordinal);
+        var unavailableSites = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
         var sourcesChecked = 0;
 
-        async Task CheckpointAsync(string site, long lastPostId, bool done)
+        async Task CheckpointAsync(SiteProgressReporter? siteReporter, string site, long lastPostId, bool done)
         {
-            progress?.ReportPhase($"'{site}': checkpointing (tag rows, vocabulary, refresh progress)...");
+            siteReporter?.ReportPhase($"'{site}': checkpointing (tag rows, vocabulary, refresh progress)...");
 
             if (dirtyCacheRows.Count > 0)
             {
@@ -102,6 +118,7 @@ public static class TagRefresher
                 if (unavailableSites.ContainsKey(site))
                     continue;
 
+                var siteReporter = progress?.Sites.GetValueOrDefault(site);
                 var client = clientsBySite[site];
                 var (savedLastPostId, _) = await db.GetRefreshProgressAsync(site, cancellationToken).ConfigureAwait(false);
                 var lastPostId = reset ? 0L : savedLastPostId;
@@ -114,12 +131,12 @@ public static class TagRefresher
                     var batch = await db.GetSourcesBatchAsync(site, lastPostId, BatchSize, cancellationToken).ConfigureAwait(false);
                     if (batch.Count == 0)
                     {
-                        await CheckpointAsync(site, lastPostId, done: true).ConfigureAwait(false);
-                        progress?.ReportPhase($"'{site}': up to date — nothing left to refresh.");
+                        await CheckpointAsync(siteReporter, site, lastPostId, done: true).ConfigureAwait(false);
+                        siteReporter?.ReportPhase($"'{site}': up to date — nothing left to refresh.");
                         break;
                     }
 
-                    progress?.ReportPhase($"'{site}': refreshing {batch.Count} post(s) after id {lastPostId}...");
+                    siteReporter?.ReportPhase($"'{site}': refreshing {batch.Count} post(s) after id {lastPostId}...");
 
                     foreach (var (postId, md5) in batch)
                     {
@@ -138,7 +155,7 @@ public static class TagRefresher
                         }
                         catch (Exception ex) when (ex is not OperationCanceledException)
                         {
-                            SiteAvailability.MarkUnavailable(site, ex, sites, unavailableSites, msg => progress?.ReportPhase(msg));
+                            SiteAvailability.MarkUnavailable(site, ex, sites, unavailableSites, msg => siteReporter?.ReportPhase(msg));
                             siteFailed = true;
                             break;
                         }
@@ -163,7 +180,7 @@ public static class TagRefresher
                         lastPostId = postId;
                     }
 
-                    await CheckpointAsync(site, lastPostId, done: false).ConfigureAwait(false);
+                    await CheckpointAsync(siteReporter, site, lastPostId, done: false).ConfigureAwait(false);
                 }
             }
 

@@ -38,10 +38,7 @@ public static class CrawlQuota
     }
 }
 
-/// <summary>
-/// Picks which eligible tag the positive-crawl phase should work on next, and which
-/// site a tag's next batch of requests should go to.
-/// </summary>
+/// <summary>Picks which eligible tag the positive-crawl phase should work on next.</summary>
 public static class CrawlScheduling
 {
     /// <summary>
@@ -52,21 +49,4 @@ public static class CrawlScheduling
     /// </summary>
     public static IEnumerable<TagSurveyResult> RarestFirst(IEnumerable<TagSurveyResult> eligibleTags) =>
         eligibleTags.OrderBy(t => t.BestCount).ThenBy(t => t.Name, StringComparer.Ordinal);
-
-    /// <summary>
-    /// Picks the site with fewest requests made so far this run, so load naturally
-    /// spreads across both sites instead of exhausting one before the other is ever
-    /// touched. Ties broken by name for determinism.
-    /// </summary>
-    public static string PickLeastLoadedSite(IReadOnlyDictionary<string, int> requestsMadeBySite)
-    {
-        if (requestsMadeBySite.Count == 0)
-            throw new ArgumentException("At least one site is required.", nameof(requestsMadeBySite));
-
-        return requestsMadeBySite
-            .OrderBy(kv => kv.Value)
-            .ThenBy(kv => kv.Key, StringComparer.Ordinal)
-            .First()
-            .Key;
-    }
 }

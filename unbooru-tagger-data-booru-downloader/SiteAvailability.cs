@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+
 namespace UnbooruTagger.Crawler;
 
 /// <summary>
@@ -6,7 +8,11 @@ namespace UnbooruTagger.Crawler;
 /// <see cref="TransientHttpRetry"/>'s retries and throws, drop that site for the rest
 /// of the run and keep going with whatever's left, rather than taking the whole run
 /// down over one site's outage — unless that was the last site, in which case there's
-/// nothing left to make progress with.
+/// nothing left to make progress with. <see cref="ConcurrentDictionary{TKey,TValue}"/>
+/// (not a plain <c>Dictionary</c>) because <see cref="DatasetCrawler"/> now runs one
+/// worker task per site concurrently — each only ever writes its own key, but a plain
+/// <c>Dictionary</c> isn't safe for a write on one thread happening alongside a read
+/// (e.g. another site's "am I the last one left" check) on another, regardless of key.
 /// </summary>
 internal static class SiteAvailability
 {
@@ -21,7 +27,7 @@ internal static class SiteAvailability
         string site,
         Exception ex,
         IReadOnlyList<string> sites,
-        Dictionary<string, string> unavailableSites,
+        ConcurrentDictionary<string, string> unavailableSites,
         Action<string>? report)
     {
         unavailableSites[site] = ex.Message;
