@@ -102,7 +102,7 @@ public static class LargeDatasetPreprocessor
         TagVocabulary vocabulary;
         if (File.Exists(vocabularyPath))
         {
-            vocabulary = TagVocabulary.Load(vocabularyPath, vocabularyDeltaPath);
+            vocabulary = TagVocabulary.LoadAndCompact(vocabularyPath, vocabularyDeltaPath);
         }
         else
         {
@@ -182,7 +182,7 @@ public static class LargeDatasetPreprocessor
                 // the one part of the page loop safe to fan out across cores. Vocabulary
                 // lookups/mutation and the writer are not thread-safe and stay on the
                 // sequential pass below, appending in the page's original order.
-                var pixelsByImage = new float[page.Count][];
+                var pixelsByImage = new EncodedImage[page.Count];
                 Parallel.For(
                     0,
                     page.Count,
@@ -190,7 +190,7 @@ public static class LargeDatasetPreprocessor
                     i =>
                     {
                         using var blobStream = new MemoryStream(page[i].BlobData);
-                        pixelsByImage[i] = ImagePreprocessing.LoadAndNormalize(blobStream, inputSize);
+                        pixelsByImage[i] = ImagePreprocessing.LoadAndEncode(blobStream, inputSize);
                     });
 
                 progress?.ReportPhase($"Page {pageNumber}: writing {page.Count} images to cache...");

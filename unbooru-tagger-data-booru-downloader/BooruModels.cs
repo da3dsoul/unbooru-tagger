@@ -15,6 +15,14 @@ public sealed record BooruPost(
 public sealed record BooruTagCount(string Name, int PostCount);
 
 /// <summary>
+/// A resolved tag alias: searching/tagging <paramref name="Antecedent"/> on this site is
+/// silently redirected to <paramref name="Consequent"/>. Both are raw (un-prefixed,
+/// site-local) tag names, never a <see cref="TagCategoryNaming"/> identity — see
+/// <see cref="TagSurveyor"/> for why that matters.
+/// </summary>
+public sealed record BooruTagAlias(string Antecedent, string Consequent);
+
+/// <summary>
 /// One page of posts plus an opaque continuation token for the next page (null once
 /// exhausted). The token's shape is site-specific (a "before this post id" cursor for
 /// Danbooru, a page-index for Gelbooru) — callers should treat it as opaque and just

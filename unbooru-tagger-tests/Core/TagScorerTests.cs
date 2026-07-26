@@ -49,8 +49,9 @@ public class TagScorerTests
             { 0.1f, 0.1f, 0.1f, 0.1f }
         };
 
-        var loosePercentile = TagScorer.DetectBoxes(heatmap, threshold: -10f, relativePercentile: 0f, imageWidth: 4, imageHeight: 4);
-        var tightPercentile = TagScorer.DetectBoxes(heatmap, threshold: -10f, relativePercentile: 0.9f, imageWidth: 4, imageHeight: 4);
+        var fullCanvas = new LetterboxBox(0, 0, 4, 4);
+        var loosePercentile = TagScorer.DetectBoxes(heatmap, threshold: -10f, relativePercentile: 0f, fullCanvas, canvasSize: 4, imageWidth: 4, imageHeight: 4);
+        var tightPercentile = TagScorer.DetectBoxes(heatmap, threshold: -10f, relativePercentile: 0.9f, fullCanvas, canvasSize: 4, imageWidth: 4, imageHeight: 4);
 
         var looseArea = loosePercentile.Sum(b => b.Width * b.Height);
         var tightArea = tightPercentile.Sum(b => b.Width * b.Height);
@@ -65,7 +66,7 @@ public class TagScorerTests
 
         // Even at percentile 0 (its own weakest cell), a tag whose whole heatmap sits
         // below the absolute floor should get no boxes.
-        var boxes = TagScorer.DetectBoxes(heatmap, threshold: 0.5f, relativePercentile: 0f, imageWidth: 2, imageHeight: 2);
+        var boxes = TagScorer.DetectBoxes(heatmap, threshold: 0.5f, relativePercentile: 0f, new LetterboxBox(0, 0, 2, 2), canvasSize: 2, imageWidth: 2, imageHeight: 2);
 
         Assert.Empty(boxes);
     }

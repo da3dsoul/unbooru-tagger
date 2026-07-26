@@ -49,9 +49,14 @@ public sealed class GelbooruClient(HttpClient http, IRateLimiter rateLimiter, st
                 yield break;
 
             foreach (var element in tagsElement.EnumerateArray())
+            {
+                var category = element.TryGetProperty("type", out var typeProp) && typeProp.TryGetInt32(out var typeCode)
+                    ? TagCategoryNaming.FromRawCode(typeCode)
+                    : TagCategory.General;
                 yield return new BooruTagCount(
-                    WebUtility.HtmlDecode(element.GetProperty("name").GetString()!),
+                    TagCategoryNaming.Identity(WebUtility.HtmlDecode(element.GetProperty("name").GetString()!), category),
                     element.GetProperty("count").GetInt32());
+            }
         }
     }
 

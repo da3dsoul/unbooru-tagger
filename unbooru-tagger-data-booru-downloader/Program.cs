@@ -1,5 +1,6 @@
 using System.CommandLine;
 using Spectre.Console;
+using UnbooruTagger.Core.Dataset;
 using UnbooruTagger.Crawler;
 
 var outputDirOption = new Option<string>("--output-dir") { Description = "Dataset directory — gets images.bin/tag_rows.jsonl/tag_vocabulary.json (same format build-large-cache produces) plus crawl.sqlite", Required = true };
@@ -32,6 +33,33 @@ static Dictionary<string, IBooruClient> BuildClients(
         clients[site] = client;
     }
     return clients;
+}
+
+/// <summary>
+/// Wraps <see cref="TagAliasCache.FetchAndCacheAsync"/> for a command that structurally
+/// depends on alias data for correctness — <c>survey-tags</c> to merge a cross-site
+/// alias (e.g. <c>head_pat</c>/<c>headpat</c>) into one eligible tag, <c>refresh-tags</c>
+/// to reconcile images already stuck on an aliased-away identity. A raw fetch failure
+/// (Danbooru unreachable, rate-limited, ...) would otherwise either crash the whole
+/// command with an unhandled-exception stack trace, or — worse — silently proceed with
+/// <see langword="null"/> aliases and produce a survey/reconciliation that's quietly
+/// wrong instead of visibly incomplete. Neither is acceptable for a command whose entire
+/// job depends on this data, so this exits cleanly instead: a short, actionable message
+/// and a non-zero exit code, no partial/incorrect work performed.
+/// </summary>
+static async Task<(Dictionary<string, string>? TagAliases, bool Failed)> FetchTagAliasesOrFailAsync(
+    string commandName, string outputDirectory, IReadOnlyDictionary<string, IBooruClient> clients, CancellationToken cancellationToken)
+{
+    try
+    {
+        return (await TagAliasCache.FetchAndCacheAsync(outputDirectory, clients, cancellationToken), false);
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException)
+    {
+        Console.Error.WriteLine($"Failed to fetch Danbooru's active tag aliases: {ex.Message}");
+        Console.Error.WriteLine($"'{commandName}' depends on this to correctly merge/reconcile cross-site tag aliases (e.g. head_pat/headpat) — exiting without making any changes rather than risk a silently wrong result. Try again once connectivity is restored.");
+        return (null, true);
+    }
 }
 
 static void PrintEstimate(CrawlEstimate estimate)
@@ -86,6 +114,10 @@ surveyCommand.SetAction(async (parseResult, cancellationToken) =>
         sites, httpClient, rateDanbooru, rateGelbooru,
         parseResult.GetValue(danbooruLoginOption), parseResult.GetValue(danbooruApiKeyOption),
         parseResult.GetValue(gelbooruApiKeyOption), parseResult.GetValue(gelbooruUserIdOption));
+    var excludedTags = await TagExclusions.LoadOrCreateAsync(outputDirectory, cancellationToken);
+    var (tagAliases, tagAliasFetchFailed) = await FetchTagAliasesOrFailAsync("survey-tags", outputDirectory, clients, cancellationToken);
+    if (tagAliasFetchFailed)
+        return 1;
 
     var stopNotes = new List<string>();
     var summary = await AnsiConsole.Progress()
@@ -107,7 +139,7 @@ surveyCommand.SetAction(async (parseResult, cancellationToken) =>
                     task.Description = $"Persisting survey results to crawl.sqlite... ({written}/{total})";
                 }
             };
-            return await TagSurveyor.SurveyAsync(db, clients.Values.ToList(), minImages, maxImages, progress, cancellationToken);
+            return await TagSurveyor.SurveyAsync(db, clients.Values.ToList(), minImages, maxImages, excludedTags, tagAliases, progress, cancellationToken);
         });
 
     foreach (var note in stopNotes)
@@ -115,7 +147,7 @@ surveyCommand.SetAction(async (parseResult, cancellationToken) =>
     if (stopNotes.Any(n => n.Contains("stopped after 0 eligible")))
         AnsiConsole.MarkupLine("[yellow]A site found zero eligible tags — if that's unexpected, the site's tag-list API may not actually be honoring the sort-by-count-descending request, so this stopped on the very first (effectively random) tag instead of the least popular eligible one.[/]");
 
-    Console.WriteLine($"Surveyed {summary.TotalTagsSeen} tags; {summary.EligibleTagCount} eligible at --min-images {minImages}.");
+    Console.WriteLine($"Surveyed {summary.TotalTagsSeen} tags; {summary.EligibleTagCount} eligible at --min-images {minImages} ({summary.ExcludedTagCount} excluded via '{TagExclusions.FileName}').");
     PrintEstimate(new CrawlEstimate(summary.EligibleTagCount, summary.EstimatedImageSlots, 0, TimeSpan.Zero));
     return 0;
 });
@@ -163,13 +195,17 @@ crawlCommand.SetAction(async (parseResult, cancellationToken) =>
         sites, httpClient, rateDanbooru, rateGelbooru,
         parseResult.GetValue(danbooruLoginOption), parseResult.GetValue(danbooruApiKeyOption),
         parseResult.GetValue(gelbooruApiKeyOption), parseResult.GetValue(gelbooruUserIdOption));
+    var excludedTags = await TagExclusions.LoadOrCreateAsync(outputDirectory, cancellationToken);
+    // Never fetches — only survey-tags/refresh-tags populate this cache; crawl just
+    // reads whatever's already there (see TagAliasCache's own doc comment for why).
+    var tagAliases = await TagAliasCache.TryLoadAsync(outputDirectory, cancellationToken);
 
     var pageSizeBySite = clients.ToDictionary(kv => kv.Key, kv => kv.Value.PageSize);
     var rateBySite = new Dictionary<string, double> { ["danbooru"] = rateDanbooru, ["gelbooru"] = rateGelbooru }
         .Where(kv => clients.ContainsKey(kv.Key))
         .ToDictionary(kv => kv.Key, kv => kv.Value);
 
-    var estimate = DatasetCrawler.Estimate(allTags, minImages, maxImages, pageSizeBySite, rateBySite, tagSurveyRequestsMade: 0);
+    var estimate = DatasetCrawler.Estimate(allTags, minImages, maxImages, pageSizeBySite, rateBySite, tagSurveyRequestsMade: 0, excludedTags);
     Console.WriteLine("Estimate (recomputed from the last survey-tags run):");
     PrintEstimate(estimate);
 
@@ -181,7 +217,7 @@ crawlCommand.SetAction(async (parseResult, cancellationToken) =>
             return await DatasetCrawler.RunAsync(
                 db, clients, httpClient, outputDirectory, inputSize,
                 minImages, maxImages, negativeTarget, vocabCompactInterval,
-                progress, cancellationToken);
+                progress, cancellationToken, excludedTags, tagAliases: tagAliases);
         });
 
     if (result.Shortfalls.Count > 0)
@@ -205,6 +241,12 @@ crawlCommand.SetAction(async (parseResult, cancellationToken) =>
 });
 
 var resetOption = new Option<bool>("--reset") { Description = "Restart each selected site's refresh sweep from the beginning instead of resuming after the last post it checked — use to re-verify posts a normal refresh already passed, e.g. after a change to how reconciliation works" };
+var onlyTagsOption = new Option<string[]>("--only-tags")
+{
+    Description = "Skip the full per-site sweep entirely and instead only re-check images that currently hold one of these tag identities — for a scoped correction (e.g. reconciling images stuck on a tag a tag-alias merge just orphaned) where sweeping the whole corpus would be far more work than the problem needs. Never touches --reset/the normal resumable cursor.",
+    AllowMultipleArgumentsPerToken = true,
+    DefaultValueFactory = _ => []
+};
 
 var refreshCommand = new Command("refresh-tags", "Re-fetch previously-crawled posts by id to catch tag edits made on the site since crawl last saw them, reconciling each affected image's tags as the union of every known source's current tags (can both add and remove)");
 refreshCommand.Options.Add(sitesOption);
@@ -218,6 +260,7 @@ refreshCommand.Options.Add(gelbooruUserIdOption);
 refreshCommand.Options.Add(rateDanbooruOption);
 refreshCommand.Options.Add(rateGelbooruOption);
 refreshCommand.Options.Add(resetOption);
+refreshCommand.Options.Add(onlyTagsOption);
 refreshCommand.SetAction(async (parseResult, cancellationToken) =>
 {
     var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
@@ -227,6 +270,7 @@ refreshCommand.SetAction(async (parseResult, cancellationToken) =>
     var rateDanbooru = parseResult.GetRequiredValue(rateDanbooruOption);
     var rateGelbooru = parseResult.GetRequiredValue(rateGelbooruOption);
     var reset = parseResult.GetRequiredValue(resetOption);
+    var onlyTags = parseResult.GetRequiredValue(onlyTagsOption);
 
     using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
 
@@ -241,6 +285,10 @@ refreshCommand.SetAction(async (parseResult, cancellationToken) =>
         sites, httpClient, rateDanbooru, rateGelbooru,
         parseResult.GetValue(danbooruLoginOption), parseResult.GetValue(danbooruApiKeyOption),
         parseResult.GetValue(gelbooruApiKeyOption), parseResult.GetValue(gelbooruUserIdOption));
+    var excludedTags = await TagExclusions.LoadOrCreateAsync(outputDirectory, cancellationToken);
+    var (tagAliases, tagAliasFetchFailed) = await FetchTagAliasesOrFailAsync("refresh-tags", outputDirectory, clients, cancellationToken);
+    if (tagAliasFetchFailed)
+        return 1;
 
     RefreshResult result;
     try
@@ -250,7 +298,7 @@ refreshCommand.SetAction(async (parseResult, cancellationToken) =>
             .StartAsync(async ctx =>
             {
                 var progress = ProgressBarColumns.AddRefreshTasks(ctx, sites);
-                return await TagRefresher.RunAsync(db, clients, outputDirectory, inputSize, minImages, reset, progress, cancellationToken);
+                return await TagRefresher.RunAsync(db, clients, outputDirectory, inputSize, minImages, reset, progress, cancellationToken, excludedTags, tagAliases, onlyTags);
             });
     }
     catch (AllSitesUnavailableException ex)
@@ -273,11 +321,40 @@ refreshCommand.SetAction(async (parseResult, cancellationToken) =>
     return 0;
 });
 
+var shrinkCacheCommand = new Command("shrink-cache", "One-time conversion of a dataset directory's images.bin from the old float32/full-padded-canvas format to the current uint8/content-only format, in place — re-run to resume after an interruption");
+shrinkCacheCommand.Options.Add(outputDirOption);
+shrinkCacheCommand.SetAction((parseResult, cancellationToken) =>
+{
+    var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
+
+    AnsiConsole.Progress()
+        .Columns(ProgressBarColumns.Default)
+        .Start(ctx =>
+        {
+            var task = ctx.AddTask("Shrinking cache...");
+            task.IsIndeterminate = true;
+            PreprocessedDatasetCacheMigrator.ShrinkInPlace(
+                outputDirectory,
+                (converted, total) =>
+                {
+                    task.IsIndeterminate = false;
+                    task.MaxValue = total;
+                    task.Value = converted;
+                    task.Description = $"Shrinking cache... ({converted}/{total})";
+                },
+                cancellationToken);
+        });
+
+    Console.WriteLine($"Done. '{outputDirectory}' is now in the current cache format.");
+    return Task.FromResult(0);
+});
+
 var rootCommand = new RootCommand("unbooru-tagger booru crawler (downloads Danbooru/Gelbooru images+tags directly into a trainable dataset directory)")
 {
     surveyCommand,
     crawlCommand,
-    refreshCommand
+    refreshCommand,
+    shrinkCacheCommand
 };
 
 return await rootCommand.Parse(args).InvokeAsync();

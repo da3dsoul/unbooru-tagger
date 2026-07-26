@@ -1,5 +1,6 @@
 using System.Text.Json;
 using SkiaSharp;
+using UnbooruTagger.Core.Encoding;
 using UnbooruTagger.Core.Runtime;
 using UnbooruTagger.Core.Scoring;
 
@@ -58,7 +59,7 @@ public static class DetectCommandHandler
         using var bitmap = SKBitmap.Decode(imagePath)
             ?? throw new InvalidDataException($"Could not decode image at '{imagePath}'.");
 
-        var guide = HeatmapRefiner.BuildGuide(bitmap, RefinementSize);
+        var guide = HeatmapRefiner.BuildGuide(bitmap, RefinementSize, out var refinementContent);
 
         var detections = new List<TagDetection>();
         for (var row = 0; row < model.Embeddings.RowCount; row++)
@@ -70,7 +71,8 @@ public static class DetectCommandHandler
 
             var heatmap = TagScorer.Heatmap(tagEmbedding, encoding.SpatialFeatures);
             var refinedHeatmap = HeatmapRefiner.Refine(heatmap, guide);
-            var boxes = TagScorer.DetectBoxes(refinedHeatmap, boxThreshold, boxPercentile, bitmap.Width, bitmap.Height);
+            var boxes = TagScorer.DetectBoxes(
+                refinedHeatmap, boxThreshold, boxPercentile, refinementContent, RefinementSize, bitmap.Width, bitmap.Height);
             detections.Add(new TagDetection(model.Vocabulary.GetByRowIndex(row).Tag, confidence, boxes));
         }
 

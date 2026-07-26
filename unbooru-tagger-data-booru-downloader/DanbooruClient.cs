@@ -41,9 +41,49 @@ public sealed class DanbooruClient(HttpClient http, IRateLimiter rateLimiter, st
             foreach (var element in doc.RootElement.EnumerateArray())
             {
                 any = true;
+                var category = element.TryGetProperty("category", out var categoryProp) && categoryProp.TryGetInt32(out var categoryCode)
+                    ? TagCategoryNaming.FromRawCode(categoryCode)
+                    : TagCategory.General;
                 yield return new BooruTagCount(
-                    element.GetProperty("name").GetString()!,
+                    TagCategoryNaming.Identity(element.GetProperty("name").GetString()!, category),
                     element.GetProperty("post_count").GetInt32());
+            }
+
+            if (!any)
+                yield break;
+        }
+    }
+
+    /// <summary>
+    /// Streams every currently-active tag alias — Danbooru's own record of "this
+    /// deprecated/alternate spelling now means that canonical tag" (e.g. <c>head_pat</c>
+    /// -&gt; <c>headpat</c>). <see cref="TagSurveyor"/> uses this so an alias and its
+    /// target don't end up surveyed as two unrelated eligible tags: without it, a search
+    /// for the antecedent silently redirects and returns posts tagged with the
+    /// consequent name, which can never satisfy quota tracked against the antecedent
+    /// identity — that tag's per-site floor then never moves and its crawl only gives up
+    /// once results are physically exhausted, having wasted a full pagination run for
+    /// zero counted credit. Only Danbooru exposes this; Gelbooru has no equivalent
+    /// listing, but Danbooru's table alone is enough since a raw name from *either* site
+    /// can be looked up against it.
+    /// </summary>
+    public async IAsyncEnumerable<BooruTagAlias> ListActiveTagAliasesAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        for (var page = 1; ; page++)
+        {
+            var uri = new Uri($"{_baseUrl}/tag_aliases.json?search[status]=active&limit=1000&page={page}{AuthQuery()}");
+            var json = await GetStringAsync(uri, cancellationToken).ConfigureAwait(false);
+            using var doc = JsonDocument.Parse(json);
+
+            var any = false;
+            foreach (var element in doc.RootElement.EnumerateArray())
+            {
+                any = true;
+                if (!element.TryGetProperty("antecedent_name", out var antecedentProp) || antecedentProp.ValueKind != JsonValueKind.String
+                    || !element.TryGetProperty("consequent_name", out var consequentProp) || consequentProp.ValueKind != JsonValueKind.String)
+                    continue;
+
+                yield return new BooruTagAlias(antecedentProp.GetString()!, consequentProp.GetString()!);
             }
 
             if (!any)

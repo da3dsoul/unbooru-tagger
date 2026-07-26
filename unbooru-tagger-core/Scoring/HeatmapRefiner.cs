@@ -1,4 +1,5 @@
 using SkiaSharp;
+using UnbooruTagger.Core.Encoding;
 
 namespace UnbooruTagger.Core.Scoring;
 
@@ -12,17 +13,22 @@ namespace UnbooruTagger.Core.Scoring;
 public static class HeatmapRefiner
 {
     /// <summary>
-    /// Resizes <paramref name="original"/> down to <paramref name="size"/> x <paramref name="size"/>
-    /// (matching how <see cref="Encoding.ImagePreprocessing"/> squares off the image for the
-    /// model) and extracts it as an RGB guide for <see cref="Refine"/>. Build this once per
-    /// image and reuse it across every tag's heatmap — it doesn't depend on which tag is
-    /// being refined.
+    /// Letterboxes <paramref name="original"/> into a <paramref name="size"/> x
+    /// <paramref name="size"/> canvas the exact same way <see cref="ImagePreprocessing"/>
+    /// does for the model input (see <see cref="ImagePreprocessing.BuildLetterboxCanvas"/>),
+    /// and extracts it as an RGB guide for <see cref="Refine"/>. Matching that letterbox
+    /// exactly matters: <see cref="Refine"/> upsamples the model's heatmap grid — which
+    /// covers the whole padded canvas, not just the real image — directly onto this guide,
+    /// so a mismatched canvas would misalign the two. <paramref name="content"/> is where
+    /// this canvas's real content ended up, in this method's own <paramref name="size"/>
+    /// resolution (not the model's <c>inputSize</c>) — callers need it to crop the padding
+    /// bars back out of a refined heatmap before mapping it to the original image.
+    /// Build this once per image and reuse it across every tag's heatmap — it doesn't
+    /// depend on which tag is being refined.
     /// </summary>
-    public static float[,,] BuildGuide(SKBitmap original, int size)
+    public static float[,,] BuildGuide(SKBitmap original, int size, out LetterboxBox content)
     {
-        var resizeInfo = new SKImageInfo(size, size, SKColorType.Rgba8888, SKAlphaType.Unpremul);
-        using var resized = original.Resize(resizeInfo, SKSamplingOptions.Default)
-            ?? throw new InvalidOperationException("Failed to resize image for heatmap refinement.");
+        using var resized = ImagePreprocessing.BuildLetterboxCanvas(original, size, out content);
 
         var guide = new float[size, size, 3];
         var pixels = resized.GetPixelSpan();

@@ -53,4 +53,37 @@ public class TagEligibilityTests
 
         Assert.Equal(0, TagEligibility.EstimateImageSlots(tags, minImages: 500, maxImages: 1000));
     }
+
+    [Fact]
+    public void IsEligible_False_WhenTagIsExcluded_EvenIfCountMeetsThreshold()
+    {
+        var tag = new TagSurveyResult("meta:highres", 100000, 100000);
+        var rules = new TagExclusionRules(new HashSet<string> { "meta:highres" }, new HashSet<string>());
+
+        Assert.False(TagEligibility.IsEligible(tag, minImages: 500, rules));
+    }
+
+    [Fact]
+    public void IsEligible_True_WhenExclusionRulesGivenButThisTagIsntOneOfThem()
+    {
+        var tag = new TagSurveyResult("1girl", 100000, 100000);
+        var rules = new TagExclusionRules(new HashSet<string> { "meta:highres" }, new HashSet<string>());
+
+        Assert.True(TagEligibility.IsEligible(tag, minImages: 500, rules));
+    }
+
+    [Fact]
+    public void EstimateImageSlots_ExcludesExcludedTagsFromTheUpperBound()
+    {
+        var tags = new[]
+        {
+            new TagSurveyResult("1girl", 10000, null),
+            new TagSurveyResult("meta:highres", 50000, null),
+        };
+        var rules = new TagExclusionRules(new HashSet<string> { "meta:highres" }, new HashSet<string>());
+
+        var estimate = TagEligibility.EstimateImageSlots(tags, minImages: 500, maxImages: 1000, rules);
+
+        Assert.Equal(1000, estimate);
+    }
 }

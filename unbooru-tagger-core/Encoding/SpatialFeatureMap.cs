@@ -29,5 +29,11 @@ public sealed class SpatialFeatureMap
         _data.AsSpan((y * Width + x) * Channels, Channels);
 }
 
-/// <summary>The image tower's output: a pooled global embedding plus the spatial map it was pooled from.</summary>
-public sealed record ImageEncoding(float[] PooledEmbedding, SpatialFeatureMap SpatialFeatures);
+/// <summary>
+/// The image tower's output: a pooled global embedding plus the spatial map it was
+/// pooled from, plus where the source image's real content landed inside the
+/// (letterboxed) input canvas — <see cref="SpatialFeatures"/> covers the whole canvas,
+/// padding included, so callers mapping grid cells back to the original image's pixel
+/// space need <see cref="Content"/> to exclude the padding bars.
+/// </summary>
+public sealed record ImageEncoding(float[] PooledEmbedding, SpatialFeatureMap SpatialFeatures, LetterboxBox Content);

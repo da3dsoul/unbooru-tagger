@@ -65,19 +65,42 @@ public static class AddTagCommandHandler
         var (trainingIndices, validationIndices) = SplitForValidation(manifest.Entries.Count);
         var useEarlyStopping = validationIndices.Count > 0;
 
-        using var trainingPixelBatch = ImageBatchLoader.Load(trainingIndices.Select(i => imagePaths[i]).ToList(), config.InputSize).to(device);
+        var (rawTrainingPixelBatch, trainingBoxes) = ImageBatchLoader.Load(trainingIndices.Select(i => imagePaths[i]).ToList(), config.InputSize);
+        using var trainingPixelBatch = rawTrainingPixelBatch.to(device);
         using var trainingLabels = BatchLabelBuilder.Build(trainingIndices.Select(i => imageTagRows[i]).ToList(), vocabulary.Records.Count).to(device);
 
         Tensor? validationPixelBatch = null;
         Tensor? validationLabels = null;
+        IReadOnlyList<LetterboxBox>? validationBoxes = null;
         if (useEarlyStopping)
         {
-            validationPixelBatch = ImageBatchLoader.Load(validationIndices.Select(i => imagePaths[i]).ToList(), config.InputSize).to(device);
+            (var rawValidationPixelBatch, validationBoxes) = ImageBatchLoader.Load(validationIndices.Select(i => imagePaths[i]).ToList(), config.InputSize);
+            validationPixelBatch = rawValidationPixelBatch.to(device);
             validationLabels = BatchLabelBuilder.Build(validationIndices.Select(i => imageTagRows[i]).ToList(), vocabulary.Records.Count).to(device);
         }
         else
         {
             AnsiConsole.MarkupLineInterpolated($"Only {manifest.Entries.Count} images — too few for a validation split, running the full {steps}-step count without early stopping.");
+        }
+
+        // The image encoder is frozen for the whole run and these batches never change,
+        // so the mask (which locations are real content vs. letterbox padding) is the
+        // same every step -- computed once here from a throwaway forward pass instead of
+        // rebuilt every step.
+        Tensor trainingMask;
+        Tensor? validationMask = null;
+        using (no_grad())
+        {
+            var (_, warmupSpatial) = imageTower.forward(trainingPixelBatch);
+            using var _warmupSpatial = warmupSpatial;
+            trainingMask = SpatialMask.Build(trainingBoxes, config.InputSize, warmupSpatial.shape[2], warmupSpatial.shape[3], device);
+
+            if (useEarlyStopping)
+            {
+                var (_, warmupValidationSpatial) = imageTower.forward(validationPixelBatch!);
+                using var _warmupValidationSpatial = warmupValidationSpatial;
+                validationMask = SpatialMask.Build(validationBoxes!, config.InputSize, warmupValidationSpatial.shape[2], warmupValidationSpatial.shape[3], device);
+            }
         }
 
         var earlyStopping = new EarlyStopping(earlyStoppingPatience);
@@ -103,7 +126,8 @@ public static class AddTagCommandHandler
 
                 for (var step = 0; step < steps; step++)
                 {
-                    var (pooled, _) = imageTower.forward(trainingPixelBatch);
+                    var (_, spatial) = imageTower.forward(trainingPixelBatch);
+                    var pooled = ImageTower.MaskedPool(spatial, trainingMask);
                     var tagEmbeddings = tagTower.forward(allTagIndices);
                     var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, trainingLabels);
 
@@ -132,7 +156,8 @@ public static class AddTagCommandHandler
                         continue;
 
                     using var _ = no_grad();
-                    var (valPooled, _) = imageTower.forward(validationPixelBatch!);
+                    var (_, valSpatial) = imageTower.forward(validationPixelBatch!);
+                    var valPooled = ImageTower.MaskedPool(valSpatial, validationMask!);
                     var valTagEmbeddings = tagTower.forward(allTagIndices);
                     var validationLoss = SigmoidContrastiveLoss.Compute(valPooled, valTagEmbeddings, validationLabels!).item<float>();
 

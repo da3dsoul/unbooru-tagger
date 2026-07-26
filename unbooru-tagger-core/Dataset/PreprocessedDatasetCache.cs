@@ -1,4 +1,5 @@
 using System.Text.Json;
+using UnbooruTagger.Core.Encoding;
 
 namespace UnbooruTagger.Core.Dataset;
 
@@ -12,7 +13,76 @@ public static class PreprocessedDatasetCache
 {
     internal const string PixelsFileName = "images.bin";
     internal const string LabelsFileName = "tag_rows.jsonl";
-    internal const int HeaderBytes = sizeof(int) * 2;
+
+    /// <summary>
+    /// Distinguishes the current format from older ones — an old cache read under a
+    /// newer layout would otherwise silently misinterpret its bytes instead of failing
+    /// loudly. Bumped from "LBX1" to "LBX2" when records switched from fixed-size
+    /// (full padded canvas, float32) to variable-size (content-only, uint8): a cache
+    /// built under "LBX1" must be regenerated, not just re-read, since the two formats
+    /// don't even agree on how long a record is.
+    /// </summary>
+    internal const int FormatMagic = 0x4C425832; // "LBX2"
+
+    internal const int HeaderBytes = sizeof(int) * 3;
+    internal const int BoxBytes = sizeof(int) * 4;
+
+    /// <summary>
+    /// Byte length of a record's pixel payload — <see cref="EncodedImage"/> stores only
+    /// the letterbox content region (no padding), as raw <c>uint8</c> RGB, so this is
+    /// derivable from the box already written at the start of the record instead of
+    /// needing a separate stored length.
+    /// </summary>
+    internal static long ContentByteLength(int width, int height) => (long)width * height * 3;
+}
+
+/// <summary>
+/// Locates records in <see cref="PreprocessedDatasetCache.PixelsFileName"/>, which are
+/// variable-length (an <see cref="EncodedImage"/> stores only its letterbox content
+/// region, no padding) rather than fixed-stride — a record's start offset can only be
+/// found by walking every prior record's 16-byte box header (never its pixel payload,
+/// which is what makes the walk cheap even across millions of records) and accumulating
+/// <c>BoxBytes + width*height*3</c> each time.
+/// </summary>
+internal static class PreprocessedImageIndex
+{
+    /// <summary>The byte offset each of <paramref name="imageCount"/> records starts at, in image-index order — for building a reader's random-access index.</summary>
+    public static long[] BuildOffsets(Stream stream, int imageCount)
+    {
+        var offsets = new long[imageCount];
+        var position = (long)PreprocessedDatasetCache.HeaderBytes;
+        var box = new byte[PreprocessedDatasetCache.BoxBytes];
+        for (var i = 0; i < imageCount; i++)
+        {
+            offsets[i] = position;
+            position += ReadRecordLength(stream, position, box, i);
+        }
+
+        return offsets;
+    }
+
+    /// <summary>The byte offset just past the last of <paramref name="imageCount"/> records — where a resumed writer should continue appending.</summary>
+    public static long FindEndOffset(Stream stream, int imageCount)
+    {
+        var position = (long)PreprocessedDatasetCache.HeaderBytes;
+        var box = new byte[PreprocessedDatasetCache.BoxBytes];
+        for (var i = 0; i < imageCount; i++)
+            position += ReadRecordLength(stream, position, box, i);
+
+        return position;
+    }
+
+    private static long ReadRecordLength(Stream stream, long position, byte[] boxBuffer, int imageIndex)
+    {
+        stream.Position = position;
+        var read = stream.Read(boxBuffer, 0, boxBuffer.Length);
+        if (read != boxBuffer.Length)
+            throw new EndOfStreamException($"Expected a {boxBuffer.Length}-byte box header for image {imageIndex}, got {read}.");
+
+        var width = BitConverter.ToInt32(boxBuffer, 8);
+        var height = BitConverter.ToInt32(boxBuffer, 12);
+        return PreprocessedDatasetCache.BoxBytes + PreprocessedDatasetCache.ContentByteLength(width, height);
+    }
 }
 
 /// <summary>
@@ -27,7 +97,6 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
     private readonly BinaryWriter _pixelWriter;
     private readonly string _labelPath;
     private StreamWriter _labelWriter;
-    private readonly int _inputSize;
 
     /// <summary>Images durably committed as of the last <see cref="Flush"/> (or resumed from a prior run).</summary>
     public int ImageCount { get; private set; }
@@ -49,7 +118,6 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
 
     private PreprocessedDatasetCacheWriter(string directory, int inputSize, bool resume)
     {
-        _inputSize = inputSize;
         Directory.CreateDirectory(directory);
 
         var pixelPath = Path.Combine(directory, PreprocessedDatasetCache.PixelsFileName);
@@ -64,15 +132,25 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
             _pixelStream.Position = 0;
             using (var headerReader = new BinaryReader(_pixelStream, System.Text.Encoding.UTF8, leaveOpen: true))
             {
+                var magic = headerReader.ReadInt32();
+                if (magic != PreprocessedDatasetCache.FormatMagic)
+                    throw new InvalidDataException(
+                        $"Cache at '{directory}' was built with an older cache format. Delete it and rebuild.");
+
                 ImageCount = headerReader.ReadInt32();
                 var storedInputSize = headerReader.ReadInt32();
                 if (storedInputSize != inputSize)
                     throw new InvalidDataException($"Cache at '{directory}' was built with input size {storedInputSize}, but {inputSize} was requested.");
             }
 
-            var imageBytes = 3L * inputSize * inputSize * sizeof(float);
-            _pixelStream.SetLength(PreprocessedDatasetCache.HeaderBytes + ImageCount * imageBytes);
-            _pixelStream.Position = _pixelStream.Length;
+            // Records are variable-length (content-only, no padding stored), so the
+            // resume point can't be computed by arithmetic the way a fixed-stride format
+            // could — walk the ImageCount confirmed records' box headers (16 bytes each,
+            // never the pixel payload) to find exactly where the last one ends. Anything
+            // past that point is a dangling, never-flushed page and gets truncated away.
+            var resumePosition = PreprocessedImageIndex.FindEndOffset(_pixelStream, ImageCount);
+            _pixelStream.SetLength(resumePosition);
+            _pixelStream.Position = resumePosition;
 
             var confirmedLines = File.Exists(labelPath) ? File.ReadLines(labelPath).Take(ImageCount).ToList() : [];
             File.WriteAllLines(labelPath, confirmedLines);
@@ -82,6 +160,7 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
         {
             _pixelStream = File.Create(pixelPath);
             _pixelWriter = new BinaryWriter(_pixelStream);
+            _pixelWriter.Write(PreprocessedDatasetCache.FormatMagic);
             _pixelWriter.Write(0); // image count placeholder, patched by Flush/Dispose
             _pixelWriter.Write(inputSize);
 
@@ -93,15 +172,18 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
         }
     }
 
-    /// <summary>Appends one already-normalized image (see Core.Encoding.ImagePreprocessing) and its tag row indices.</summary>
-    public void Append(float[] normalizedPixels, IReadOnlyList<int> tagRows)
+    /// <summary>Appends one resized (not yet padded/normalized) image (see Core.Encoding.ImagePreprocessing) and its tag row indices.</summary>
+    public void Append(EncodedImage image, IReadOnlyList<int> tagRows)
     {
-        var expectedLength = 3 * _inputSize * _inputSize;
-        if (normalizedPixels.Length != expectedLength)
-            throw new ArgumentException($"Expected {expectedLength} floats for a {_inputSize}x{_inputSize} image, got {normalizedPixels.Length}.");
+        var expectedLength = PreprocessedDatasetCache.ContentByteLength(image.Content.Width, image.Content.Height);
+        if (image.Pixels.Length != expectedLength)
+            throw new ArgumentException($"Expected {expectedLength} bytes for a {image.Content.Width}x{image.Content.Height} content region, got {image.Pixels.Length}.");
 
-        foreach (var value in normalizedPixels)
-            _pixelWriter.Write(value);
+        _pixelWriter.Write(image.Content.X);
+        _pixelWriter.Write(image.Content.Y);
+        _pixelWriter.Write(image.Content.Width);
+        _pixelWriter.Write(image.Content.Height);
+        _pixelWriter.Write(image.Pixels);
         _labelWriter.WriteLine(JsonSerializer.Serialize(tagRows));
         ImageCount++;
     }
@@ -160,7 +242,7 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
     {
         _pixelWriter.Flush();
         var position = _pixelStream.Position;
-        _pixelStream.Position = 0;
+        _pixelStream.Position = sizeof(int); // past the magic number
         _pixelWriter.Write(ImageCount);
         _pixelStream.Position = position;
         _pixelWriter.Flush();
@@ -179,8 +261,7 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
 public sealed class PreprocessedDatasetCacheReader : IDisposable
 {
     private readonly FileStream _pixelStream;
-    private readonly int _imageFloats;
-    private readonly int _imageBytes;
+    private readonly long[] _offsets;
 
     public int ImageCount { get; }
     public int InputSize { get; }
@@ -191,12 +272,20 @@ public sealed class PreprocessedDatasetCacheReader : IDisposable
         _pixelStream = File.OpenRead(Path.Combine(directory, PreprocessedDatasetCache.PixelsFileName));
         using (var reader = new BinaryReader(_pixelStream, System.Text.Encoding.UTF8, leaveOpen: true))
         {
+            var magic = reader.ReadInt32();
+            if (magic != PreprocessedDatasetCache.FormatMagic)
+                throw new InvalidDataException(
+                    $"Cache at '{directory}' was built with an older cache format. Delete it and rebuild.");
+
             ImageCount = reader.ReadInt32();
             InputSize = reader.ReadInt32();
         }
 
-        _imageFloats = 3 * InputSize * InputSize;
-        _imageBytes = _imageFloats * sizeof(float);
+        // Records are variable-length (content-only, no padding stored), so random
+        // access needs an offset table. Building it costs one sequential pass over just
+        // the box headers (16 bytes each) — never the pixel payloads — so it stays cheap
+        // even at a multi-million-image corpus.
+        _offsets = PreprocessedImageIndex.BuildOffsets(_pixelStream, ImageCount);
 
         // Only the first ImageCount lines are confirmed committed — a crash can leave
         // dangling trailing lines from a page that started but never finished flushing.
@@ -207,19 +296,28 @@ public sealed class PreprocessedDatasetCacheReader : IDisposable
             .ToList();
     }
 
-    /// <summary>Reads one image's normalized pixel tensor directly off disk — the cache is never fully loaded into memory.</summary>
-    public float[] ReadImage(int index)
+    /// <summary>Reads one image's letterbox content region off disk and reconstructs the full padded, normalized pixel tensor a model consumes — the cache is never fully loaded into memory.</summary>
+    public PreprocessedImage ReadImage(int index)
     {
-        _pixelStream.Position = PreprocessedDatasetCache.HeaderBytes + ((long)index * _imageBytes);
+        _pixelStream.Position = _offsets[index];
 
-        var buffer = new byte[_imageBytes];
-        var read = _pixelStream.Read(buffer, 0, buffer.Length);
-        if (read != buffer.Length)
-            throw new EndOfStreamException($"Expected {buffer.Length} bytes for image {index}, got {read}.");
+        var box = new byte[PreprocessedDatasetCache.BoxBytes];
+        var boxRead = _pixelStream.Read(box, 0, box.Length);
+        if (boxRead != box.Length)
+            throw new EndOfStreamException($"Expected a {box.Length}-byte box header for image {index}, got {boxRead}.");
 
-        var floats = new float[_imageFloats];
-        Buffer.BlockCopy(buffer, 0, floats, 0, buffer.Length);
-        return floats;
+        var content = new LetterboxBox(
+            BitConverter.ToInt32(box, 0),
+            BitConverter.ToInt32(box, 4),
+            BitConverter.ToInt32(box, 8),
+            BitConverter.ToInt32(box, 12));
+
+        var pixelBytes = new byte[PreprocessedDatasetCache.ContentByteLength(content.Width, content.Height)];
+        var pixelsRead = _pixelStream.Read(pixelBytes, 0, pixelBytes.Length);
+        if (pixelsRead != pixelBytes.Length)
+            throw new EndOfStreamException($"Expected {pixelBytes.Length} pixel bytes for image {index}, got {pixelsRead}.");
+
+        return ImagePreprocessing.Reconstruct(new EncodedImage(pixelBytes, content), InputSize);
     }
 
     public void Dispose() => _pixelStream.Dispose();

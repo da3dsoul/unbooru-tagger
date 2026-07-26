@@ -13,17 +13,26 @@ internal sealed class FixedWidthDescriptionColumn(int width) : ProgressColumn
 }
 
 /// <summary>
-/// One site's own progress rows — phase text (with a real fraction while a page's posts
-/// are in flight), this site's current tag (its own count against a realistic per-tag
-/// ceiling), and how many of the eligible tags this site's own worker has finished this
-/// phase. Each configured site (danbooru, gelbooru, ...) gets one of these, since
-/// <see cref="DatasetCrawler"/> now runs a dedicated concurrent worker per site instead
-/// of picking one site at a time to fetch from — a single shared "current tag" row
-/// stopped meaning anything once two sites could be on two different tags at once.
+/// One site's own progress rows — phase text (a plain status line, e.g. "fetching
+/// page..." or an error/backoff message), separate download and processing fractions
+/// for whatever page is currently in flight, this site's current tag (its own count
+/// against a realistic per-tag ceiling), and how many of the eligible tags this site's
+/// own worker has finished this phase. Each configured site (danbooru, gelbooru, ...)
+/// gets one of these, since <see cref="DatasetCrawler"/> now runs a dedicated concurrent
+/// worker per site instead of picking one site at a time to fetch from — a single shared
+/// "current tag" row stopped meaning anything once two sites could be on two different
+/// tags at once.
+///
+/// Download and processing are reported separately (rather than one shared "processing
+/// N posts" fraction) because <see cref="DatasetCrawler"/> now runs them as genuinely
+/// separate phases with their own per-site worker pools: a page stuck waiting on the
+/// network looks different from one stuck waiting on decode/resize, and collapsing both
+/// into one bar hid which of the two — if either — was actually the bottleneck.
 /// </summary>
 public sealed record SiteProgressReporter(
     Action<string> ReportPhase,
-    Action<int, int> ReportPhaseProgress,
+    Action<int, int> ReportDownloadProgress,
+    Action<int, int> ReportProcessingProgress,
     Action<string, long, long> ReportTagProgress,
     Action<long, long> ReportTagsCompleted);
 
@@ -76,24 +85,30 @@ public static class ProgressBarColumns
         var phaseTask = ctx.AddTask(Markup.Escape($"[{site}] Initializing..."));
         phaseTask.IsIndeterminate = true;
 
+        var downloadTask = ctx.AddTask(Markup.Escape($"[{site}] Downloading"));
+        var processingTask = ctx.AddTask(Markup.Escape($"[{site}] Processing"));
         var tagProgressTask = ctx.AddTask(Markup.Escape($"[{site}] Current tag"));
         var tagsTask = ctx.AddTask(Markup.Escape($"[{site}] Tags completed"));
 
         void ReportPhase(string phase)
         {
-            // A fresh phase label has no fraction of its own until a ReportPhaseProgress
-            // call says otherwise (e.g. a page's post-by-post processing), so default to
-            // a spinner rather than a stale bar from whatever the previous phase left it at.
             phaseTask.IsIndeterminate = true;
             var bounded = phase.Length > DescriptionWidth ? phase[..DescriptionWidth] + "…" : phase;
             phaseTask.Description = Markup.Escape($"[{site}] {bounded}");
         }
 
-        void ReportPhaseProgress(int completed, int total)
+        void ReportDownloadProgress(int completed, int total)
         {
-            phaseTask.IsIndeterminate = false;
-            phaseTask.MaxValue = total;
-            phaseTask.Value = completed;
+            downloadTask.Description = Markup.Escape($"[{site}] Downloading ({completed}/{total})");
+            downloadTask.MaxValue = total;
+            downloadTask.Value = completed;
+        }
+
+        void ReportProcessingProgress(int completed, int total)
+        {
+            processingTask.Description = Markup.Escape($"[{site}] Processing ({completed}/{total})");
+            processingTask.MaxValue = total;
+            processingTask.Value = completed;
         }
 
         void ReportTagProgress(string tagName, long completed, long target)
@@ -114,7 +129,7 @@ public static class ProgressBarColumns
             tagsTask.Value = completed;
         }
 
-        return new SiteProgressReporter(ReportPhase, ReportPhaseProgress, ReportTagProgress, ReportTagsCompleted);
+        return new SiteProgressReporter(ReportPhase, ReportDownloadProgress, ReportProcessingProgress, ReportTagProgress, ReportTagsCompleted);
     }
 
     /// <summary><paramref name="sites"/> gets one row group each (see <see cref="AddSiteTasks"/>), rendered in the order given — plus one shared images-appended row.</summary>
