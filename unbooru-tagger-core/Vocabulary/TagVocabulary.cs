@@ -172,6 +172,37 @@ public sealed class TagVocabulary
     }
 
     /// <summary>
+    /// Loads <paramref name="path"/>, replaying <paramref name="deltaPath"/> on top of
+    /// it exactly like <see cref="Load"/> — but if that delta existed, immediately
+    /// writes the merged result back to <paramref name="path"/> and deletes it, instead
+    /// of leaving the merge sitting in memory only.
+    ///
+    /// <see cref="Load"/> alone leaves a gap: if the caller's run then ends any way
+    /// other than reaching its own next periodic/final compaction (crash, cancellation,
+    /// an unhandled error), the delta file is left on disk exactly as before, and
+    /// nothing ever folds it back into <paramref name="path"/> — not even a subsequent
+    /// <see cref="Load"/>, since that also only replays it into memory again. Meanwhile
+    /// any reader that opens <paramref name="path"/> directly without knowing about a
+    /// delta file (e.g. training, which loads a finished dataset's vocabulary with no
+    /// delta path at all) silently sees a stale snapshot. Compacting right after every
+    /// load closes that gap: the on-disk file is never more than one run's worth of
+    /// uncompacted changes behind, and it's always safe to do here because a delta only
+    /// ever contains records from checkpoints that were already durably committed
+    /// alongside it (see e.g. DatasetCrawler's CheckpointAsync ordering).
+    /// </summary>
+    public static TagVocabulary LoadAndCompact(string path, string? deltaPath = null)
+    {
+        var hadDelta = deltaPath is not null && File.Exists(deltaPath);
+        var vocabulary = Load(path, deltaPath);
+        if (hadDelta)
+        {
+            vocabulary.Save(path);
+            File.Delete(deltaPath!);
+        }
+        return vocabulary;
+    }
+
+    /// <summary>
     /// Writes the full, compacted snapshot, including every change previously
     /// appended via <see cref="SaveDelta"/>. Callers that use <see cref="SaveDelta"/>
     /// for per-page checkpointing should call this periodically (and once the run

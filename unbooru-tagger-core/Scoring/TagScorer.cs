@@ -29,9 +29,12 @@ public static class TagScorer
 
     /// <summary>
     /// Rough bounding boxes for one tag: thresholds its <see cref="Heatmap"/> and groups
-    /// contiguous above-threshold grid cells (4-connectivity) into boxes, each scaled from
-    /// heatmap-grid space up to <paramref name="imageWidth"/> x <paramref name="imageHeight"/>
-    /// pixels. Approximate localization, not a trained detector — see CLAUDE.md.
+    /// contiguous above-threshold grid cells (4-connectivity) into boxes. <paramref name="heatmap"/>
+    /// covers a <paramref name="canvasSize"/> x <paramref name="canvasSize"/> letterboxed
+    /// canvas (padding bars included), so each box is first mapped from grid space to that
+    /// canvas, then from <paramref name="content"/> (where the real image sits within it) to
+    /// <paramref name="imageWidth"/> x <paramref name="imageHeight"/> pixels — the original
+    /// image's own space. Approximate localization, not a trained detector — see CLAUDE.md.
     /// </summary>
     /// <param name="threshold">Absolute sigmoid floor — a tag whose whole heatmap sits below this never gets a box, regardless of <paramref name="relativePercentile"/>.</param>
     /// <param name="relativePercentile">
@@ -41,8 +44,11 @@ public static class TagScorer
     /// keeps only the locations near a tag's own peak instead of everything that happens to
     /// clear the global absolute bar.
     /// </param>
+    /// <param name="content">Where the original image's real content sits within the letterboxed canvas, in canvas pixel space (0..<paramref name="canvasSize"/>).</param>
+    /// <param name="canvasSize">The side length of the square letterboxed canvas <paramref name="heatmap"/>'s grid covers.</param>
     public static List<BoundingBox> DetectBoxes(
-        float[,] heatmap, float threshold, float relativePercentile, int imageWidth, int imageHeight)
+        float[,] heatmap, float threshold, float relativePercentile,
+        LetterboxBox content, int canvasSize, int imageWidth, int imageHeight)
     {
         var height = heatmap.GetLength(0);
         var width = heatmap.GetLength(1);
@@ -58,8 +64,15 @@ public static class TagScorer
         var effectiveThreshold = Math.Max(threshold, min + relativePercentile * (max - min));
 
         var visited = new bool[height, width];
-        var scaleX = imageWidth / (float)width;
-        var scaleY = imageHeight / (float)height;
+
+        // Grid cell -> canvas pixel, then canvas pixel -> original image pixel: canvas
+        // pixels inside `content` map linearly onto the original image; anything outside
+        // it (the letterbox bars) clamps to the image's own edge instead of overshooting
+        // past it or going negative.
+        var gridToCanvasX = canvasSize / (float)width;
+        var gridToCanvasY = canvasSize / (float)height;
+        var canvasToImageX = imageWidth / (float)content.Width;
+        var canvasToImageY = imageHeight / (float)content.Height;
 
         var boxes = new List<BoundingBox>();
         for (var y = 0; y < height; y++)
@@ -68,7 +81,9 @@ public static class TagScorer
             if (visited[y, x] || heatmap[y, x] < effectiveThreshold)
                 continue;
 
-            boxes.Add(FloodFillComponent(heatmap, visited, x, y, effectiveThreshold, scaleX, scaleY));
+            boxes.Add(FloodFillComponent(
+                heatmap, visited, x, y, effectiveThreshold,
+                gridToCanvasX, gridToCanvasY, canvasToImageX, canvasToImageY, content, imageWidth, imageHeight));
         }
 
         return boxes;
@@ -76,7 +91,9 @@ public static class TagScorer
 
     /// <summary>BFS over 4-connected above-threshold grid cells starting at (startX, startY), returning their pixel-space bounding box.</summary>
     private static BoundingBox FloodFillComponent(
-        float[,] heatmap, bool[,] visited, int startX, int startY, float threshold, float scaleX, float scaleY)
+        float[,] heatmap, bool[,] visited, int startX, int startY, float threshold,
+        float gridToCanvasX, float gridToCanvasY, float canvasToImageX, float canvasToImageY,
+        LetterboxBox content, int imageWidth, int imageHeight)
     {
         var height = heatmap.GetLength(0);
         var width = heatmap.GetLength(1);
@@ -109,10 +126,15 @@ public static class TagScorer
             }
         }
 
-        var pixelX = (int)(minX * scaleX);
-        var pixelY = (int)(minY * scaleY);
-        var pixelRight = (int)MathF.Ceiling((maxX + 1) * scaleX);
-        var pixelBottom = (int)MathF.Ceiling((maxY + 1) * scaleY);
+        var canvasLeft = minX * gridToCanvasX;
+        var canvasTop = minY * gridToCanvasY;
+        var canvasRight = MathF.Ceiling((maxX + 1) * gridToCanvasX);
+        var canvasBottom = MathF.Ceiling((maxY + 1) * gridToCanvasY);
+
+        var pixelX = (int)Math.Clamp((canvasLeft - content.X) * canvasToImageX, 0, imageWidth);
+        var pixelY = (int)Math.Clamp((canvasTop - content.Y) * canvasToImageY, 0, imageHeight);
+        var pixelRight = (int)Math.Clamp(MathF.Ceiling((canvasRight - content.X) * canvasToImageX), 0, imageWidth);
+        var pixelBottom = (int)Math.Clamp(MathF.Ceiling((canvasBottom - content.Y) * canvasToImageY), 0, imageHeight);
 
         return new BoundingBox(pixelX, pixelY, pixelRight - pixelX, pixelBottom - pixelY, peakConfidence);
     }

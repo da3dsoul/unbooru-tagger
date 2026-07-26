@@ -1,12 +1,15 @@
 using System.Reflection;
 using UnbooruTagger.Core.Dataset;
+using UnbooruTagger.Core.Encoding;
 
 namespace UnbooruTagger.Tests.Core;
 
 public class CacheResumeSmokeTests
 {
-    private static float[] Image(int inputSize, float offset) =>
-        Enumerable.Range(0, 3 * inputSize * inputSize).Select(i => i + offset).ToArray();
+    private static EncodedImage Image(int inputSize, byte offset) =>
+        new(
+            Enumerable.Range(0, 3 * inputSize * inputSize).Select(i => (byte)(i + offset)).ToArray(),
+            new LetterboxBox(0, 0, inputSize, inputSize));
 
     [Fact]
     public void OpenOrCreate_DropsDanglingPageAndResumesCleanly()
@@ -41,8 +44,8 @@ public class CacheResumeSmokeTests
             Assert.Equal(2, reader.ImageCount);
             Assert.Equal(new[] { 0, 2 }, reader.ImageTagRows[0]);
             Assert.Equal(new[] { 5 }, reader.ImageTagRows[1]);
-            Assert.Equal(image0, reader.ReadImage(0));
-            Assert.Equal(image2, reader.ReadImage(1));
+            Assert.Equal(ImagePreprocessing.Reconstruct(image0, inputSize).Pixels, reader.ReadImage(0).Pixels);
+            Assert.Equal(ImagePreprocessing.Reconstruct(image2, inputSize).Pixels, reader.ReadImage(1).Pixels);
         }
         finally
         {

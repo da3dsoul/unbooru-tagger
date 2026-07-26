@@ -34,7 +34,16 @@ public static class SigmoidContrastiveLoss
     /// <param name="tagEmbeddings">[batchTags, embeddingDim]</param>
     /// <param name="labels">[batchImages, batchTags]: +1 where the image is tagged with that tag, -1 otherwise.</param>
     /// <param name="temperature">Lower sharpens (concentrates gradient on a tag's best-matching location); higher smooths toward <see cref="Compute"/>'s behavior.</param>
-    public static Tensor ComputeLocalized(Tensor spatialFeatures, Tensor tagEmbeddings, Tensor labels, float temperature)
+    /// <param name="spatialMask">
+    /// Optional [batchImages, 1, height, width] validity mask (see
+    /// <c>UnbooruTagger.Training.Model.SpatialMask</c>) — 1 for locations with real image
+    /// content, 0 for letterbox padding. Masked-out locations are excluded from both the
+    /// log-sum-exp pool and the log-location-count normalization it's built on, so a
+    /// padded border can't be picked as a tag's "best-matching location" or dilute the
+    /// mean-pooled fallback at high temperature. Omit for an unpadded spatial map (every
+    /// location counts, matching the original unmasked behavior).
+    /// </param>
+    public static Tensor ComputeLocalized(Tensor spatialFeatures, Tensor tagEmbeddings, Tensor labels, float temperature, Tensor? spatialMask = null)
     {
         var batch = spatialFeatures.shape[0];
         var dim = spatialFeatures.shape[1];
@@ -48,9 +57,22 @@ public static class SigmoidContrastiveLoss
         var perLocationLogits = flattened.matmul(tagEmbeddings.t()).transpose(1, 2);
 
         var scaled = perLocationLogits / temperature;
+
+        Tensor logValidCount;
+        if (spatialMask is not null)
+        {
+            var maskFlat = spatialMask.reshape([batch, 1, locations]);
+            scaled = scaled.masked_fill(maskFlat.eq(0), float.NegativeInfinity);
+            logValidCount = maskFlat.sum([2], keepdim: true).log();
+        }
+        else
+        {
+            logValidCount = tensor(MathF.Log(locations));
+        }
+
         var maxScaled = scaled.amax([2], keepdim: true);
         var logSumExp = maxScaled + (scaled - maxScaled).exp().sum([2], keepdim: true).log();
-        var pooledLogits = (temperature * (logSumExp - MathF.Log(locations))).squeeze(2);
+        var pooledLogits = (temperature * (logSumExp - logValidCount)).squeeze(2);
 
         return nn.functional.softplus(-labels * pooledLogits).mean();
     }

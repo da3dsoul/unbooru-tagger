@@ -1,4 +1,5 @@
 using SkiaSharp;
+using UnbooruTagger.Core.Encoding;
 using UnbooruTagger.Core.Runtime;
 using UnbooruTagger.Core.Scoring;
 
@@ -21,7 +22,7 @@ public static class HeatmapCommandHandler
 
         using var original = SKBitmap.Decode(imagePath)
             ?? throw new InvalidDataException($"Could not decode image at '{imagePath}'.");
-        using var overlay = RenderOverlay(original, heatmap);
+        using var overlay = RenderOverlay(original, heatmap, encoding.Content, model.ImageEncoder.InputSize);
 
         using var image = SKImage.FromBitmap(overlay);
         using var data = image.Encode(SKEncodedImageFormat.Png, quality: 100);
@@ -31,8 +32,14 @@ public static class HeatmapCommandHandler
         return 0;
     }
 
-    /// <summary>Upsamples the (typically much smaller than the image) heatmap grid and blends it as a red overlay.</summary>
-    private static SKBitmap RenderOverlay(SKBitmap original, float[,] heatmap)
+    /// <summary>
+    /// Upsamples the (typically much smaller than the image) heatmap grid, crops out the
+    /// letterbox padding bars it covers alongside the real image content, and blends the
+    /// result as a red overlay. <paramref name="content"/>/<paramref name="canvasSize"/>
+    /// describe where the real image sits within the grid's full padded canvas — see
+    /// <see cref="UnbooruTagger.Core.Encoding.ImageEncoding.Content"/>.
+    /// </summary>
+    private static SKBitmap RenderOverlay(SKBitmap original, float[,] heatmap, LetterboxBox content, int canvasSize)
     {
         var height = heatmap.GetLength(0);
         var width = heatmap.GetLength(1);
@@ -54,8 +61,15 @@ public static class HeatmapCommandHandler
             heatBitmap.SetPixel(x, y, new SKColor(255, 0, 0, (byte)(normalized * 255)));
         }
 
-        using var resizedHeat = heatBitmap.Resize(new SKImageInfo(original.Width, original.Height), SKSamplingOptions.Default)
-            ?? throw new InvalidOperationException("Failed to resize heatmap overlay.");
+        using var canvasHeat = heatBitmap.Resize(new SKImageInfo(canvasSize, canvasSize), SKSamplingOptions.Default)
+            ?? throw new InvalidOperationException("Failed to resize heatmap overlay to canvas size.");
+
+        using var croppedHeat = new SKBitmap(content.Width, content.Height);
+        if (!canvasHeat.ExtractSubset(croppedHeat, new SKRectI(content.X, content.Y, content.X + content.Width, content.Y + content.Height)))
+            throw new InvalidOperationException("Failed to crop heatmap overlay to the image content region.");
+
+        using var resizedHeat = croppedHeat.Resize(new SKImageInfo(original.Width, original.Height), SKSamplingOptions.Default)
+            ?? throw new InvalidOperationException("Failed to resize heatmap overlay to the original image size.");
 
         var result = new SKBitmap(original.Width, original.Height);
         using var canvas = new SKCanvas(result);

@@ -90,6 +90,12 @@ public sealed class CrawlDatabase : IDisposable
         return db;
     }
 
+    // ImageSources' primary key only covers (Site, PostId) — every lookup BY Md5
+    // (dedup checks, GetImageSourceSnapshotsAsync's per-image union of sources for
+    // TagRefresher's reconciliation) would otherwise be a full table scan. Hidden for
+    // years behind refresh-tags' own network rate limit on every request; exposed the
+    // instant a caller issues these lookups back-to-back with none in between (a
+    // targeted refresh resolving which sources belong to a batch of images at once).
     private async Task MigrateAsync(CancellationToken cancellationToken)
     {
         const string sql =
@@ -130,6 +136,8 @@ public sealed class CrawlDatabase : IDisposable
                 PostDate TEXT NOT NULL,
                 PRIMARY KEY (Site, PostId)
             );
+
+            CREATE INDEX IF NOT EXISTS idx_ImageSources_Md5 ON ImageSources (Md5);
 
             CREATE TABLE IF NOT EXISTS RefreshProgress (
                 Site TEXT PRIMARY KEY,
@@ -248,6 +256,33 @@ public sealed class CrawlDatabase : IDisposable
 
                 written++;
                 onRowWritten?.Invoke(written);
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }, cancellationToken);
+
+    /// <summary>
+    /// Removes surveyed rows by identity outright, rather than leaving them at
+    /// <c>Eligible = 0</c> like a tag that merely fell under quota this survey — for the
+    /// one case that needs a real delete: a raw name <see cref="TagSurveyor"/> has since
+    /// learned is a known alias of another tag, which must stop being iterated as its own
+    /// eligible tag ever again, not just skipped until the next re-survey un-merges it.
+    /// </summary>
+    public Task DeleteTagSurveysAsync(IEnumerable<string> names, CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            await using var transaction = _connection.BeginTransaction();
+
+            var command = _connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "DELETE FROM Tags WHERE Name = $name;";
+            var nameParam = command.Parameters.Add("$name", SqliteType.Text);
+
+            foreach (var name in names)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                nameParam.Value = name;
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -472,6 +507,34 @@ public sealed class CrawlDatabase : IDisposable
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }, cancellationToken);
+
+    /// <summary>
+    /// How many distinct images <paramref name="site"/> has contributed as a source that
+    /// carry <paramref name="tagIdentity"/> — the per-site fairness-floor credit a
+    /// resumed <c>crawl</c> run can't otherwise reconstruct, since <c>SitePositiveCounts</c>
+    /// itself is never persisted (see <see cref="DatasetCrawler.RunAsync"/>'s own doc
+    /// comment on why). Derived here instead from <c>ImageSources.Tags</c> — each source
+    /// row's own eligible-tags snapshot, already durable — rather than adding a new
+    /// column to maintain in lockstep. Meant to be called once, for the one tag a site's
+    /// worker is actually resuming into (mid-pagination, not yet Done) — every other
+    /// tag's real answer is already 0 (never touched), so there's no reason to pay for
+    /// this query on all of them.
+    /// </summary>
+    public Task<int> CountSiteContributionsForTagAsync(string site, string tagIdentity, CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = "SELECT COUNT(DISTINCT Md5) FROM ImageSources WHERE Site = $site AND Tags LIKE $pattern ESCAPE '\\';";
+            command.Parameters.AddWithValue("$site", site);
+            command.Parameters.AddWithValue("$pattern", $"%\"{EscapeLikePattern(tagIdentity)}\"%");
+
+            var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            return Convert.ToInt32(result);
+        }, cancellationToken);
+
+    /// <summary>Escapes a value for safe use inside a SQL LIKE pattern — <c>%</c>/<c>_</c> are LIKE wildcards, and booru tag names routinely contain literal underscores (<c>head_pat</c>), which would otherwise match any single character instead of a real underscore.</summary>
+    private static string EscapeLikePattern(string value) =>
+        value.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
 
     /// <summary>Resumable cursor for <c>refresh-tags</c>' per-site sweep through <c>ImageSources</c>, ordered by <c>PostId</c> ascending — same pattern as <see cref="TagProgressState"/>, one row per site instead of per (tag, site, phase).</summary>
     public Task<(long LastPostId, bool Done)> GetRefreshProgressAsync(string site, CancellationToken cancellationToken = default) =>

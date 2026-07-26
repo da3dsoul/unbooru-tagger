@@ -35,4 +35,74 @@ internal static class TagRowMutations
         if (currentTagRows.Remove(rowIndex))
             vocabulary.AdjustImageCount(vocabulary.GetByRowIndex(rowIndex), -1);
     }
+
+    /// <summary>
+    /// Maps a post's raw (un-prefixed) tag names — the only form a site's API ever
+    /// returns — to their eligible <see cref="TagCategoryNaming"/> identities, dropping
+    /// any raw tag that isn't a currently-eligible tag at all. <paramref name="eligibleTagIdentities"/>
+    /// is keyed by raw name (see <see cref="BuildEligibleIdentities"/> for how it's built
+    /// from the survey) since that's the only form a post's tags ever arrive in.
+    /// </summary>
+    public static IEnumerable<string> EligibleIdentities(IEnumerable<string> rawTags, IReadOnlyDictionary<string, string> eligibleTagIdentities) =>
+        rawTags.Select(eligibleTagIdentities.GetValueOrDefault).OfType<string>();
+
+    /// <summary>
+    /// Builds the raw-name -&gt; identity lookup <see cref="EligibleIdentities"/> consumes.
+    /// Deduped by raw name — not just grouped by identity — because two sites can (and do)
+    /// disagree on a tag's category (e.g. Danbooru survey files "elvaan" as General while
+    /// Gelbooru calls it Character), which <c>TagSurveyor</c> now reconciles into a single
+    /// identity going forward, but a <c>crawl.sqlite</c> surveyed before that fix can still
+    /// hold both stale rows. Rather than crash on the collision, keep the identity with the
+    /// higher combined post count (ties broken by identity string for determinism).
+    /// </summary>
+    /// <param name="tagAliases">
+    /// Antecedent raw name -&gt; consequent raw name (see
+    /// <see cref="DanbooruClient.ListActiveTagAliasesAsync"/>). <c>TagSurveyor</c> folds a
+    /// known antecedent into its consequent before a tag ever becomes its own eligible
+    /// survey row, which means the antecedent raw name is otherwise MISSING from
+    /// <paramref name="eligibleTags"/> entirely — not just merged, gone. Without this
+    /// parameter, a post still carrying the antecedent spelling (e.g. Gelbooru's own posts
+    /// keep saying <c>head_pat</c> forever; Gelbooru has no idea Danbooru aliased it to
+    /// <c>headpat</c>) would silently drop that tag altogether instead of crediting it to
+    /// the merged identity — worse than before the alias merge, which at least recorded it
+    /// under the wrong name. This backfills every known antecedent as an extra key
+    /// pointing at its (possibly chain-resolved) consequent's real eligible identity, so
+    /// that gap never happens.
+    /// </param>
+    public static Dictionary<string, string> BuildEligibleIdentities(
+        IEnumerable<TagSurveyResult> eligibleTags,
+        IReadOnlyDictionary<string, string>? tagAliases = null)
+    {
+        var byRawName = eligibleTags
+            .GroupBy(t => TagCategoryNaming.RawName(t.Name), StringComparer.Ordinal)
+            .ToDictionary(
+                g => g.Key,
+                g => g.OrderByDescending(t => t.BestCount).ThenBy(t => t.Name, StringComparer.Ordinal).First().Name,
+                StringComparer.Ordinal);
+
+        if (tagAliases is { Count: > 0 })
+        {
+            foreach (var antecedent in tagAliases.Keys)
+            {
+                if (byRawName.ContainsKey(antecedent))
+                    continue; // a real (non-aliased) eligible tag already owns this raw name
+
+                var canonicalRawName = ResolveAlias(antecedent, tagAliases);
+                if (byRawName.TryGetValue(canonicalRawName, out var identity))
+                    byRawName[antecedent] = identity;
+            }
+        }
+
+        return byRawName;
+    }
+
+    /// <summary>Follows <paramref name="tagAliases"/> (antecedent raw name -&gt; consequent raw name) from <paramref name="rawName"/> to its final target, cycle-safe in case of a bad/circular alias chain.</summary>
+    public static string ResolveAlias(string rawName, IReadOnlyDictionary<string, string> tagAliases)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var current = rawName;
+        while (tagAliases.TryGetValue(current, out var next) && seen.Add(current))
+            current = next;
+        return current;
+    }
 }

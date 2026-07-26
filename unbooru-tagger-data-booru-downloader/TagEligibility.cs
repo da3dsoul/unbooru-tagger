@@ -15,8 +15,15 @@ public readonly record struct TagSurveyResult(string Name, int? DanbooruCount, i
 /// </summary>
 public static class TagEligibility
 {
-    /// <summary>A tag is worth crawling once at least one site's post count clears <paramref name="minImages"/>.</summary>
-    public static bool IsEligible(TagSurveyResult tag, int minImages) => tag.BestCount >= minImages;
+    /// <summary>
+    /// A tag is worth crawling once at least one site's post count clears
+    /// <paramref name="minImages"/> and <paramref name="exclusions"/> doesn't rule it out
+    /// — see <see cref="TagExclusionRules"/> for what that covers (a blanket default
+    /// against meta-category tags, with exceptions) and why exclusion overrides count
+    /// regardless of how popular the tag is.
+    /// </summary>
+    public static bool IsEligible(TagSurveyResult tag, int minImages, TagExclusionRules? exclusions = null) =>
+        tag.BestCount >= minImages && !(exclusions?.IsExcluded(tag.Name) ?? false);
 
     /// <summary>
     /// Pre-dedup upper bound on total image slots a crawl would need: summing
@@ -24,6 +31,6 @@ public static class TagEligibility
     /// upper bound — real crawls end up lower once cross-tag/cross-site dedup kicks in,
     /// which isn't knowable until the crawl actually runs.
     /// </summary>
-    public static long EstimateImageSlots(IEnumerable<TagSurveyResult> tags, int minImages, int maxImages) =>
-        tags.Where(t => IsEligible(t, minImages)).Sum(t => (long)Math.Min(maxImages, t.BestCount));
+    public static long EstimateImageSlots(IEnumerable<TagSurveyResult> tags, int minImages, int maxImages, TagExclusionRules? exclusions = null) =>
+        tags.Where(t => IsEligible(t, minImages, exclusions)).Sum(t => (long)Math.Min(maxImages, t.BestCount));
 }

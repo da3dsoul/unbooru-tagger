@@ -1,6 +1,7 @@
 using Spectre.Console;
 using UnbooruTagger.Core.Dataset;
 using UnbooruTagger.Core.Embedding;
+using UnbooruTagger.Core.Encoding;
 using UnbooruTagger.Core.Vocabulary;
 using UnbooruTagger.Training.Checkpoints;
 using UnbooruTagger.Training.Data;
@@ -45,7 +46,7 @@ public static class TrainCommandHandler
         List<List<int>> imageTagRows;
         int datasetCount;
         int resolvedInputSize;
-        Func<IReadOnlyList<int>, Tensor> loadBatch;
+        Func<IReadOnlyList<int>, (Tensor Pixels, IReadOnlyList<LetterboxBox> Boxes)> loadBatch;
 
         if (cacheReader is not null)
         {
@@ -168,11 +169,22 @@ public static class TrainCommandHandler
                     {
                         for (var step = 0; step < stepsPerEpoch; step++)
                         {
+                            // Every tensor allocated in a step (pooled/spatial embeddings, the full
+                            // tagTower forward pass over the whole vocabulary, each `loss +=`
+                            // reassignment's intermediate) is native/CUDA memory that .NET's GC does
+                            // not reclaim promptly. Without this scope those accumulate every step
+                            // until VRAM is exhausted; the scope frees them all once `lossValue` has
+                            // been extracted as a plain float below.
+                            using var stepScope = NewDisposeScope();
+
                             var localBatchIndices = sampler.SampleBatch(batchSize);
                             var globalBatchIndices = localBatchIndices.Select(li => trainingIndices[li]).ToList();
 
-                            using var pixelBatch = loadBatch(globalBatchIndices).to(device);
-                            var (pooled, spatial) = imageTower.forward(pixelBatch);
+                            var (rawPixelBatch, boxes) = loadBatch(globalBatchIndices);
+                            using var pixelBatch = rawPixelBatch.to(device);
+                            var (_, spatial) = imageTower.forward(pixelBatch);
+                            var spatialMask = SpatialMask.Build(boxes, resolvedInputSize, spatial.shape[2], spatial.shape[3], device);
+                            var pooled = ImageTower.MaskedPool(spatial, spatialMask);
                             var tagEmbeddings = tagTower.forward(allTagIndices);
 
                             var batchTagRows = localBatchIndices.Select(li => trainingTagRows[li]).ToList();
@@ -180,7 +192,7 @@ public static class TrainCommandHandler
                             var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels);
 
                             if (localizationWeight > 0)
-                                loss += localizationWeight * SigmoidContrastiveLoss.ComputeLocalized(spatial, tagEmbeddings, labels, (float)localizationTemperature);
+                                loss += localizationWeight * SigmoidContrastiveLoss.ComputeLocalized(spatial, tagEmbeddings, labels, (float)localizationTemperature, spatialMask);
 
                             if (selfSupervisedWeight > 0)
                             {
@@ -232,7 +244,7 @@ public static class TrainCommandHandler
                         {
                             var validationBatchCount = Math.Max(1, (int)Math.Ceiling(validationIndices.Count / (double)batchSize));
                             var validationLoss = Evaluate(
-                                imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count, device, batchSize,
+                                imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count, device, batchSize, resolvedInputSize,
                                 onBatchComplete: batchesDone =>
                                     reporter.ReportPhaseProgress($"epoch {epoch + 1}/{epochs}: validating batch {batchesDone}/{validationBatchCount}", batchesDone, validationBatchCount));
                             AnsiConsole.MarkupLineInterpolated($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:G4}");
@@ -279,13 +291,14 @@ public static class TrainCommandHandler
     private static double Evaluate(
         ImageTower imageTower,
         TagTower tagTower,
-        Func<IReadOnlyList<int>, Tensor> loadBatch,
+        Func<IReadOnlyList<int>, (Tensor Pixels, IReadOnlyList<LetterboxBox> Boxes)> loadBatch,
         IReadOnlyList<IReadOnlyList<int>> imageTagRows,
         IReadOnlyList<int> validationIndices,
         Tensor allTagIndices,
         int vocabularySize,
         Device device,
         int batchSize,
+        int inputSize,
         Action<int>? onBatchComplete = null)
     {
         using var _ = no_grad();
@@ -299,10 +312,12 @@ public static class TrainCommandHandler
         {
             var chunk = validationIndices.Skip(offset).Take(batchSize).ToList();
 
-            using var pixelBatch = loadBatch(chunk).to(device);
-            var (pooled, spatial) = imageTower.forward(pixelBatch);
-            using var _pooled = pooled;
+            var (rawPixelBatch, boxes) = loadBatch(chunk);
+            using var pixelBatch = rawPixelBatch.to(device);
+            var (_, spatial) = imageTower.forward(pixelBatch);
             using var _spatial = spatial;
+            using var spatialMask = SpatialMask.Build(boxes, inputSize, spatial.shape[2], spatial.shape[3], device);
+            using var pooled = ImageTower.MaskedPool(spatial, spatialMask);
 
             var batchTagRows = chunk.Select(i => imageTagRows[i]).ToList();
             using var labels = BatchLabelBuilder.Build(batchTagRows, vocabularySize).to(device);
@@ -318,14 +333,19 @@ public static class TrainCommandHandler
         return totalLoss / totalCount;
     }
 
-    private static Tensor LoadCacheBatch(PreprocessedDatasetCacheReader cache, IReadOnlyList<int> indices, int inputSize)
+    private static (Tensor Pixels, IReadOnlyList<LetterboxBox> Boxes) LoadCacheBatch(PreprocessedDatasetCacheReader cache, IReadOnlyList<int> indices, int inputSize)
     {
         var imageSize = 3 * inputSize * inputSize;
         var flat = new float[indices.Count * imageSize];
+        var boxes = new LetterboxBox[indices.Count];
         for (var i = 0; i < indices.Count; i++)
-            cache.ReadImage(indices[i]).CopyTo(flat, i * imageSize);
+        {
+            var image = cache.ReadImage(indices[i]);
+            image.Pixels.CopyTo(flat, i * imageSize);
+            boxes[i] = image.Content;
+        }
 
-        return tensor(flat, [indices.Count, 3, inputSize, inputSize]);
+        return (tensor(flat, [indices.Count, 3, inputSize, inputSize]), boxes);
     }
 
     /// <summary>Shuffles all dataset indices once and carves off a validation slice, so the same held-out images are used for every epoch's evaluation.</summary>

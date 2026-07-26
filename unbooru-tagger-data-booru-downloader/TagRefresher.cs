@@ -37,6 +37,18 @@ public sealed record RefreshResult(int SourcesChecked, int ImagesChanged, IReadO
 /// <c>--reset</c> starts a site's sweep over from the beginning, for verifying posts
 /// this command itself hasn't touched yet (or re-verifying everything after a change to
 /// how reconciliation works).
+///
+/// <see cref="RunAsync"/>'s <c>onlyTagsAffectingImages</c> parameter is a separate,
+/// targeted mode: instead of the full per-site cursor sweep above, it resolves exactly
+/// which already-known images currently hold one of the given tags and re-checks only
+/// those images' sources — for a scoped correction (e.g. reconciling images stuck on a
+/// tag identity a tag-alias merge just orphaned) where the full sweep would be
+/// enormously more work than the problem actually requires. It deliberately never reads
+/// or writes <c>RefreshProgress</c> (a targeted pass touches an arbitrary subset of post
+/// ids, not an ordered walk, so it must neither advance nor reset the full sweep's own
+/// resumable cursor) and re-derives its own working set fresh on every run, so simply
+/// re-running it after an interruption skips whatever already got reconciled — any image
+/// no longer holding one of the target tags just won't be found again.
 /// </summary>
 public static class TagRefresher
 {
@@ -51,7 +63,10 @@ public static class TagRefresher
         int minImages,
         bool reset,
         CrawlProgressReporter? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TagExclusionRules? excludedTags = null,
+        IReadOnlyDictionary<string, string>? tagAliases = null,
+        IReadOnlyCollection<string>? onlyTagsAffectingImages = null)
     {
         var sites = clientsBySite.Keys.ToList();
 
@@ -65,13 +80,21 @@ public static class TagRefresher
 
         ReportSetupPhase("Loading tag survey...");
         var allTags = await db.GetAllSurveyedTagsAsync(cancellationToken).ConfigureAwait(false);
-        var eligibleTagSet = allTags.Where(t => TagEligibility.IsEligible(t, minImages)).Select(t => t.Name).ToHashSet(StringComparer.Ordinal);
+        // Keyed by raw (un-prefixed) booru name, not identity — the only form a post's
+        // tags ever come back as. See TagRowMutations.BuildEligibleIdentities — tagAliases
+        // is what lets this command actually correct an image already mistagged under an
+        // aliased-away identity (e.g. head_pat): a fresh re-fetch of that same Gelbooru
+        // post still reports the raw head_pat string, and without this it would resolve
+        // to nothing at all rather than the merged headpat identity, leaving the old,
+        // now-ineligible tag in place forever instead of reconciling it away.
+        var eligibleTagIdentities = TagRowMutations.BuildEligibleIdentities(
+            allTags.Where(t => TagEligibility.IsEligible(t, minImages, excludedTags)), tagAliases);
 
         ReportSetupPhase("Loading tag vocabulary...");
         var vocabularyPath = Path.Combine(outputDirectory, "tag_vocabulary.json");
         var vocabularyDeltaPath = Path.Combine(outputDirectory, "tag_vocabulary.delta.jsonl");
         var vocabulary = File.Exists(vocabularyPath)
-            ? TagVocabulary.Load(vocabularyPath, vocabularyDeltaPath)
+            ? TagVocabulary.LoadAndCompact(vocabularyPath, vocabularyDeltaPath)
             : TagVocabulary.CreateEmpty();
 
         ReportSetupPhase("Opening cache writer...");
@@ -113,6 +136,105 @@ public static class TagRefresher
 
         try
         {
+            if (onlyTagsAffectingImages is { Count: > 0 })
+            {
+                var targetRowIndices = onlyTagsAffectingImages
+                    .Select(tag => vocabulary.TryGet(tag, out var record) ? record.RowIndex : (int?)null)
+                    .Where(rowIndex => rowIndex is not null)
+                    .Select(rowIndex => rowIndex!.Value)
+                    .ToHashSet();
+
+                var md5ByCacheRow = knownImages.ToDictionary(kv => kv.Value, kv => kv.Key);
+                var affectedMd5s = imageTagRowsByCacheRow
+                    .Where(kv => kv.Value.Overlaps(targetRowIndices))
+                    .Select(kv => md5ByCacheRow[kv.Key])
+                    .ToList();
+
+                ReportSetupPhase($"Resolving sources for {affectedMd5s.Count} targeted image(s)...");
+
+                var sourcesBySite = new Dictionary<string, List<(long PostId, string Md5)>>(StringComparer.Ordinal);
+                foreach (var md5 in affectedMd5s)
+                {
+                    foreach (var snapshot in await db.GetImageSourceSnapshotsAsync(md5, cancellationToken).ConfigureAwait(false))
+                    {
+                        if (!clientsBySite.ContainsKey(snapshot.Site))
+                            continue; // no client configured for this source's site — can't refetch it this run
+
+                        if (!sourcesBySite.TryGetValue(snapshot.Site, out var list))
+                            sourcesBySite[snapshot.Site] = list = [];
+                        list.Add((snapshot.PostId, md5));
+                    }
+                }
+
+                foreach (var site in sites)
+                {
+                    if (unavailableSites.ContainsKey(site) || !sourcesBySite.TryGetValue(site, out var siteSources))
+                        continue;
+
+                    var siteReporter = progress?.Sites.GetValueOrDefault(site);
+                    var client = clientsBySite[site];
+                    // Snapshot the real cursor once and pass it straight back on every
+                    // checkpoint, unchanged — see this class's own doc comment on why a
+                    // targeted pass must never touch RefreshProgress for real.
+                    var (untouchedLastPostId, untouchedDone) = await db.GetRefreshProgressAsync(site, cancellationToken).ConfigureAwait(false);
+
+                    for (var offset = 0; offset < siteSources.Count; offset += BatchSize)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var batch = siteSources.Skip(offset).Take(BatchSize).ToList();
+                        siteReporter?.ReportPhase($"'{site}': refreshing {batch.Count} targeted post(s) ({Math.Min(offset + batch.Count, siteSources.Count)}/{siteSources.Count})...");
+
+                        var siteFailed = false;
+                        foreach (var (postId, md5) in batch)
+                        {
+                            if (!knownImages.TryGetValue(md5, out var cacheRowIndex))
+                                continue;
+
+                            BooruPost? post;
+                            try
+                            {
+                                post = await client.GetPostAsync(postId, cancellationToken).ConfigureAwait(false);
+                            }
+                            catch (Exception ex) when (ex is not OperationCanceledException)
+                            {
+                                SiteAvailability.MarkUnavailable(site, ex, sites, unavailableSites, msg => siteReporter?.ReportPhase(msg));
+                                siteFailed = true;
+                                break;
+                            }
+
+                            sourcesChecked++;
+                            progress?.ReportOverall(sourcesChecked, sourcesChecked);
+                            var observedTags = post is null
+                                ? []
+                                : TagRowMutations.EligibleIdentities(post.Tags, eligibleTagIdentities).Distinct(StringComparer.Ordinal).ToList();
+
+                            if (ReconcileImageTags(vocabulary, md5, site, postId, observedTags, cacheRowIndex, imageTagRowsByCacheRow,
+                                    await db.GetImageSourceSnapshotsAsync(md5, cancellationToken).ConfigureAwait(false),
+                                    combinedPositiveCountDeltas))
+                            {
+                                dirtyCacheRows.Add(cacheRowIndex);
+                                imagesChanged.Add(cacheRowIndex);
+                            }
+
+                            refreshedSourcesBuffer.Add(new RefreshedSourceTags(site, postId, md5, observedTags, DateTimeOffset.UtcNow));
+                        }
+
+                        await CheckpointAsync(siteReporter, site, untouchedLastPostId, untouchedDone).ConfigureAwait(false);
+
+                        if (siteFailed)
+                            break;
+                    }
+                }
+
+                if (File.Exists(vocabularyDeltaPath))
+                {
+                    vocabulary.Save(vocabularyPath);
+                    File.Delete(vocabularyDeltaPath);
+                }
+
+                return new RefreshResult(sourcesChecked, imagesChanged.Count, unavailableSites);
+            }
+
             foreach (var site in sites)
             {
                 if (unavailableSites.ContainsKey(site))
@@ -162,7 +284,9 @@ public static class TagRefresher
 
                         sourcesChecked++;
                         progress?.ReportOverall(sourcesChecked, sourcesChecked);
-                        var observedTags = post?.Tags.Where(eligibleTagSet.Contains).Distinct(StringComparer.Ordinal).ToList() ?? [];
+                        var observedTags = post is null
+                            ? []
+                            : TagRowMutations.EligibleIdentities(post.Tags, eligibleTagIdentities).Distinct(StringComparer.Ordinal).ToList();
 
                         if (ReconcileImageTags(vocabulary, md5, site, postId, observedTags, cacheRowIndex, imageTagRowsByCacheRow,
                                 await db.GetImageSourceSnapshotsAsync(md5, cancellationToken).ConfigureAwait(false),

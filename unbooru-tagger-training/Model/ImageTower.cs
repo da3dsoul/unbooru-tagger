@@ -78,4 +78,20 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
         var pooled = functional.adaptive_avg_pool2d(spatial, [1L, 1L]).flatten(1);
         return (pooled, spatial);
     }
+
+    /// <summary>
+    /// Global average pool restricted to <paramref name="mask"/>'s valid locations
+    /// (from <see cref="SpatialMask"/>) instead of every location uniformly —
+    /// <see cref="forward"/>'s plain <c>adaptive_avg_pool2d</c> would otherwise let the
+    /// letterbox padding bars (see <c>UnbooruTagger.Core.Encoding.ImagePreprocessing</c>)
+    /// dilute the pooled embedding for any non-square training image.
+    /// </summary>
+    /// <param name="spatial">[batch, embeddingDim, height, width] — this tower's pre-pool spatial map.</param>
+    /// <param name="mask">[batch, 1, height, width] — 1 for valid (real content) locations, 0 for padding.</param>
+    public static Tensor MaskedPool(Tensor spatial, Tensor mask)
+    {
+        var maskedSum = (spatial * mask).sum([2, 3]);
+        var validCount = mask.sum([2, 3]).clamp_min(1e-6);
+        return maskedSum / validCount;
+    }
 }
