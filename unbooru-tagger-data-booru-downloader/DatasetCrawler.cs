@@ -74,6 +74,19 @@ internal sealed class CrawlWorkingState
     public required IReadOnlyDictionary<string, ConcurrentDictionary<string, int>> SitePositiveCounts { get; init; }
 
     /// <summary>
+    /// Per (site, tag), how many of that site's own duplicate finds — a post that turned
+    /// out to already be known, by exact md5 or perceptual-hash near-match — matched the
+    /// tag currently being searched. Purely a diagnostic surfaced on the "Current tag"
+    /// progress row (see <see cref="DatasetCrawler.RunSiteTagPhaseAsync"/>) so it's
+    /// visible whether a tag's overshoot past <c>--max-images</c> is duplicate-driven;
+    /// never read by any quota decision. Same empty-per-site-dictionary start and
+    /// resume-seed-only-the-current-tag pattern as <see cref="SitePositiveCounts"/> — a
+    /// resumed run seeds straight from <see cref="TagProgressState.SiteDuplicateCount"/>,
+    /// a durable per-page checkpoint of this same dictionary's value.
+    /// </summary>
+    public required IReadOnlyDictionary<string, ConcurrentDictionary<string, int>> SiteDuplicateCounts { get; init; }
+
+    /// <summary>
     /// Each already-known image's current, live tag-row-index set, keyed by its cache
     /// row — the in-memory mirror of what's durably in <c>tag_rows.jsonl</c> as of the
     /// last checkpoint, kept live so a duplicate found later in the same run can tell
@@ -244,7 +257,8 @@ public static class DatasetCrawler
             File.Delete(leftover); // safe: nothing durable is recorded until after a successful checkpoint
 
         ReportSetupPhase("Opening cache writer...");
-        using var writer = PreprocessedDatasetCacheWriter.OpenOrCreate(outputDirectory, inputSize);
+        using var writer = PreprocessedDatasetCacheWriter.OpenOrCreate(outputDirectory, inputSize,
+            onResumeProgress: (subPhase, completed, total) => ReportSetupPhase($"Opening cache writer: {subPhase} ({completed}/{total})..."));
 
         // Seeded once from durable state (accurate as of the last successful checkpoint,
         // exactly in step with the cache file writer above thanks to its own
@@ -252,10 +266,12 @@ public static class DatasetCrawler
         // see CrawlWorkingState's own doc comment for why the durable copies deliberately
         // lag behind these during a run.
         ReportSetupPhase("Loading dedup index and tag counters...");
-        var existingImages = await db.GetAllImagesAsync(cancellationToken).ConfigureAwait(false);
+        var existingImages = await db.GetAllImagesAsync(cancellationToken,
+            onProgress: completed => ReportSetupPhase($"Loading dedup index and tag counters: images loaded ({completed})...")).ConfigureAwait(false);
         CacheConsistency.Validate(existingImages, writer.ImageCount, outputDirectory);
         var combinedPositiveCounts = await db.GetAllCombinedPositiveCountsAsync(cancellationToken).ConfigureAwait(false);
-        var committedTagRows = writer.ReadCommittedTagRows();
+        var committedTagRows = writer.ReadCommittedTagRows(
+            onProgress: (completed, total) => ReportSetupPhase($"Loading dedup index and tag counters: tag rows ({completed}/{total})..."));
         var state = new CrawlWorkingState
         {
             KnownImages = existingImages.ToDictionary(e => e.Md5, e => e.CacheRowIndex, StringComparer.Ordinal),
@@ -264,17 +280,17 @@ public static class DatasetCrawler
             ImageTagRowsByCacheRow = existingImages.ToDictionary(
                 e => e.CacheRowIndex,
                 e => new HashSet<int>(committedTagRows[e.CacheRowIndex])),
-            // Starts empty here, not fresh-and-staying-that-way: crawl.sqlite doesn't
-            // persist a per-(tag,site) breakdown directly, so there's nothing to bulk-seed
-            // this whole dictionary from up front. Instead, RunSiteTagPhaseAsync derives
-            // and seeds just the ONE entry that actually needs it — the tag a site's
-            // worker is resuming mid-pagination into — from ImageSources' own durable Tags
-            // snapshots (see CrawlDatabase.CountSiteContributionsForTagAsync) the moment
-            // it's about to become "current tag". Every other tag's real answer already is
-            // 0 (never touched, or a genuinely-exhausted tag whose Done flag short-circuits
-            // the loop before this dictionary is even consulted), so leaving them unseeded
-            // costs nothing.
+            // Starts empty here, not fresh-and-staying-that-way: RunSiteTagPhaseAsync
+            // seeds just the ONE entry that actually needs it — the tag a site's worker
+            // is resuming mid-pagination into — directly from that (tag, site, phase)
+            // row's own durable SitePositiveCount/SiteDuplicateCount (crawl.sqlite's
+            // TagProgress table) the moment it's about to become "current tag", rather
+            // than bulk-loading every tag's row up front. Every other tag's real answer
+            // already is 0 (never touched, or a genuinely-exhausted/quota-satisfied tag
+            // whose Done/QuotaSatisfiedAtMaxImages short-circuits the loop before this
+            // dictionary is even consulted), so leaving them unseeded costs nothing.
             SitePositiveCounts = sites.ToDictionary(site => site, _ => new ConcurrentDictionary<string, int>(StringComparer.Ordinal), StringComparer.Ordinal),
+            SiteDuplicateCounts = sites.ToDictionary(site => site, _ => new ConcurrentDictionary<string, int>(StringComparer.Ordinal), StringComparer.Ordinal),
         };
 
         // Guards every touch of state/vocabulary/writer once a post's dedup check needs
@@ -407,7 +423,8 @@ public static class DatasetCrawler
                           || CrawlQuota.ShouldContinueFetching(state.CombinedPositiveCount(tag.Name), maxImages),
                     db, vocabulary, writer, eligibleTagIdentities, tempDir, inputSize, downloadClient,
                     state, stateLock, downloadPool, processingPool, siteReporter, progress?.ReportOverall, estimatedTotal, CheckpointAsync,
-                    errorLog, retryDelay, () => mySitePositiveCounts.GetValueOrDefault(tag.Name), perSiteFloor, cancellationToken).ConfigureAwait(false);
+                    errorLog, retryDelay, () => mySitePositiveCounts.GetValueOrDefault(tag.Name), perSiteFloor,
+                    () => state.SiteDuplicateCounts[site].GetValueOrDefault(tag.Name), maxImages, cancellationToken).ConfigureAwait(false);
 
                 siteReporter?.ReportTagsCompleted(tagIndex, eligibleTags.Count);
             }
@@ -427,7 +444,8 @@ public static class DatasetCrawler
                     () => CrawlQuota.NegativeShortfall(writer.ImageCount, state.CombinedPositiveCount(tag.Name), negativeTarget) > 0,
                     db, vocabulary, writer, eligibleTagIdentities, tempDir, inputSize, downloadClient,
                     state, stateLock, downloadPool, processingPool, siteReporter, progress?.ReportOverall, estimatedTotal, CheckpointAsync,
-                    errorLog, retryDelay, () => writer.ImageCount - state.CombinedPositiveCount(tag.Name), negativeTarget, cancellationToken).ConfigureAwait(false);
+                    errorLog, retryDelay, () => writer.ImageCount - state.CombinedPositiveCount(tag.Name), negativeTarget,
+                    () => 0, maxImagesForQuotaTracking: null, cancellationToken).ConfigureAwait(false);
 
                 siteReporter?.ReportTagsCompleted(tagIndex, eligibleTags.Count);
             }
@@ -526,6 +544,8 @@ public static class DatasetCrawler
         Func<TimeSpan, CancellationToken, Task> retryDelay,
         Func<int> currentTagProgress,
         int tagProgressTarget,
+        Func<int> currentTagDuplicates,
+        int? maxImagesForQuotaTracking,
         CancellationToken cancellationToken)
     {
         // Only the positive phase searches FOR a specific tag — the negative phase's
@@ -535,22 +555,40 @@ public static class DatasetCrawler
 
         var tagProgress = await db.GetTagProgressAsync(progressTagName, site, phase, cancellationToken).ConfigureAwait(false);
 
+        // A tag whose quota was already confirmed satisfied under an equal-or-higher
+        // --max-images in a past run is still guaranteed satisfied now (combined counts
+        // only ever grow) — skip re-entering this tag at all. A run with a HIGHER
+        // --max-images than what's recorded can't trust this (a smaller quota being met
+        // doesn't mean a larger one is), so it falls through to the normal path below
+        // for exactly those tags.
+        if (phase == PositivePhase && maxImagesForQuotaTracking is int currentMaxImages
+            && tagProgress.QuotaSatisfiedAtMaxImages is int satisfiedAt && satisfiedAt >= currentMaxImages)
+        {
+            return;
+        }
+
         // SitePositiveCounts (the source of currentTagProgress() for the positive phase)
         // always starts this process at 0 for every tag — correct for one never touched
         // before, wrong for the one tag this site was actually mid-page on when it last
-        // stopped: that credit has real, durable history in ImageSources, just not
-        // reflected here yet. Seeded once, only for that tag (mid-pagination, not Done) —
-        // see CountSiteContributionsForTagAsync's own doc comment for why every other tag
-        // doesn't need this. Must happen before the initial ReportTagProgress below, or
-        // that first paint would still show the stale, pre-seed 0.
+        // stopped: that credit has real, durable history, just not reflected here yet.
+        // Seeded once, only for that tag (mid-pagination, not Done), directly from
+        // TagProgressState's own SitePositiveCount/SiteDuplicateCount — durable
+        // checkpoints written every page (see the SaveTagProgressAsync call below), not
+        // re-derived from an ImageSources scan the way this used to work. Must happen
+        // before the initial ReportTagProgress below, or that first paint would still
+        // show the stale, pre-seed 0.
         if (phase == PositivePhase && tagProgress is { PostsFetched: > 0, Done: false })
         {
             var mySitePositiveCounts = state.SitePositiveCounts[site];
             if (!mySitePositiveCounts.ContainsKey(progressTagName))
-                mySitePositiveCounts[progressTagName] = await db.CountSiteContributionsForTagAsync(site, progressTagName, cancellationToken).ConfigureAwait(false);
+                mySitePositiveCounts[progressTagName] = tagProgress.SitePositiveCount;
+
+            var mySiteDuplicateCounts = state.SiteDuplicateCounts[site];
+            if (!mySiteDuplicateCounts.ContainsKey(progressTagName))
+                mySiteDuplicateCounts[progressTagName] = tagProgress.SiteDuplicateCount;
         }
 
-        siteReporter?.ReportTagProgress(progressTagName, currentTagProgress(), tagProgressTarget);
+        siteReporter?.ReportTagProgress(progressTagName, currentTagProgress(), tagProgressTarget, currentTagDuplicates());
 
         while (!tagProgress.Done && shouldContinue())
         {
@@ -637,7 +675,7 @@ public static class DatasetCrawler
                         // starting count through however many merge-only credits happened
                         // since, which is exactly what made it look frozen at 0 on a page
                         // full of already-known images.
-                        siteReporter?.ReportTagProgress(progressTagName, currentTagProgress(), tagProgressTarget);
+                        siteReporter?.ReportTagProgress(progressTagName, currentTagProgress(), tagProgressTarget, currentTagDuplicates());
                     }
                 }
                 catch (OperationCanceledException)
@@ -708,10 +746,42 @@ public static class DatasetCrawler
             // able to cut off. Worst case otherwise is mild (this page gets refetched
             // and its now-known posts correctly recognized as duplicates, not orphaned),
             // but there's no reason not to close this out cleanly too.
+            // currentTagProgress()/currentTagDuplicates() read this site's own live,
+            // in-memory counts (mySitePositiveCounts/mySiteDuplicateCounts) — safe to
+            // snapshot here since every post this page dispatched has already completed
+            // (the Task.WhenAll above). Checkpointing them into TagProgressState every
+            // page is what lets the NEXT resume seed straight from this row instead of
+            // an ImageSources scan (see the resume-seed block above). Only meaningful
+            // for the positive phase — the negative phase has no analogous per-site
+            // count. QuotaSatisfiedAtMaxImages is explicitly cleared: we just fetched a
+            // real page, so whatever was previously recorded there (from an earlier,
+            // lower --max-images run) no longer reflects "not yet satisfied under the
+            // CURRENT target" — the post-loop block below re-sets it if this page
+            // boundary turns out to be where quota gets met.
             var done = page.NextCursor is null;
-            var nextTagProgress = new TagProgressState(page.NextCursor, tagProgress.PostsFetched + page.Posts.Count, done);
+            var nextTagProgress = new TagProgressState(
+                page.NextCursor,
+                tagProgress.PostsFetched + page.Posts.Count,
+                done,
+                QuotaSatisfiedAtMaxImages: null,
+                SitePositiveCount: phase == PositivePhase ? currentTagProgress() : 0,
+                SiteDuplicateCount: phase == PositivePhase ? currentTagDuplicates() : 0);
             await db.SaveTagProgressAsync(progressTagName, site, phase, nextTagProgress, CancellationToken.None).ConfigureAwait(false);
             tagProgress = nextTagProgress;
+        }
+
+        // The loop above can exit for two different reasons: pagination genuinely
+        // exhausted (tagProgress.Done, already durable via the SaveTagProgressAsync
+        // inside the loop) or shouldContinue() became false because quota was already
+        // met — that second case leaves tagProgress exactly as the last page-boundary
+        // save (or the initial GetTagProgressAsync, if the loop never even ran a single
+        // iteration) left it, with nothing recording WHY it stopped. Persisting that
+        // here is what lets a future resume skip re-entering this tag at all instead of
+        // just cheaply re-seeding it.
+        if (phase == PositivePhase && maxImagesForQuotaTracking is int recordedMaxImages && !tagProgress.Done)
+        {
+            var quotaSatisfiedState = tagProgress with { QuotaSatisfiedAtMaxImages = recordedMaxImages };
+            await db.SaveTagProgressAsync(progressTagName, site, phase, quotaSatisfiedState, CancellationToken.None).ConfigureAwait(false);
         }
     }
 
@@ -753,6 +823,7 @@ public static class DatasetCrawler
                 var observedTags = MergeDuplicateTags(post, post.Md5, site, searchedTag, vocabulary, eligibleTagIdentities, state);
                 state.PendingAdditionalSources.Add(new PendingAdditionalSource(
                     post.Md5, site, post.PostId, post.FileUrl.ToString(), post.Rating, post.CreatedAt, observedTags, DateTimeOffset.UtcNow));
+                RecordDuplicateIfSearched(state, site, searchedTag);
                 return null;
             }
         }
@@ -912,6 +983,7 @@ public static class DatasetCrawler
                     var observedTags = MergeDuplicateTags(post, post.Md5, site, searchedTag, vocabulary, eligibleTagIdentities, state);
                     state.PendingAdditionalSources.Add(new PendingAdditionalSource(
                         post.Md5, site, post.PostId, post.FileUrl.ToString(), post.Rating, post.CreatedAt, observedTags, DateTimeOffset.UtcNow));
+                    RecordDuplicateIfSearched(state, site, searchedTag);
                     return false;
                 }
 
@@ -924,6 +996,7 @@ public static class DatasetCrawler
                     var observedTags = MergeDuplicateTags(post, duplicateMd5, site, searchedTag, vocabulary, eligibleTagIdentities, state);
                     state.PendingAdditionalSources.Add(new PendingAdditionalSource(
                         duplicateMd5, site, post.PostId, post.FileUrl.ToString(), post.Rating, post.CreatedAt, observedTags, DateTimeOffset.UtcNow));
+                    RecordDuplicateIfSearched(state, site, searchedTag);
                     return false;
                 }
 
@@ -967,6 +1040,26 @@ public static class DatasetCrawler
             if (File.Exists(tempPath))
                 File.Delete(tempPath);
         }
+    }
+
+    /// <summary>
+    /// Credits <paramref name="site"/>'s live, in-memory <see cref="CrawlWorkingState.SiteDuplicateCounts"/>
+    /// for a duplicate post found while searching for <paramref name="searchedTag"/> — a
+    /// no-op during the negative phase, where <paramref name="searchedTag"/> is null (see
+    /// <see cref="RunSiteTagPhaseAsync"/>) since a duplicate there isn't "for" any single
+    /// tag. Called alongside every <see cref="MergeDuplicateTags"/> call in
+    /// <see cref="DownloadPostAsync"/>/<see cref="ProcessDownloadedPostAsync"/>, always
+    /// already holding <c>stateLock</c>. Only ever read for progress display
+    /// (<see cref="RunSiteTagPhaseAsync"/>'s <c>currentTagDuplicates</c>) — never a quota
+    /// input.
+    /// </summary>
+    private static void RecordDuplicateIfSearched(CrawlWorkingState state, string site, string? searchedTag)
+    {
+        if (searchedTag is null)
+            return;
+
+        var dupCounts = state.SiteDuplicateCounts[site];
+        dupCounts[searchedTag] = dupCounts.GetValueOrDefault(searchedTag) + 1;
     }
 
     /// <summary>

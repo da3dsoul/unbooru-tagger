@@ -206,18 +206,21 @@ dotnet run --project unbooru-tagger-data-unbooru-import -- build-large-cache \
   --min-tag-images 100
 ```
 
-Writes `images.bin` (preprocessed pixel data) and `tag_rows.jsonl` under
-`--out`. `--min-images-per-tag` (default 15) reserves the rarest-first
-images per tag when `--max-images` caps the corpus; `--min-tag-images`
-(default 100) is the corpus-wide occurrence count a tag needs to get a
-vocabulary row at all.
+Writes `images.bin` (preprocessed pixel data) and `tag_rows.sqlite` (a
+SQLite database of packed per-image tag-row indices — an older
+`tag_rows.jsonl` from a pre-existing `--out` is migrated to this
+automatically, once, the first time it's opened) under `--out`.
+`--min-images-per-tag` (default 15) reserves the rarest-first images per
+tag when `--max-images` caps the corpus; `--min-tag-images` (default 100)
+is the corpus-wide occurrence count a tag needs to get a vocabulary row
+at all.
 
 ## Crawling a dataset from Danbooru/Gelbooru (`unbooru-tagger-data-booru-downloader`)
 
 An alternative to `unbooru-tagger-data-unbooru-import` that needs no
 `unbooru` repo/SQL Server at all — it downloads directly from the Danbooru and
 Gelbooru public APIs into the same trainable dataset directory shape
-`build-large-cache` produces (`images.bin`, `tag_rows.jsonl`,
+`build-large-cache` produces (`images.bin`, `tag_rows.sqlite`,
 `tag_vocabulary.json`), plus its own `crawl.sqlite` for survey results,
 per-tag/site resumability, and cross-site image dedup, and a few more
 small files it manages itself under `--output-dir`: `excluded_tags.txt`
@@ -255,7 +258,7 @@ risk a survey that's silently wrong. `crawl` never fetches this table
 itself — it only reads whatever `survey-tags`/`refresh-tags` already
 cached to `tag_aliases.json`.
 
-Every tag's identity — in the vocabulary, `tag_rows.jsonl`,
+Every tag's identity — in the vocabulary, `tag_rows.sqlite`,
 `excluded_tags.txt`, progress output — is its raw booru name prefixed
 with its category (Danbooru's `tags.json` `category`/Gelbooru's `type`):
 `white_hair`, `elf`, `character:frieren`, `series:sousou_no_frieren`.
@@ -316,15 +319,25 @@ one out of ever contributing anything of its own — a tag's actual
 combined image count can end up slightly over `--max-images` as a
 result. Downloads and processing (decode/hash/resize) within a page also
 run concurrently, gated by separate per-site semaphores, so one site's
-network waits don't queue up behind the other's CPU work.
+network waits don't queue up behind the other's CPU work. Each site's
+live progress shows a running duplicate count alongside its image tally
+(e.g. `smelling_penis (750/500/143 dupes)`) — a high count there means
+most of that overshoot came from re-discovering already-known images
+while chasing its own floor, not from genuinely new ones.
 
-Re-running the same command resumes (per-tag/site pagination cursors,
-plus the cache's own resumability). On startup, `crawl` also checks that
-`crawl.sqlite`'s row indices still agree with the cache files' actual
-image count, and refuses to continue with an explicit error if they've
-drifted apart (e.g. `images.bin`/`tag_rows.jsonl` restored or moved
-independently of `crawl.sqlite`) rather than silently reassigning an
-already-claimed row to the wrong image. An image satisfying several
+Re-running the same command resumes efficiently, even against a
+multi-million-image corpus: per-tag/site pagination cursors, plus each
+(tag, site) pair's own fairness-floor and duplicate counts, are
+checkpointed durably every page, so a restart never has to re-derive a
+partially-crawled tag's progress from scratch. The pixel/tag-row cache
+resumes the same way — a small sidecar (`images.bin.resume`) caches
+where to pick back up instead of re-walking every already-cached record.
+On startup, `crawl` also checks that `crawl.sqlite`'s row indices still
+agree with the cache files' actual image count, and refuses to continue
+with an explicit error if they've drifted apart (e.g.
+`images.bin`/`tag_rows.sqlite` restored or moved independently of
+`crawl.sqlite`) rather than silently reassigning an already-claimed row
+to the wrong image. An image satisfying several
 eligible tags at once is only ever downloaded once — both sites return a
 post's full tag list in the same response used to find it, so there's
 never a need to re-fetch tags for an already-cached image. Dedup happens

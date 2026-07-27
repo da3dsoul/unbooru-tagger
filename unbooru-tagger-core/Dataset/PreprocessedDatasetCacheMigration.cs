@@ -126,7 +126,9 @@ public static class PreprocessedDatasetCacheMigrator
     private static void SwapIn(string directory, string tempDirectory, int expectedImageCount)
     {
         var pixelPath = Path.Combine(directory, PreprocessedDatasetCache.PixelsFileName);
-        var labelPath = Path.Combine(directory, PreprocessedDatasetCache.LabelsFileName);
+        var labelPath = Path.Combine(directory, PreprocessedDatasetCache.LabelsFileName); // the genuine LBX1-era tag_rows.jsonl being migrated away from
+        var tagRowDbPath = Path.Combine(directory, TagRowStore.DatabaseFileName);
+        var resumeIndexPath = Path.Combine(directory, PreprocessedDatasetCache.ResumeIndexFileName);
         var backupPixelPath = pixelPath + ".lbx1.bak";
         var backupLabelPath = labelPath + ".lbx1.bak";
 
@@ -137,7 +139,25 @@ public static class PreprocessedDatasetCacheMigrator
         File.Move(pixelPath, backupPixelPath, overwrite: true);
         File.Move(labelPath, backupLabelPath, overwrite: true);
         File.Move(Path.Combine(tempDirectory, PreprocessedDatasetCache.PixelsFileName), pixelPath);
-        File.Move(Path.Combine(tempDirectory, PreprocessedDatasetCache.LabelsFileName), labelPath);
+
+        // The temp writer stores tag rows via TagRowStore (SQLite), not tag_rows.jsonl —
+        // ShrinkInPlace only ever reads the OLD jsonl directly as migration source data
+        // (see above), it never asks the temp writer to produce one.
+        File.Move(Path.Combine(tempDirectory, TagRowStore.DatabaseFileName), tagRowDbPath, overwrite: true);
+
+        // The temp writer's own Flush calls (see ShrinkInPlace) already wrote a valid
+        // resume index for tempDirectory's cache — carry it over so the migrated cache
+        // doesn't pay for one wasted walk on its very first resume. Not every migration
+        // reaches this with one present (e.g. a source cache with zero images never
+        // calls Flush), so this is a move, not a required file.
+        var tempResumeIndexPath = Path.Combine(tempDirectory, PreprocessedDatasetCache.ResumeIndexFileName);
+        if (File.Exists(tempResumeIndexPath))
+            File.Move(tempResumeIndexPath, resumeIndexPath, overwrite: true);
+
+        // Non-recursive: anything unexpected still sitting in tempDirectory at this
+        // point (the two files and the resume index above are everything the temp
+        // writer ever creates) means something's wrong, and should throw rather than
+        // silently vanish via a recursive delete.
         Directory.Delete(tempDirectory);
 
         using (var verify = new PreprocessedDatasetCacheReader(directory))

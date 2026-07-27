@@ -208,39 +208,4 @@ public class CrawlDatabaseTests
         Assert.Equal(0xFFFFFFFFFFFFFFFFUL, images[0].PHash); // exercises the signed-long bit-pattern round trip for the top bit
     }
 
-    [Fact]
-    public async Task CountSiteContributionsForTagAsync_CountsDistinctImagesForThatSiteAndTag()
-    {
-        using var db = await OpenTempDatabaseAsync();
-        await db.UpsertTagSurveysAsync([("head_pat", (int?)10, (int?)null, true), ("1girl", (int?)10, (int?)null, true)], DateTimeOffset.UtcNow, null);
-
-        // MakeImage hardcodes PostId 1 — override it per call so these three images land
-        // as three distinct ImageSources rows (Site, PostId) instead of colliding on the
-        // same upsert key and silently overwriting each other's Tags.
-        await db.CommitPendingImagesAsync([MakeImage("md5-a", 0, "head_pat", "1girl") with { PostId = 1 }], [], [], CancellationToken.None);
-        await db.CommitPendingImagesAsync([MakeImage("md5-b", 1, "head_pat") with { PostId = 2 }], [], [], CancellationToken.None);
-        await db.CommitPendingImagesAsync([MakeImage("md5-c", 2, "1girl") with { PostId = 3 }], [], [], CancellationToken.None); // no head_pat
-
-        Assert.Equal(2, await db.CountSiteContributionsForTagAsync("danbooru", "head_pat"));
-        Assert.Equal(0, await db.CountSiteContributionsForTagAsync("gelbooru", "head_pat")); // MakeImage only ever writes "danbooru" sources
-    }
-
-    /// <summary>
-    /// Regression guard for the derivation this feeds (RunSiteTagPhaseAsync's resume-
-    /// credit seeding): booru tags routinely contain literal underscores
-    /// (<c>head_pat</c>, <c>white_hair</c>), which is also the SQL LIKE single-character
-    /// wildcard. Without escaping it, a tag search for "head_pat" would silently also
-    /// match "headXpat" for any character X, inflating a resumed run's seeded credit.
-    /// </summary>
-    [Fact]
-    public async Task CountSiteContributionsForTagAsync_UnderscoreInTagNameIsNotTreatedAsALikeWildcard()
-    {
-        using var db = await OpenTempDatabaseAsync();
-        await db.UpsertTagSurveysAsync([("head_pat", (int?)10, (int?)null, true), ("headxpat", (int?)10, (int?)null, true)], DateTimeOffset.UtcNow, null);
-
-        await db.CommitPendingImagesAsync([MakeImage("md5-a", 0, "headxpat")], [], [], CancellationToken.None);
-
-        Assert.Equal(0, await db.CountSiteContributionsForTagAsync("danbooru", "head_pat"));
-        Assert.Equal(1, await db.CountSiteContributionsForTagAsync("danbooru", "headxpat"));
-    }
 }

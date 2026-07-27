@@ -1,4 +1,3 @@
-using System.Text.Json;
 using UnbooruTagger.Core.Encoding;
 
 namespace UnbooruTagger.Core.Dataset;
@@ -12,7 +11,37 @@ namespace UnbooruTagger.Core.Dataset;
 public static class PreprocessedDatasetCache
 {
     internal const string PixelsFileName = "images.bin";
+
+    /// <summary>
+    /// The legacy per-image tag-row label format — one JSON array per line — superseded
+    /// by <see cref="TagRowStore"/> (a SQLite database, <c>tag_rows.sqlite</c>). Kept as
+    /// a constant purely because two migrations still need to recognize/read it: an
+    /// existing cache that predates <see cref="TagRowStore"/> gets migrated to it
+    /// automatically the first time it's opened (see <see cref="TagRowStore.OpenForWriting"/>/
+    /// <see cref="TagRowStore.OpenForReading"/>), and <see cref="PreprocessedDatasetCacheMigrator"/>
+    /// (the much older LBX1 -&gt; LBX2 pixel-format migration) reads a genuinely ancient
+    /// cache's copy of this file directly as its source data.
+    /// </summary>
     internal const string LabelsFileName = "tag_rows.jsonl";
+
+    /// <summary>
+    /// Small sidecar caching, for the current <c>ImageCount</c>, the byte offset
+    /// <see cref="PreprocessedImageIndex.FindEndOffset"/> would otherwise have to
+    /// re-walk every already-cached pixel record's box header to find. See
+    /// <see cref="PreprocessedDatasetCacheWriter.Flush"/> (writes it) and the writer's
+    /// resume constructor (reads it). Deliberately a separate tiny file rather than a
+    /// field inside <see cref="PixelsFileName"/>'s own header: growing that header
+    /// would shift every existing record's byte offset, which would need rewriting the
+    /// entire (potentially multi-GB) pixel file to adopt on an existing cache — exactly
+    /// the expensive one-time cost this is meant to avoid. Self-healing: if it's
+    /// missing, corrupt, or its stored count doesn't match the pixel file's current
+    /// <c>ImageCount</c> (stale — e.g. from before this file existed, or a crash
+    /// between the two writes), the reader falls back to the original walk and
+    /// rewrites this file with the now-current answer.
+    /// </summary>
+    internal const string ResumeIndexFileName = "images.bin.resume";
+
+    internal const int ResumeIndexMagic = 0x52534D31; // "RSM1"
 
     /// <summary>
     /// Distinguishes the current format from older ones — an old cache read under a
@@ -46,6 +75,9 @@ public static class PreprocessedDatasetCache
 /// </summary>
 internal static class PreprocessedImageIndex
 {
+    /// <summary>How often (in records) a walk reports back to an <c>onProgress</c> callback — frequent enough to look live on a multi-million-record corpus, infrequent enough that the callback itself is never the bottleneck.</summary>
+    private const int ProgressReportInterval = 5_000;
+
     /// <summary>The byte offset each of <paramref name="imageCount"/> records starts at, in image-index order — for building a reader's random-access index.</summary>
     public static long[] BuildOffsets(Stream stream, int imageCount)
     {
@@ -61,14 +93,26 @@ internal static class PreprocessedImageIndex
         return offsets;
     }
 
-    /// <summary>The byte offset just past the last of <paramref name="imageCount"/> records — where a resumed writer should continue appending.</summary>
-    public static long FindEndOffset(Stream stream, int imageCount)
+    /// <summary>
+    /// The byte offset just past the last of <paramref name="imageCount"/> records —
+    /// where a resumed writer should continue appending. One seek-past-the-payload +
+    /// one 16-byte header read per record; storage with high per-seek latency (a
+    /// network mount, a spinning disk) makes that add up visibly at a multi-million-
+    /// record corpus, which is what <paramref name="onProgress"/> (called every
+    /// <see cref="ProgressReportInterval"/> records, plus once at the end) is for.
+    /// </summary>
+    public static long FindEndOffset(Stream stream, int imageCount, Action<int, int>? onProgress = null)
     {
         var position = (long)PreprocessedDatasetCache.HeaderBytes;
         var box = new byte[PreprocessedDatasetCache.BoxBytes];
         for (var i = 0; i < imageCount; i++)
+        {
             position += ReadRecordLength(stream, position, box, i);
+            if (onProgress is not null && (i + 1) % ProgressReportInterval == 0)
+                onProgress(i + 1, imageCount);
+        }
 
+        onProgress?.Invoke(imageCount, imageCount);
         return position;
     }
 
@@ -86,17 +130,18 @@ internal static class PreprocessedImageIndex
 }
 
 /// <summary>
-/// Appends to <see cref="PreprocessedDatasetCache"/>'s on-disk files. Labels are
-/// stored one JSON array per line (not one big JSON array) specifically so they can
-/// be appended without rewriting the whole file — needed for <see cref="OpenOrCreate"/>
-/// to resume a run that was interrupted partway through a multi-million-image corpus.
+/// Appends to <see cref="PreprocessedDatasetCache"/>'s on-disk files: <c>images.bin</c>
+/// for pixels, and a <see cref="TagRowStore"/> (SQLite) for each image's tag-row
+/// indices. Tag rows used to be one JSON array per line in a <c>tag_rows.jsonl</c> text
+/// file; <see cref="TagRowStore"/> migrates one of those automatically the first time
+/// it's opened, so that history doesn't need repeating here.
 /// </summary>
 public sealed class PreprocessedDatasetCacheWriter : IDisposable
 {
     private readonly FileStream _pixelStream;
     private readonly BinaryWriter _pixelWriter;
-    private readonly string _labelPath;
-    private StreamWriter _labelWriter;
+    private readonly string _resumeIndexPath;
+    private readonly TagRowStore _tagRowStore;
 
     /// <summary>Images durably committed as of the last <see cref="Flush"/> (or resumed from a prior run).</summary>
     public int ImageCount { get; private set; }
@@ -109,20 +154,25 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
     /// <summary>
     /// Opens an existing cache directory to continue appending where a prior run left
     /// off, or creates a fresh one if <paramref name="directory"/> is empty/missing.
-    /// Any bytes/lines left over from a page that started but never finished a
+    /// Any pixel bytes/tag rows left over from a page that started but never finished a
     /// <see cref="Flush"/> are dropped, so resumed appends start exactly at the last
-    /// confirmed image boundary.
+    /// confirmed image boundary. <paramref name="onResumeProgress"/> (subPhase label,
+    /// completed, total), if given, is invoked periodically while resuming against an
+    /// existing corpus — both walking the pixel file's box headers (only needed when
+    /// the resume-index sidecar is missing/stale) and a one-time <c>tag_rows.jsonl</c>
+    /// migration (only needed once, ever, per cache) are O(<c>ImageCount</c>), so a
+    /// multi-million-image corpus can spend real, visible time here with nothing else
+    /// to show for it otherwise.
     /// </summary>
-    public static PreprocessedDatasetCacheWriter OpenOrCreate(string directory, int inputSize) =>
-        new(directory, inputSize, resume: true);
+    public static PreprocessedDatasetCacheWriter OpenOrCreate(string directory, int inputSize, Action<string, int, int>? onResumeProgress = null) =>
+        new(directory, inputSize, resume: true, onResumeProgress);
 
-    private PreprocessedDatasetCacheWriter(string directory, int inputSize, bool resume)
+    private PreprocessedDatasetCacheWriter(string directory, int inputSize, bool resume, Action<string, int, int>? onResumeProgress = null)
     {
         Directory.CreateDirectory(directory);
 
         var pixelPath = Path.Combine(directory, PreprocessedDatasetCache.PixelsFileName);
-        var labelPath = Path.Combine(directory, PreprocessedDatasetCache.LabelsFileName);
-        _labelPath = labelPath;
+        _resumeIndexPath = Path.Combine(directory, PreprocessedDatasetCache.ResumeIndexFileName);
 
         if (resume && File.Exists(pixelPath))
         {
@@ -145,16 +195,33 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
 
             // Records are variable-length (content-only, no padding stored), so the
             // resume point can't be computed by arithmetic the way a fixed-stride format
-            // could — walk the ImageCount confirmed records' box headers (16 bytes each,
-            // never the pixel payload) to find exactly where the last one ends. Anything
-            // past that point is a dangling, never-flushed page and gets truncated away.
-            var resumePosition = PreprocessedImageIndex.FindEndOffset(_pixelStream, ImageCount);
-            _pixelStream.SetLength(resumePosition);
-            _pixelStream.Position = resumePosition;
+            // could — normally this means walking the ImageCount confirmed records' box
+            // headers (16 bytes each, never the pixel payload) to find exactly where the
+            // last one ends. The resume index (see ResumeIndexFileName) caches that
+            // answer from the last Flush, so a clean resume skips the walk entirely; a
+            // stale/missing/corrupt index is the only thing that falls back to doing it
+            // the slow way, which then heals the index for next time.
+            var hasValidResumeIndex = TryReadResumeIndex(_resumeIndexPath, ImageCount, out var pixelResumePosition);
 
-            var confirmedLines = File.Exists(labelPath) ? File.ReadLines(labelPath).Take(ImageCount).ToList() : [];
-            File.WriteAllLines(labelPath, confirmedLines);
-            _labelWriter = new StreamWriter(new FileStream(labelPath, FileMode.Append, FileAccess.Write, FileShare.Read));
+            if (!hasValidResumeIndex)
+            {
+                pixelResumePosition = PreprocessedImageIndex.FindEndOffset(_pixelStream, ImageCount,
+                    onProgress: (completed, total) => onResumeProgress?.Invoke("resuming pixel index", completed, total));
+                WriteResumeIndex(_resumeIndexPath, ImageCount, pixelResumePosition);
+            }
+
+            // Anything past pixelResumePosition is a dangling, never-flushed page and gets truncated away.
+            _pixelStream.SetLength(pixelResumePosition);
+            _pixelStream.Position = pixelResumePosition;
+
+            // Migrates an existing tag_rows.jsonl automatically on first open (see
+            // TagRowStore.OpenForWriting), and drops any row at/past ImageCount the same
+            // way the pixel truncate above does — SQLite's own transaction log already
+            // makes a dangling, never-committed page impossible here (unlike the old
+            // JSONL format, which needed its own manual dangling-line detection), so
+            // there's nothing else to do.
+            _tagRowStore = TagRowStore.OpenForWriting(directory, ImageCount,
+                onMigrateProgress: onResumeProgress);
         }
         else
         {
@@ -164,10 +231,7 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
             _pixelWriter.Write(0); // image count placeholder, patched by Flush/Dispose
             _pixelWriter.Write(inputSize);
 
-            // FileShare.Read (File.Create's default is exclusive None) so
-            // ReadCommittedTagRows/MergeTagRows can open their own handle on this same
-            // file while this one's still held open, instead of throwing IOException.
-            _labelWriter = new StreamWriter(new FileStream(labelPath, FileMode.Create, FileAccess.Write, FileShare.Read));
+            _tagRowStore = TagRowStore.CreateFresh(directory);
             ImageCount = 0;
         }
     }
@@ -184,7 +248,7 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
         _pixelWriter.Write(image.Content.Width);
         _pixelWriter.Write(image.Content.Height);
         _pixelWriter.Write(image.Pixels);
-        _labelWriter.WriteLine(JsonSerializer.Serialize(tagRows));
+        _tagRowStore.Append(ImageCount, tagRows);
         ImageCount++;
     }
 
@@ -195,12 +259,8 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
     /// the same image brings from a different source) without maintaining a second
     /// copy of that state itself.
     /// </summary>
-    public IReadOnlyList<IReadOnlyList<int>> ReadCommittedTagRows() =>
-        File.ReadLines(_labelPath)
-            .Take(ImageCount)
-            .Select(line => (IReadOnlyList<int>)(JsonSerializer.Deserialize<int[]>(line)
-                             ?? throw new InvalidDataException($"'{_labelPath}' contains an invalid tag-row label line.")))
-            .ToList();
+    public IReadOnlyList<IReadOnlyList<int>> ReadCommittedTagRows(Action<int, int>? onProgress = null) =>
+        _tagRowStore.ReadAll(ImageCount, onProgress);
 
     /// <summary>
     /// Overwrites the tag-row indices for specific already-committed rows — the only
@@ -210,28 +270,11 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
     /// already-merged tag set, not just the delta. Every index must already be durably
     /// committed (&lt; <see cref="ImageCount"/> as of the last <see cref="Flush"/>) —
     /// call this right after <see cref="Flush"/>, never against a row appended earlier
-    /// in the same not-yet-flushed page.
-    ///
-    /// Requires rewriting the whole labels file: JSONL lines vary in byte length, so an
-    /// existing line can't be patched in place the way the fixed-width pixel file can.
-    /// Only called when there's actually something to merge, not on every checkpoint —
-    /// see the caller for why that keeps this affordable against a large corpus.
+    /// in the same not-yet-flushed page (see <see cref="TagRowStore.MergeRows"/> for why
+    /// that ordering matters).
     /// </summary>
-    public void MergeTagRows(IReadOnlyDictionary<int, IReadOnlyList<int>> tagRowsByIndex)
-    {
-        if (tagRowsByIndex.Count == 0)
-            return;
-
-        _labelWriter.Flush();
-        _labelWriter.Dispose();
-
-        var lines = File.ReadLines(_labelPath).Take(ImageCount).ToList();
-        foreach (var (rowIndex, tagRows) in tagRowsByIndex)
-            lines[rowIndex] = JsonSerializer.Serialize(tagRows);
-        File.WriteAllLines(_labelPath, lines);
-
-        _labelWriter = new StreamWriter(new FileStream(_labelPath, FileMode.Append, FileAccess.Write, FileShare.Read));
-    }
+    public void MergeTagRows(IReadOnlyDictionary<int, IReadOnlyList<int>> tagRowsByIndex) =>
+        _tagRowStore.MergeRows(tagRowsByIndex);
 
     /// <summary>
     /// Durably persists everything appended so far (patches the header count and
@@ -240,21 +283,83 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
     /// </summary>
     public void Flush()
     {
+        // Tag rows commit BEFORE the pixel header is patched: a crash between the two
+        // just leaves the pixel header (the source of truth ImageCount is read from on
+        // the next open) undercounting what TagRowStore actually has committed — safe,
+        // since every reader bounds its own query by ImageCount regardless. The reverse
+        // order would risk ImageCount claiming more confirmed images than TagRowStore
+        // actually has rows for, leaving a real gap somewhere in 0..ImageCount.
+        _tagRowStore.Flush();
+
         _pixelWriter.Flush();
-        var position = _pixelStream.Position;
+        var pixelEndOffset = _pixelStream.Position;
         _pixelStream.Position = sizeof(int); // past the magic number
         _pixelWriter.Write(ImageCount);
-        _pixelStream.Position = position;
+        _pixelStream.Position = pixelEndOffset;
         _pixelWriter.Flush();
 
-        _labelWriter.Flush();
+        // pixelEndOffset is exactly the confirmed end-of-data offset for the ImageCount
+        // just patched above — keep the resume index in step so the NEXT OpenOrCreate
+        // (this process resuming after a crash, or a later one) can skip straight to it
+        // instead of re-walking every pixel record. A crash between this write and the
+        // pixel header patch above just means the index is one Flush stale next time
+        // it's read — TryReadResumeIndex's ImageCount check catches that and falls back
+        // to the walk, so this never needs to be perfectly atomic with the patch above.
+        WriteResumeIndex(_resumeIndexPath, ImageCount, pixelEndOffset);
+    }
+
+    /// <summary>Overwrites <see cref="PreprocessedDatasetCache.ResumeIndexFileName"/> with the current answer — tiny (16 bytes), cheap to rewrite in full every call.</summary>
+    private static void WriteResumeIndex(string path, int imageCount, long pixelDataEndOffset)
+    {
+        using var stream = new FileStream(path, FileMode.Create, FileAccess.Write);
+        using var writer = new BinaryWriter(stream);
+        writer.Write(PreprocessedDatasetCache.ResumeIndexMagic);
+        writer.Write(imageCount);
+        writer.Write(pixelDataEndOffset);
+    }
+
+    /// <summary>
+    /// True (with <paramref name="pixelDataEndOffset"/> populated) only if the resume
+    /// index exists, isn't corrupt, and was written for exactly
+    /// <paramref name="expectedImageCount"/> — a stale index (written for a smaller
+    /// ImageCount, e.g. from before a subsequent crash added more confirmed images
+    /// without a matching Flush reaching this file) is deliberately rejected rather
+    /// than trusted, since silently resuming from the wrong offset would corrupt the
+    /// pixel file. Any read failure (missing file, truncated, wrong magic) is treated
+    /// the same as "no index yet" rather than thrown — this is purely an optimization
+    /// the caller can always safely fall back from.
+    /// </summary>
+    private static bool TryReadResumeIndex(string path, int expectedImageCount, out long pixelDataEndOffset)
+    {
+        pixelDataEndOffset = 0;
+        if (!File.Exists(path))
+            return false;
+
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read);
+            using var reader = new BinaryReader(stream);
+            if (reader.ReadInt32() != PreprocessedDatasetCache.ResumeIndexMagic)
+                return false;
+            if (reader.ReadInt32() != expectedImageCount)
+                return false;
+
+            pixelDataEndOffset = reader.ReadInt64();
+            return true;
+        }
+        catch (IOException)
+        {
+            // Covers EndOfStreamException (a truncated/corrupt index file) too — it
+            // derives from IOException.
+            return false;
+        }
     }
 
     public void Dispose()
     {
         Flush();
         _pixelWriter.Dispose();
-        _labelWriter.Dispose();
+        _tagRowStore.Dispose();
     }
 }
 
@@ -262,12 +367,14 @@ public sealed class PreprocessedDatasetCacheReader : IDisposable
 {
     private readonly FileStream _pixelStream;
     private readonly long[] _offsets;
+    private readonly TagRowStore _tagRowStore;
 
     public int ImageCount { get; }
     public int InputSize { get; }
     public IReadOnlyList<IReadOnlyList<int>> ImageTagRows { get; }
 
-    public PreprocessedDatasetCacheReader(string directory)
+    /// <summary><paramref name="onProgress"/> (subPhase label, completed, total), if given, reports on the same two O(ImageCount) steps <see cref="PreprocessedDatasetCacheWriter.OpenOrCreate"/> does: a one-time <c>tag_rows.jsonl</c> migration (only if this cache predates <see cref="TagRowStore"/>) and loading every tag row into <see cref="ImageTagRows"/>.</summary>
+    public PreprocessedDatasetCacheReader(string directory, Action<string, int, int>? onProgress = null)
     {
         _pixelStream = File.OpenRead(Path.Combine(directory, PreprocessedDatasetCache.PixelsFileName));
         using (var reader = new BinaryReader(_pixelStream, System.Text.Encoding.UTF8, leaveOpen: true))
@@ -287,13 +394,12 @@ public sealed class PreprocessedDatasetCacheReader : IDisposable
         // even at a multi-million-image corpus.
         _offsets = PreprocessedImageIndex.BuildOffsets(_pixelStream, ImageCount);
 
-        // Only the first ImageCount lines are confirmed committed — a crash can leave
-        // dangling trailing lines from a page that started but never finished flushing.
-        ImageTagRows = File.ReadLines(Path.Combine(directory, PreprocessedDatasetCache.LabelsFileName))
-            .Take(ImageCount)
-            .Select(line => (IReadOnlyList<int>)(JsonSerializer.Deserialize<int[]>(line)
-                             ?? throw new InvalidDataException($"'{directory}' contains an invalid tag-row label line.")))
-            .ToList();
+        // Migrates an existing tag_rows.jsonl automatically on first open, same as the
+        // writer — training can open a cache directly that no writer in this process
+        // has ever touched since TagRowStore existed.
+        _tagRowStore = TagRowStore.OpenForReading(directory, ImageCount, onMigrateProgress: onProgress);
+        ImageTagRows = _tagRowStore.ReadAll(ImageCount,
+            onProgress: (completed, total) => onProgress?.Invoke("loading tag rows", completed, total));
     }
 
     /// <summary>Reads one image's letterbox content region off disk and reconstructs the full padded, normalized pixel tensor a model consumes — the cache is never fully loaded into memory.</summary>
@@ -320,5 +426,9 @@ public sealed class PreprocessedDatasetCacheReader : IDisposable
         return ImagePreprocessing.Reconstruct(new EncodedImage(pixelBytes, content), InputSize);
     }
 
-    public void Dispose() => _pixelStream.Dispose();
+    public void Dispose()
+    {
+        _pixelStream.Dispose();
+        _tagRowStore.Dispose();
+    }
 }

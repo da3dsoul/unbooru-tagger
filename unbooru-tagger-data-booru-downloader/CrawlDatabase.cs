@@ -3,8 +3,39 @@ using Microsoft.Data.Sqlite;
 
 namespace UnbooruTagger.Crawler;
 
-/// <summary>Per-(tag,site,phase) pagination state — lets a re-run of <c>crawl</c> resume exactly where it left off instead of re-listing pages already consumed.</summary>
-public sealed record TagProgressState(string? Cursor, int PostsFetched, bool Done);
+/// <summary>
+/// Per-(tag,site,phase) pagination state — lets a re-run of <c>crawl</c> resume exactly
+/// where it left off instead of re-listing pages already consumed.
+/// </summary>
+/// <param name="QuotaSatisfiedAtMaxImages">
+/// Non-null only for the positive phase: the <c>--max-images</c> value in effect the
+/// last time this (tag, site) stopped fetching because its own/combined quota was
+/// already met — <em>not</em> because the site's pagination was actually exhausted
+/// (that's what <see cref="Done"/> means). Combined counts only ever grow, so a quota
+/// satisfied at some value is still satisfied at any equal-or-lower <c>--max-images</c>
+/// a later run uses — <see cref="DatasetCrawler.RunSiteTagPhaseAsync"/> trusts this to
+/// skip re-entering this tag at all on resume. A later run with a HIGHER
+/// <c>--max-images</c> can't trust it (a smaller quota being met doesn't mean a larger
+/// one is), so it falls back to actually re-checking <see cref="SitePositiveCount"/>/
+/// <see cref="SiteDuplicateCount"/> against the new target for exactly those tags.
+/// </param>
+/// <param name="SitePositiveCount">
+/// This site's own live fairness-floor count for this tag as of the last page boundary
+/// (<see cref="DatasetCrawler.RunSiteTagPhaseAsync"/>'s in-memory <c>mySitePositiveCounts</c>,
+/// checkpointed here every page) — meaningful for the positive phase only. A resumed run
+/// seeds straight from this column instead of re-deriving it from <c>ImageSources</c> (an
+/// unindexed <c>LIKE</c> scan that used to run once per tag per resumed process and got
+/// slower as the corpus grew) — durable, incremental bookkeeping instead of an
+/// after-the-fact reconstruction.
+/// </param>
+/// <param name="SiteDuplicateCount">Same idea as <see cref="SitePositiveCount"/>, for this site's live duplicate-detection count on this tag.</param>
+public sealed record TagProgressState(
+    string? Cursor,
+    int PostsFetched,
+    bool Done,
+    int? QuotaSatisfiedAtMaxImages = null,
+    int SitePositiveCount = 0,
+    int SiteDuplicateCount = 0);
 
 /// <summary>
 /// One newly-downloaded, not-yet-durable image, buffered by <see cref="DatasetCrawler"/>
@@ -160,6 +191,17 @@ public sealed class CrawlDatabase : IDisposable
         // reached yet. See ImageSourceSnapshot's doc comment.
         await EnsureColumnAsync("ImageSources", "Tags", "TEXT NULL", cancellationToken).ConfigureAwait(false);
         await EnsureColumnAsync("ImageSources", "FetchedAt", "TEXT NULL", cancellationToken).ConfigureAwait(false);
+
+        // NULL means "never recorded as quota-satisfied" — see TagProgressState's own
+        // doc comment on QuotaSatisfiedAtMaxImages.
+        await EnsureColumnAsync("TagProgress", "QuotaSatisfiedAtMaxImages", "INTEGER NULL", cancellationToken).ConfigureAwait(false);
+
+        // See TagProgressState's own doc comments on SitePositiveCount/SiteDuplicateCount
+        // — durable checkpoints of a resumed run's per-site fairness-floor/duplicate
+        // counts, so resuming a partially-worked tag never needs to re-derive them from
+        // an ImageSources scan.
+        await EnsureColumnAsync("TagProgress", "SitePositiveCount", "INTEGER NOT NULL DEFAULT 0", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync("TagProgress", "SiteDuplicateCount", "INTEGER NOT NULL DEFAULT 0", cancellationToken).ConfigureAwait(false);
     }
 
     private async Task EnsureColumnAsync(string table, string column, string definition, CancellationToken cancellationToken)
@@ -310,7 +352,7 @@ public sealed class CrawlDatabase : IDisposable
         WithLockAsync(async () =>
         {
             var command = _connection.CreateCommand();
-            command.CommandText = "SELECT Cursor, PostsFetched, Done FROM TagProgress WHERE TagName = $tag AND Site = $site AND Phase = $phase;";
+            command.CommandText = "SELECT Cursor, PostsFetched, Done, QuotaSatisfiedAtMaxImages, SitePositiveCount, SiteDuplicateCount FROM TagProgress WHERE TagName = $tag AND Site = $site AND Phase = $phase;";
             command.Parameters.AddWithValue("$tag", tagName);
             command.Parameters.AddWithValue("$site", site);
             command.Parameters.AddWithValue("$phase", phase);
@@ -322,7 +364,10 @@ public sealed class CrawlDatabase : IDisposable
             return new TagProgressState(
                 reader.IsDBNull(0) ? null : reader.GetString(0),
                 reader.GetInt32(1),
-                reader.GetInt32(2) != 0);
+                reader.GetInt32(2) != 0,
+                reader.IsDBNull(3) ? null : reader.GetInt32(3),
+                reader.GetInt32(4),
+                reader.GetInt32(5));
         }, cancellationToken);
 
     public Task SaveTagProgressAsync(string tagName, string site, string phase, TagProgressState state, CancellationToken cancellationToken = default) =>
@@ -331,12 +376,15 @@ public sealed class CrawlDatabase : IDisposable
             var command = _connection.CreateCommand();
             command.CommandText =
                 """
-                INSERT INTO TagProgress (TagName, Site, Phase, Cursor, PostsFetched, Done)
-                VALUES ($tag, $site, $phase, $cursor, $postsFetched, $done)
+                INSERT INTO TagProgress (TagName, Site, Phase, Cursor, PostsFetched, Done, QuotaSatisfiedAtMaxImages, SitePositiveCount, SiteDuplicateCount)
+                VALUES ($tag, $site, $phase, $cursor, $postsFetched, $done, $quotaSatisfiedAtMaxImages, $sitePositiveCount, $siteDuplicateCount)
                 ON CONFLICT(TagName, Site, Phase) DO UPDATE SET
                     Cursor = $cursor,
                     PostsFetched = $postsFetched,
-                    Done = $done;
+                    Done = $done,
+                    QuotaSatisfiedAtMaxImages = $quotaSatisfiedAtMaxImages,
+                    SitePositiveCount = $sitePositiveCount,
+                    SiteDuplicateCount = $siteDuplicateCount;
                 """;
             command.Parameters.AddWithValue("$tag", tagName);
             command.Parameters.AddWithValue("$site", site);
@@ -344,8 +392,14 @@ public sealed class CrawlDatabase : IDisposable
             command.Parameters.AddWithValue("$cursor", (object?)state.Cursor ?? DBNull.Value);
             command.Parameters.AddWithValue("$postsFetched", state.PostsFetched);
             command.Parameters.AddWithValue("$done", state.Done ? 1 : 0);
+            command.Parameters.AddWithValue("$sitePositiveCount", state.SitePositiveCount);
+            command.Parameters.AddWithValue("$siteDuplicateCount", state.SiteDuplicateCount);
+            command.Parameters.AddWithValue("$quotaSatisfiedAtMaxImages", (object?)state.QuotaSatisfiedAtMaxImages ?? DBNull.Value);
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }, cancellationToken);
+
+    /// <summary>How often (in rows) <see cref="GetAllImagesAsync"/> reports back to an <c>onProgress</c> callback — same reasoning as <see cref="UnbooruTagger.Core.Dataset.PreprocessedDatasetCacheWriter"/>'s own reporting cadence.</summary>
+    private const int ImageLoadProgressInterval = 5_000;
 
     /// <summary>
     /// Every already-cached image's md5/cache-row-index/perceptual-hash, for seeding the
@@ -353,9 +407,13 @@ public sealed class CrawlDatabase : IDisposable
     /// against — see <see cref="PerceptualHash"/> and <see cref="DatasetCrawler"/>'s
     /// working state. Kept purely in memory during a run rather than re-querying per
     /// post: with a corpus that can reach millions of rows, a DB round trip per post
-    /// would make dedup checks the dominant cost of the whole crawl.
+    /// would make dedup checks the dominant cost of the whole crawl. <paramref name="onProgress"/>,
+    /// if given, is invoked with a running row count every <see cref="ImageLoadProgressInterval"/>
+    /// rows (no total — the row count isn't known ahead of a single streamed SELECT
+    /// without a separate COUNT query, which isn't worth paying for just to report a
+    /// denominator).
     /// </summary>
-    public Task<IReadOnlyList<(string Md5, int CacheRowIndex, ulong PHash)>> GetAllImagesAsync(CancellationToken cancellationToken = default) =>
+    public Task<IReadOnlyList<(string Md5, int CacheRowIndex, ulong PHash)>> GetAllImagesAsync(CancellationToken cancellationToken = default, Action<int>? onProgress = null) =>
         WithLockAsync(async () =>
         {
             var command = _connection.CreateCommand();
@@ -363,7 +421,13 @@ public sealed class CrawlDatabase : IDisposable
             var results = new List<(string, int, ulong)>();
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
                 results.Add((reader.GetString(0), reader.GetInt32(1), unchecked((ulong)reader.GetInt64(2))));
+                if (onProgress is not null && results.Count % ImageLoadProgressInterval == 0)
+                    onProgress(results.Count);
+            }
+
+            onProgress?.Invoke(results.Count);
             return (IReadOnlyList<(string Md5, int CacheRowIndex, ulong PHash)>)results;
         }, cancellationToken);
 
@@ -507,34 +571,6 @@ public sealed class CrawlDatabase : IDisposable
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }, cancellationToken);
-
-    /// <summary>
-    /// How many distinct images <paramref name="site"/> has contributed as a source that
-    /// carry <paramref name="tagIdentity"/> — the per-site fairness-floor credit a
-    /// resumed <c>crawl</c> run can't otherwise reconstruct, since <c>SitePositiveCounts</c>
-    /// itself is never persisted (see <see cref="DatasetCrawler.RunAsync"/>'s own doc
-    /// comment on why). Derived here instead from <c>ImageSources.Tags</c> — each source
-    /// row's own eligible-tags snapshot, already durable — rather than adding a new
-    /// column to maintain in lockstep. Meant to be called once, for the one tag a site's
-    /// worker is actually resuming into (mid-pagination, not yet Done) — every other
-    /// tag's real answer is already 0 (never touched), so there's no reason to pay for
-    /// this query on all of them.
-    /// </summary>
-    public Task<int> CountSiteContributionsForTagAsync(string site, string tagIdentity, CancellationToken cancellationToken = default) =>
-        WithLockAsync(async () =>
-        {
-            var command = _connection.CreateCommand();
-            command.CommandText = "SELECT COUNT(DISTINCT Md5) FROM ImageSources WHERE Site = $site AND Tags LIKE $pattern ESCAPE '\\';";
-            command.Parameters.AddWithValue("$site", site);
-            command.Parameters.AddWithValue("$pattern", $"%\"{EscapeLikePattern(tagIdentity)}\"%");
-
-            var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-            return Convert.ToInt32(result);
-        }, cancellationToken);
-
-    /// <summary>Escapes a value for safe use inside a SQL LIKE pattern — <c>%</c>/<c>_</c> are LIKE wildcards, and booru tag names routinely contain literal underscores (<c>head_pat</c>), which would otherwise match any single character instead of a real underscore.</summary>
-    private static string EscapeLikePattern(string value) =>
-        value.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
 
     /// <summary>Resumable cursor for <c>refresh-tags</c>' per-site sweep through <c>ImageSources</c>, ordered by <c>PostId</c> ascending — same pattern as <see cref="TagProgressState"/>, one row per site instead of per (tag, site, phase).</summary>
     public Task<(long LastPostId, bool Done)> GetRefreshProgressAsync(string site, CancellationToken cancellationToken = default) =>
