@@ -58,6 +58,37 @@ internal sealed class CursorPagedSiteClient(string siteName, IReadOnlyDictionary
         throw new NotSupportedException();
 }
 
+/// <summary>
+/// Like <see cref="CursorPagedSiteClient"/> but counts every <see cref="ListPostsAsync"/>
+/// call — for proving a resumed run whose quota is already known-satisfied never fetches
+/// another page at all, not just that it produces the right data if it did. Takes the
+/// first (cursor-null) page separately from <paramref name="pagesByCursor"/> since
+/// <c>Dictionary</c> never allows a null key at runtime, even for a nullable-annotated
+/// key type — unlike <see cref="CursorPagedSiteClient"/>'s tests, which never needed a
+/// null-cursor entry because they only ever simulate resuming PAST page 1.
+/// </summary>
+internal sealed class CountingCursorPagedSiteClient(string siteName, BooruPostPage firstPage, IReadOnlyDictionary<string, BooruPostPage>? pagesByCursor = null) : IBooruClient
+{
+    public string SiteName => siteName;
+    public int PageSize => 100;
+    public IRateLimiter RateLimiter { get; } = new ImmediateRateLimiter();
+    public int ListPostsCallCount { get; private set; }
+
+    public IAsyncEnumerable<BooruTagCount> ListTagsByCountDescendingAsync(CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException();
+
+    public Task<BooruPostPage> ListPostsAsync(string tagQuery, string? cursor, CancellationToken cancellationToken = default)
+    {
+        ListPostsCallCount++;
+        if (cursor is null)
+            return Task.FromResult(firstPage);
+        return Task.FromResult(pagesByCursor?.GetValueOrDefault(cursor) ?? new BooruPostPage([], null));
+    }
+
+    public Task<BooruPost?> GetPostAsync(long postId, CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException();
+}
+
 /// <summary>Cancels <paramref name="cts"/> on the Nth request, then throws through the request's own token — simulating an exit request noticed mid-download rather than a network failure.</summary>
 internal sealed class CancelOnRequestHttpMessageHandler(byte[] imageBytes, int cancelOnRequestNumber, CancellationTokenSource cts) : HttpMessageHandler
 {
@@ -903,7 +934,7 @@ public class DatasetCrawlerConcurrencyTests
                 ReportPhase: _ => { },
                 ReportDownloadProgress: (completed, total) => { lock (reportLock) downloadReports.Add((completed, total)); },
                 ReportProcessingProgress: (completed, total) => { lock (reportLock) processingReports.Add((completed, total)); },
-                ReportTagProgress: (_, completed, _) => { lock (reportLock) tagReports.Add(completed); },
+                ReportTagProgress: (_, completed, _, _) => { lock (reportLock) tagReports.Add(completed); },
                 ReportTagsCompleted: (_, _) => { });
 
             var progress = new CrawlProgressReporter(
@@ -997,7 +1028,7 @@ public class DatasetCrawlerConcurrencyTests
                 ReportPhase: _ => { },
                 ReportDownloadProgress: (_, _) => { },
                 ReportProcessingProgress: (_, _) => { },
-                ReportTagProgress: (_, completed, _) => tagReports.Add(completed),
+                ReportTagProgress: (_, completed, _, _) => tagReports.Add(completed),
                 ReportTagsCompleted: (_, _) => { });
             var progress = new CrawlProgressReporter(
                 new Dictionary<string, SiteProgressReporter> { ["danbooru"] = siteReporter },
@@ -1026,10 +1057,11 @@ public class DatasetCrawlerConcurrencyTests
     /// posts get credited (which per-post crediting already did correctly; the actual gap
     /// was SitePositiveCounts having no memory across a restart at all). Checks both: the
     /// very first reported value already shows the resumed site's real prior credit
-    /// (<see cref="CrawlDatabase.CountSiteContributionsForTagAsync"/>, seeded in
-    /// <c>RunSiteTagPhaseAsync</c> before that first report), and it climbs further as
-    /// this process's own page-2 posts — all rediscoveries of images already known from
-    /// elsewhere, the realistic shape once a corpus is large — get processed.
+    /// (seeded in <c>RunSiteTagPhaseAsync</c> directly from <see cref="TagProgressState.SitePositiveCount"/>
+    /// — the durable per-page checkpoint a real prior process would have saved — before
+    /// that first report), and it climbs further as this process's own page-2 posts —
+    /// all rediscoveries of images already known from elsewhere, the realistic shape
+    /// once a corpus is large — get processed.
     /// </summary>
     [Fact]
     public async Task RunAsync_ResumedMidPagination_CreditsManyRediscoveredDuplicatesOnTheContinuedPage()
@@ -1063,9 +1095,13 @@ public class DatasetCrawlerConcurrencyTests
             await db.CommitPendingImagesAsync(seedImages, [], [], CancellationToken.None);
 
             // The tag/site/phase progress record a real prior process would have saved:
-            // partway through pagination, not Done — the exact state a resumed process
-            // reads on startup, with SitePositiveCounts reset to 0 regardless.
-            await db.SaveTagProgressAsync("head_pat", "danbooru", "positive", new TagProgressState("page-2-cursor", alreadyKnownCount, Done: false), CancellationToken.None);
+            // partway through pagination, not Done, with SitePositiveCount checkpointed
+            // to this site's real prior credit (see Flush's own per-page save) — the
+            // exact durable state a resumed process reads on startup and seeds straight
+            // from, no ImageSources re-derivation involved.
+            await db.SaveTagProgressAsync("head_pat", "danbooru", "positive",
+                new TagProgressState("page-2-cursor", alreadyKnownCount, Done: false, SitePositiveCount: alreadyKnownCount),
+                CancellationToken.None);
 
             // Page 2: the same already-known images turning up again — e.g. the search
             // re-lists something already found via a different tag's earlier crawl.
@@ -1083,7 +1119,7 @@ public class DatasetCrawlerConcurrencyTests
                 ReportPhase: _ => { },
                 ReportDownloadProgress: (_, _) => { },
                 ReportProcessingProgress: (_, _) => { },
-                ReportTagProgress: (_, completed, _) => tagReports.Add(completed),
+                ReportTagProgress: (_, completed, _, _) => tagReports.Add(completed),
                 ReportTagsCompleted: (_, _) => { });
             var progress = new CrawlProgressReporter(
                 new Dictionary<string, SiteProgressReporter> { ["danbooru"] = siteReporter },
@@ -1102,13 +1138,132 @@ public class DatasetCrawlerConcurrencyTests
             Assert.Equal(alreadyKnownCount, (await db.GetAllImagesAsync()).Count); // no duplicate rows from rediscovery
 
             // The very first report — before a single page-2 post is processed — must
-            // already reflect this site's real prior credit, derived from ImageSources,
-            // not the pre-fix 0.
+            // already reflect this site's real prior credit, seeded straight from the
+            // persisted TagProgressState.SitePositiveCount, not the pre-fix 0.
             Assert.Equal(alreadyKnownCount, tagReports[0]);
 
             // ...and it must climb further as page 2's own rediscoveries get credited on
             // top of that seeded baseline.
             Assert.Contains((long)(alreadyKnownCount * 2), tagReports);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_ResumedWithQuotaAlreadySatisfied_SkipsRefetchingEntirely()
+    {
+        const int inputSize = 8;
+        const int maxImages = 3;
+
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true)], DateTimeOffset.UtcNow, null);
+
+            // More posts than maxImages needs, on a single page whose NextCursor is
+            // deliberately non-null: this site's own pagination is NOT exhausted, so the
+            // only way the crawl stops on this tag is shouldContinue() going false
+            // partway through the page once the per-site floor (== maxImages, single
+            // site) is met -- exactly the "quota satisfied, not Done" case
+            // QuotaSatisfiedAtMaxImages exists for, as opposed to the already-covered
+            // "genuinely exhausted" (Done == true) case.
+            var posts = Enumerable.Range(0, maxImages + 2)
+                .Select(i => new BooruPost(i, $"img-{i}", new Uri($"https://example.test/{i}.png"), ["1girl"], "g", DateTimeOffset.UtcNow, 8, 8))
+                .ToList();
+            var firstPage = new BooruPostPage(posts, "more-pages-exist");
+            var client = new CountingCursorPagedSiteClient("danbooru", firstPage);
+            var clients = new Dictionary<string, IBooruClient> { ["danbooru"] = client };
+
+            var imageBytesByUrl = posts.ToDictionary(p => p.FileUrl, p => MakeDistinctTestPng((int)p.PostId));
+            using var downloadClient = new HttpClient(new RoutedImageHttpMessageHandler(imageBytesByUrl));
+
+            await DatasetCrawler.RunAsync(
+                db, clients, downloadClient, directory, inputSize,
+                minImages: 1, maxImages: maxImages, negativeTarget: 0, vocabCompactIntervalPages: 1,
+                progress: null, CancellationToken.None);
+
+            var progress = await db.GetTagProgressAsync("1girl", "danbooru", "positive");
+            Assert.False(progress.Done); // pagination genuinely NOT exhausted -- only quota was met
+            Assert.Equal(maxImages, progress.QuotaSatisfiedAtMaxImages);
+
+            // The page-boundary checkpoint (not just the quota flag) must reflect a real,
+            // correctly-bounded count -- at least enough to have satisfied the floor, but
+            // never more than the posts actually available to dispatch.
+            Assert.InRange(progress.SitePositiveCount, maxImages, posts.Count);
+
+            var callsAfterFirstRun = client.ListPostsCallCount;
+            Assert.True(callsAfterFirstRun > 0);
+
+            // Second run: same db, same directory, same maxImages, same client instance
+            // (so its own call counter carries over) -- if the fast path weren't
+            // working, this would fetch at least one more page.
+            await DatasetCrawler.RunAsync(
+                db, clients, downloadClient, directory, inputSize,
+                minImages: 1, maxImages: maxImages, negativeTarget: 0, vocabCompactIntervalPages: 1,
+                progress: null, CancellationToken.None);
+
+            Assert.Equal(callsAfterFirstRun, client.ListPostsCallCount);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task RunAsync_ResumedWithHigherMaxImagesThanRecordedQuota_ResumesFetching()
+    {
+        const int inputSize = 8;
+        const int firstRunMaxImages = 3;
+        const int secondRunMaxImages = firstRunMaxImages * 3;
+
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true)], DateTimeOffset.UtcNow, null);
+
+            // First page satisfies firstRunMaxImages without exhausting pagination (same
+            // setup as RunAsync_ResumedWithQuotaAlreadySatisfied_SkipsRefetchingEntirely);
+            // a second page then lets the run continue once a HIGHER --max-images makes
+            // the previously-recorded quota untrustworthy.
+            var page1Posts = Enumerable.Range(0, firstRunMaxImages + 2)
+                .Select(i => new BooruPost(i, $"img-{i}", new Uri($"https://example.test/page1-{i}.png"), ["1girl"], "g", DateTimeOffset.UtcNow, 8, 8))
+                .ToList();
+            var page2Posts = Enumerable.Range(0, secondRunMaxImages)
+                .Select(i => new BooruPost(1000 + i, $"img2-{i}", new Uri($"https://example.test/page2-{i}.png"), ["1girl"], "g", DateTimeOffset.UtcNow, 8, 8))
+                .ToList();
+            var client = new CountingCursorPagedSiteClient("danbooru",
+                firstPage: new BooruPostPage(page1Posts, "page-2-cursor"),
+                pagesByCursor: new Dictionary<string, BooruPostPage> { ["page-2-cursor"] = new BooruPostPage(page2Posts, null) });
+            var clients = new Dictionary<string, IBooruClient> { ["danbooru"] = client };
+
+            var imageBytesByUrl = page1Posts.Concat(page2Posts).ToDictionary(p => p.FileUrl, p => MakeDistinctTestPng((int)p.PostId));
+            using var downloadClient = new HttpClient(new RoutedImageHttpMessageHandler(imageBytesByUrl));
+
+            await DatasetCrawler.RunAsync(
+                db, clients, downloadClient, directory, inputSize,
+                minImages: 1, maxImages: firstRunMaxImages, negativeTarget: 0, vocabCompactIntervalPages: 1,
+                progress: null, CancellationToken.None);
+
+            var afterFirstRun = await db.GetTagProgressAsync("1girl", "danbooru", "positive");
+            Assert.Equal(firstRunMaxImages, afterFirstRun.QuotaSatisfiedAtMaxImages);
+            var callsAfterFirstRun = client.ListPostsCallCount;
+
+            // A higher --max-images can't trust the previously-recorded quota (a smaller
+            // quota being met doesn't mean a larger one is) -- this must fall back to the
+            // normal path and fetch page 2.
+            await DatasetCrawler.RunAsync(
+                db, clients, downloadClient, directory, inputSize,
+                minImages: 1, maxImages: secondRunMaxImages, negativeTarget: 0, vocabCompactIntervalPages: 1,
+                progress: null, CancellationToken.None);
+
+            Assert.True(client.ListPostsCallCount > callsAfterFirstRun);
+            Assert.True((await db.GetAllImagesAsync()).Count > firstRunMaxImages);
         }
         finally
         {

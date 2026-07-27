@@ -33,7 +33,7 @@ public sealed record SiteProgressReporter(
     Action<string> ReportPhase,
     Action<int, int> ReportDownloadProgress,
     Action<int, int> ReportProcessingProgress,
-    Action<string, long, long> ReportTagProgress,
+    Action<string, long, long, long> ReportTagProgress,
     Action<long, long> ReportTagsCompleted);
 
 /// <summary>
@@ -111,9 +111,9 @@ public static class ProgressBarColumns
             processingTask.Value = completed;
         }
 
-        void ReportTagProgress(string tagName, long completed, long target)
+        void ReportTagProgress(string tagName, long completed, long target, long duplicates)
         {
-            tagProgressTask.Description = Markup.Escape($"[{site}] Current tag: {tagName} ({completed}/{target})");
+            tagProgressTask.Description = Markup.Escape($"[{site}] Current tag: {tagName} ({completed}/{target}/{duplicates} dupes)");
             tagProgressTask.MaxValue = target;
             // A tag can already be over target the moment its phase starts (e.g. the
             // negative top-up's "current negatives" is corpus-wide arithmetic, not
