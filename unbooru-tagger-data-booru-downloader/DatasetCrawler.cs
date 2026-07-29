@@ -156,7 +156,6 @@ internal sealed class CrawlWorkingState
 public static class DatasetCrawler
 {
     private const string PositivePhase = "positive";
-    private const string NegativePhase = "negative";
 
     /// <summary>
     /// Max <see cref="PerceptualHash.HammingDistance"/> (out of 64 bits) for two images to
@@ -215,7 +214,10 @@ public static class DatasetCrawler
         CancellationToken cancellationToken,
         TagExclusionRules? excludedTags = null,
         Func<TimeSpan, CancellationToken, Task>? retryDelay = null,
-        IReadOnlyDictionary<string, string>? tagAliases = null)
+        IReadOnlyDictionary<string, string>? tagAliases = null,
+        double negativeCooccurrenceRatio = 0.5,
+        int negativeCooccurrenceMinExamples = 15,
+        int maxHardNegativeSources = 3)
     {
         retryDelay ??= Task.Delay;
         var errorLog = CrawlErrorLog.ForDirectory(outputDirectory);
@@ -430,22 +432,64 @@ public static class DatasetCrawler
             }
 
             siteReporter?.ReportTagsCompleted(0, eligibleTags.Count);
+
+            // Built once per site-worker, right at this site's own positive->negative
+            // transition — not once globally up front (this run's own positive phase,
+            // just completed above, is exactly the data a fresh/bootstrapping corpus
+            // needs reflected) and not shared across sites (no cross-site barrier exists
+            // between phases — see this class's own doc comment for why — so each site
+            // builds its own snapshot of whatever's in the corpus at the moment IT
+            // reaches this point). ImageTagRowsByCacheRow is already fully resident in
+            // memory; only the copy under stateLock is needed since another site's
+            // worker can still be concurrently mutating individual HashSet<int>
+            // instances via MergeDuplicateTags for as long as this run continues.
+            TagCooccurrenceIndex cooccurrenceIndex;
+            await stateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var tagRowSnapshot = state.ImageTagRowsByCacheRow.Values
+                    .Select(set => (IReadOnlyCollection<int>)set.ToArray())
+                    .ToList();
+                cooccurrenceIndex = TagCooccurrenceIndex.Build(tagRowSnapshot);
+            }
+            finally
+            {
+                stateLock.Release();
+            }
+
             tagIndex = 0;
             foreach (var tag in eligibleTags)
             {
                 tagIndex++;
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var negativeQuery = $"-{TagCategoryNaming.RawName(tag.Name)}";
-                siteReporter?.ReportPhase($"{NegativePhase} crawl: tag '{tag.Name}' ({tagIndex}/{eligibleTags.Count})");
+                var targetRow = vocabulary.TryGet(tag.Name, out var targetRecord) ? targetRecord.RowIndex : (int?)null;
+                var queryPlans = NegativeQueryPlanning.BuildQuerySequence(
+                    tag.Name, targetRow, cooccurrenceIndex, vocabulary,
+                    negativeCooccurrenceRatio, negativeCooccurrenceMinExamples, maxHardNegativeSources);
 
-                await RunSiteTagPhaseAsync(
-                    site, client, NegativePhase, tag.Name, negativeQuery,
-                    () => CrawlQuota.NegativeShortfall(writer.ImageCount, state.CombinedPositiveCount(tag.Name), negativeTarget) > 0,
-                    db, vocabulary, writer, eligibleTagIdentities, tempDir, inputSize, downloadClient,
-                    state, stateLock, downloadPool, processingPool, siteReporter, progress?.ReportOverall, estimatedTotal, CheckpointAsync,
-                    errorLog, retryDelay, () => writer.ImageCount - state.CombinedPositiveCount(tag.Name), negativeTarget,
-                    () => 0, maxImagesForQuotaTracking: null, cancellationToken).ConfigureAwait(false);
+                // Checked before every plan, including the first: a tag whose negatives
+                // are already covered — even purely organically, as a side effect of
+                // other tags' positive crawls — costs zero requests here, hard-negative
+                // or fallback alike. Only a genuine shortfall causes any fetching, and
+                // RunSiteTagPhaseAsync's own shouldContinue re-checks the same shortfall
+                // every page, so a plan stops pulling the moment the target is met
+                // mid-query.
+                foreach (var plan in queryPlans)
+                {
+                    if (CrawlQuota.NegativeShortfall(writer.ImageCount, state.CombinedPositiveCount(tag.Name), negativeTarget) <= 0)
+                        break;
+
+                    siteReporter?.ReportPhase($"negative crawl: tag '{tag.Name}' via {plan.DisplayLabel} ({tagIndex}/{eligibleTags.Count})");
+
+                    await RunSiteTagPhaseAsync(
+                        site, client, plan.PhaseKey, tag.Name, plan.TagQuery,
+                        () => CrawlQuota.NegativeShortfall(writer.ImageCount, state.CombinedPositiveCount(tag.Name), negativeTarget) > 0,
+                        db, vocabulary, writer, eligibleTagIdentities, tempDir, inputSize, downloadClient,
+                        state, stateLock, downloadPool, processingPool, siteReporter, progress?.ReportOverall, estimatedTotal, CheckpointAsync,
+                        errorLog, retryDelay, () => writer.ImageCount - state.CombinedPositiveCount(tag.Name), negativeTarget,
+                        () => 0, maxImagesForQuotaTracking: null, cancellationToken).ConfigureAwait(false);
+                }
 
                 siteReporter?.ReportTagsCompleted(tagIndex, eligibleTags.Count);
             }
