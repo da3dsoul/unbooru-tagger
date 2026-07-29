@@ -361,6 +361,25 @@ deliberately more negatives than positives, since an image with many tags
 would otherwise skew the surviving negative pool toward sparsely-tagged
 images.
 
+Once a tag's negative pool is actually short (checked against the whole
+corpus first — a tag whose negatives are already covered organically,
+just as a side effect of other tags' positive crawls, costs zero extra
+requests here), the negative phase prefers hard negatives over plain
+random background: it scans the corpus's own already-recorded tag
+co-occurrence (`TagCooccurrenceIndex`) for tags that commonly show up
+alongside the target AND have enough images carrying them *without* the
+target to trust as a real negative source (`--negative-cooccurrence-ratio`,
+default `0.5`; `--negative-cooccurrence-min-examples`, default `15`), then
+queries up to `--max-hard-negative-sources` (default `3`) of those —
+e.g. `vocaloid -hatsune_miku` — before falling back to the plain
+`-{tag}` query every tag has always used. The counter-example floor is
+what keeps a near-subset pair (`large_breasts` almost always implies
+`breasts`) from being mined in the direction that has no real
+counter-examples to draw from, while still allowing the useful reverse
+direction and genuinely spread-out pairs (a character vs. the series
+it's from) through. Set `--max-hard-negative-sources 0` to disable this
+and always use the plain query, matching pre-existing behavior exactly.
+
 A transient failure (network reset, DNS, TLS, timeout, HTTP 429, or a
 5xx) is retried automatically with capped exponential backoff; a
 permanently-gone download (404/410) is skipped immediately instead of

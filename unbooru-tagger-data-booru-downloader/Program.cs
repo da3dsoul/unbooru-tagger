@@ -155,6 +155,9 @@ surveyCommand.SetAction(async (parseResult, cancellationToken) =>
 var negativeTargetOption = new Option<int?>("--negative-target") { Description = "Non-tagged images each eligible tag should end up with (default 2x --min-images — see plan notes on dedup bias)" };
 var inputSizeOption = new Option<int>("--input-size") { Description = "Square input resolution to preprocess images to", DefaultValueFactory = _ => 224 };
 var vocabCompactIntervalOption = new Option<int>("--vocab-compact-interval") { Description = "Pages between full tag_vocabulary.json compactions (the delta log is still checkpointed every page regardless, same as build-large-cache's option of the same name)", DefaultValueFactory = _ => 20 };
+var negativeCooccurrenceRatioOption = new Option<double>("--negative-cooccurrence-ratio") { Description = "Minimum fraction of a tag's own images that must also carry a candidate tag before that candidate is trusted as a hard-negative source", DefaultValueFactory = _ => 0.5 };
+var negativeCooccurrenceMinExamplesOption = new Option<int>("--negative-cooccurrence-min-examples") { Description = "Minimum counter-example images (has the candidate tag, lacks the target) required to trust a pair as a hard-negative source", DefaultValueFactory = _ => 15 };
+var maxHardNegativeSourcesOption = new Option<int>("--max-hard-negative-sources") { Description = "Cap on distinct co-occurring tags tried as hard-negative queries per tag before falling back to the plain tag-absent negative query; 0 disables hard-negative mining", DefaultValueFactory = _ => 3 };
 
 var crawlCommand = new Command("crawl", "Download images for every eligible tag (rarest-first), then top up negatives — writes directly into a trainable dataset directory");
 crawlCommand.Options.Add(sitesOption);
@@ -170,6 +173,9 @@ crawlCommand.Options.Add(rateDanbooruOption);
 crawlCommand.Options.Add(rateGelbooruOption);
 crawlCommand.Options.Add(negativeTargetOption);
 crawlCommand.Options.Add(vocabCompactIntervalOption);
+crawlCommand.Options.Add(negativeCooccurrenceRatioOption);
+crawlCommand.Options.Add(negativeCooccurrenceMinExamplesOption);
+crawlCommand.Options.Add(maxHardNegativeSourcesOption);
 crawlCommand.SetAction(async (parseResult, cancellationToken) =>
 {
     var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
@@ -181,6 +187,9 @@ crawlCommand.SetAction(async (parseResult, cancellationToken) =>
     var rateGelbooru = parseResult.GetRequiredValue(rateGelbooruOption);
     var negativeTarget = parseResult.GetValue(negativeTargetOption) ?? minImages * 2;
     var vocabCompactInterval = parseResult.GetRequiredValue(vocabCompactIntervalOption);
+    var negativeCooccurrenceRatio = parseResult.GetRequiredValue(negativeCooccurrenceRatioOption);
+    var negativeCooccurrenceMinExamples = parseResult.GetRequiredValue(negativeCooccurrenceMinExamplesOption);
+    var maxHardNegativeSources = parseResult.GetRequiredValue(maxHardNegativeSourcesOption);
 
     using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
 
@@ -217,7 +226,10 @@ crawlCommand.SetAction(async (parseResult, cancellationToken) =>
             return await DatasetCrawler.RunAsync(
                 db, clients, httpClient, outputDirectory, inputSize,
                 minImages, maxImages, negativeTarget, vocabCompactInterval,
-                progress, cancellationToken, excludedTags, tagAliases: tagAliases);
+                progress, cancellationToken, excludedTags, tagAliases: tagAliases,
+                negativeCooccurrenceRatio: negativeCooccurrenceRatio,
+                negativeCooccurrenceMinExamples: negativeCooccurrenceMinExamples,
+                maxHardNegativeSources: maxHardNegativeSources);
         });
 
     if (result.Shortfalls.Count > 0)
