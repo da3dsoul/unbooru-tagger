@@ -307,6 +307,23 @@ dotnet run --project unbooru-tagger-data-booru-downloader -- crawl \
   --gelbooru-user-id <user-id>
 ```
 
+Every option this command was run with (sites, `--min-images`/`--max-images`/
+`--input-size`, rates, API credentials, negative-mining settings) is saved to
+`last-crawl-command.json` under `--output-dir`. A later re-run just needs:
+
+```sh
+dotnet run --project unbooru-tagger-data-booru-downloader -- crawl \
+  --output-dir ./data/crawled \
+  --resume
+```
+
+`--resume` reuses everything from that file and ignores any of those same
+options if you also pass them alongside it — only `--output-dir` matters
+together with `--resume`. This is separate from (and doesn't replace) the
+per-tag/site progress checkpointing described below, which is what actually
+lets a re-run pick back up mid-corpus instead of starting over — `--resume`
+only saves you from having to reconstruct the command itself.
+
 Every configured site runs its own worker concurrently — each doing a
 full positive-then-negative pass over every eligible tag at its own rate
 limit — rather than the crawler round-robining pages between whichever
