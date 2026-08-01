@@ -159,6 +159,11 @@ var negativeCooccurrenceRatioOption = new Option<double>("--negative-cooccurrenc
 var negativeCooccurrenceMinExamplesOption = new Option<int>("--negative-cooccurrence-min-examples") { Description = "Minimum counter-example images (has the candidate tag, lacks the target) required to trust a pair as a hard-negative source", DefaultValueFactory = _ => 15 };
 var maxHardNegativeSourcesOption = new Option<int>("--max-hard-negative-sources") { Description = "Cap on distinct co-occurring tags tried as hard-negative queries per tag before falling back to the plain tag-absent negative query; 0 disables hard-negative mining", DefaultValueFactory = _ => 3 };
 
+var resumeOption = new Option<bool>("--resume")
+{
+    Description = $"Reuse every crawl option (sites, --min-images/--max-images/--input-size, rates, API credentials, negative-mining settings) from the last 'crawl' run recorded under --output-dir ('{CrawlCommandRecord.FileName}'), ignoring any of those options passed alongside this flag — only --output-dir is needed together with --resume. Fails if no prior 'crawl' run was recorded there yet."
+};
+
 var crawlCommand = new Command("crawl", "Download images for every eligible tag (rarest-first), then top up negatives — writes directly into a trainable dataset directory");
 crawlCommand.Options.Add(sitesOption);
 crawlCommand.Options.Add(minImagesOption);
@@ -176,20 +181,66 @@ crawlCommand.Options.Add(vocabCompactIntervalOption);
 crawlCommand.Options.Add(negativeCooccurrenceRatioOption);
 crawlCommand.Options.Add(negativeCooccurrenceMinExamplesOption);
 crawlCommand.Options.Add(maxHardNegativeSourcesOption);
+crawlCommand.Options.Add(resumeOption);
 crawlCommand.SetAction(async (parseResult, cancellationToken) =>
 {
     var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
-    var minImages = parseResult.GetRequiredValue(minImagesOption);
-    var maxImages = parseResult.GetRequiredValue(maxImagesOption);
-    var sites = parseResult.GetRequiredValue(sitesOption);
-    var inputSize = parseResult.GetRequiredValue(inputSizeOption);
-    var rateDanbooru = parseResult.GetRequiredValue(rateDanbooruOption);
-    var rateGelbooru = parseResult.GetRequiredValue(rateGelbooruOption);
-    var negativeTarget = parseResult.GetValue(negativeTargetOption) ?? minImages * 2;
-    var vocabCompactInterval = parseResult.GetRequiredValue(vocabCompactIntervalOption);
-    var negativeCooccurrenceRatio = parseResult.GetRequiredValue(negativeCooccurrenceRatioOption);
-    var negativeCooccurrenceMinExamples = parseResult.GetRequiredValue(negativeCooccurrenceMinExamplesOption);
-    var maxHardNegativeSources = parseResult.GetRequiredValue(maxHardNegativeSourcesOption);
+    var resume = parseResult.GetRequiredValue(resumeOption);
+
+    string[] sites;
+    int minImages, maxImages, inputSize, negativeTarget, vocabCompactInterval, negativeCooccurrenceMinExamples, maxHardNegativeSources;
+    double rateDanbooru, rateGelbooru, negativeCooccurrenceRatio;
+    string? danbooruLogin, danbooruApiKey, gelbooruApiKey, gelbooruUserId;
+
+    if (resume)
+    {
+        var saved = await CrawlCommandRecord.TryLoadAsync(outputDirectory, cancellationToken);
+        if (saved is null)
+        {
+            Console.Error.WriteLine($"--resume was given but no saved crawl command was found under '{outputDirectory}' ('{CrawlCommandRecord.FileName}') — run 'crawl' normally (without --resume) at least once first.");
+            return 1;
+        }
+
+        Console.WriteLine($"Resuming with the crawl options saved from the last run under '{outputDirectory}'.");
+        sites = saved.Sites;
+        minImages = saved.MinImages;
+        maxImages = saved.MaxImages;
+        inputSize = saved.InputSize;
+        danbooruLogin = saved.DanbooruLogin;
+        danbooruApiKey = saved.DanbooruApiKey;
+        gelbooruApiKey = saved.GelbooruApiKey;
+        gelbooruUserId = saved.GelbooruUserId;
+        rateDanbooru = saved.RateDanbooru;
+        rateGelbooru = saved.RateGelbooru;
+        negativeTarget = saved.NegativeTarget;
+        vocabCompactInterval = saved.VocabCompactInterval;
+        negativeCooccurrenceRatio = saved.NegativeCooccurrenceRatio;
+        negativeCooccurrenceMinExamples = saved.NegativeCooccurrenceMinExamples;
+        maxHardNegativeSources = saved.MaxHardNegativeSources;
+    }
+    else
+    {
+        sites = parseResult.GetRequiredValue(sitesOption);
+        minImages = parseResult.GetRequiredValue(minImagesOption);
+        maxImages = parseResult.GetRequiredValue(maxImagesOption);
+        inputSize = parseResult.GetRequiredValue(inputSizeOption);
+        rateDanbooru = parseResult.GetRequiredValue(rateDanbooruOption);
+        rateGelbooru = parseResult.GetRequiredValue(rateGelbooruOption);
+        danbooruLogin = parseResult.GetValue(danbooruLoginOption);
+        danbooruApiKey = parseResult.GetValue(danbooruApiKeyOption);
+        gelbooruApiKey = parseResult.GetValue(gelbooruApiKeyOption);
+        gelbooruUserId = parseResult.GetValue(gelbooruUserIdOption);
+        negativeTarget = parseResult.GetValue(negativeTargetOption) ?? minImages * 2;
+        vocabCompactInterval = parseResult.GetRequiredValue(vocabCompactIntervalOption);
+        negativeCooccurrenceRatio = parseResult.GetRequiredValue(negativeCooccurrenceRatioOption);
+        negativeCooccurrenceMinExamples = parseResult.GetRequiredValue(negativeCooccurrenceMinExamplesOption);
+        maxHardNegativeSources = parseResult.GetRequiredValue(maxHardNegativeSourcesOption);
+
+        await CrawlCommandRecord.SaveAsync(outputDirectory, new CrawlCommandRecord(
+            sites, minImages, maxImages, inputSize, danbooruLogin, danbooruApiKey, gelbooruApiKey, gelbooruUserId,
+            rateDanbooru, rateGelbooru, negativeTarget, vocabCompactInterval, negativeCooccurrenceRatio,
+            negativeCooccurrenceMinExamples, maxHardNegativeSources), cancellationToken);
+    }
 
     using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
 
@@ -202,8 +253,7 @@ crawlCommand.SetAction(async (parseResult, cancellationToken) =>
 
     var clients = BuildClients(
         sites, httpClient, rateDanbooru, rateGelbooru,
-        parseResult.GetValue(danbooruLoginOption), parseResult.GetValue(danbooruApiKeyOption),
-        parseResult.GetValue(gelbooruApiKeyOption), parseResult.GetValue(gelbooruUserIdOption));
+        danbooruLogin, danbooruApiKey, gelbooruApiKey, gelbooruUserId);
     var excludedTags = await TagExclusions.LoadOrCreateAsync(outputDirectory, cancellationToken);
     // Never fetches — only survey-tags/refresh-tags populate this cache; crawl just
     // reads whatever's already there (see TagAliasCache's own doc comment for why).
