@@ -160,7 +160,10 @@ public static class TagSurveyor
         // known — e.g. a crawl.sqlite surveyed before ListActiveTagAliasesAsync existed.
         // Deleted outright rather than left at Eligible = 0, since that path is for a tag
         // that genuinely fell under quota this survey, not one that should never be
-        // iterated as its own tag again.
+        // iterated as its own tag again. Its TagProgress rows (any site/phase) are
+        // deleted alongside the Tags row, not just left orphaned — a resumed crawl only
+        // ever iterates tags still present in Tags, so leaving them behind is harmless to
+        // correctness, but keeps crawl.sqlite honest for anyone inspecting it directly.
         if (tagAliases is { Count: > 0 })
         {
             var existingRows = await db.GetAllSurveyedTagsAsync(cancellationToken).ConfigureAwait(false);
@@ -169,7 +172,10 @@ public static class TagSurveyor
                 .Where(name => tagAliases.ContainsKey(TagCategoryNaming.RawName(name)))
                 .ToList();
             if (staleAliasRows.Count > 0)
+            {
                 await db.DeleteTagSurveysAsync(staleAliasRows, cancellationToken).ConfigureAwait(false);
+                await db.DeleteTagProgressAsync(staleAliasRows, cancellationToken).ConfigureAwait(false);
+            }
         }
 
         var eligibleTags = results.Where(t => TagEligibility.IsEligible(t, minImages, excludedTags)).ToList();

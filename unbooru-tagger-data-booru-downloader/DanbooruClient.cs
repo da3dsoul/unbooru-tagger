@@ -63,9 +63,10 @@ public sealed class DanbooruClient(HttpClient http, IRateLimiter rateLimiter, st
     /// consequent name, which can never satisfy quota tracked against the antecedent
     /// identity — that tag's per-site floor then never moves and its crawl only gives up
     /// once results are physically exhausted, having wasted a full pagination run for
-    /// zero counted credit. Only Danbooru exposes this; Gelbooru has no equivalent
-    /// listing, but Danbooru's table alone is enough since a raw name from *either* site
-    /// can be looked up against it.
+    /// zero counted credit. Danbooru's own JSON <c>tag_aliases.json</c> endpoint; Gelbooru
+    /// maintains an independently-diverging alias table of its own (see
+    /// <see cref="GelbooruClient.ListActiveTagAliasesAsync"/>'s doc comment) — Danbooru's
+    /// table alone is NOT enough, despite what this comment used to claim.
     /// </summary>
     public async IAsyncEnumerable<BooruTagAlias> ListActiveTagAliasesAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {

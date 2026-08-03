@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace UnbooruTagger.Crawler;
 
@@ -57,6 +58,56 @@ public sealed class GelbooruClient(HttpClient http, IRateLimiter rateLimiter, st
                     TagCategoryNaming.Identity(WebUtility.HtmlDecode(element.GetProperty("name").GetString()!), category),
                     element.GetProperty("count").GetInt32());
             }
+        }
+    }
+
+    /// <summary>
+    /// Gelbooru's own row shape on its (HTML-only — no <c>dapi</c> equivalent exists;
+    /// <c>s=tag_alias</c>/<c>s=alias</c> under <c>page=dapi</c> both come back empty)
+    /// alias listing page: <c>&lt;td&gt;&lt;a href="...tags=ANTECEDENT"&gt;display&lt;/a&gt;
+    /// &lt;span class="tag-count"&gt;N&lt;/span&gt; &lt;b&gt;&amp;rarr;&lt;/b&gt;
+    /// &lt;a href="...tags=CONSEQUENT"&gt;display&lt;/a&gt; &lt;span class="tag-count"&gt;N&lt;/span&gt;&lt;/td&gt;</c>
+    /// per row. The raw tag name is read from each link's own <c>tags=</c> query
+    /// parameter, not its display text (which has underscores rendered back out as
+    /// spaces) — the same underscored form <see cref="ListPostsAsync"/> expects.
+    /// </summary>
+    private static readonly Regex AliasRowPattern = new(
+        """<td><a href="[^"]*?tags=([^"&]+)"[^>]*>[^<]*</a>\s*<span class="tag-count">\d+</span>\s*<b>&rarr;</b>\s*<a href="[^"]*?tags=([^"&]+)"[^>]*>[^<]*</a>\s*<span class="tag-count">\d+</span></td>""",
+        RegexOptions.Compiled);
+
+    /// <summary>How much <c>pid</c> advances between alias-listing pages — the step the site's own "next page" links use (confirmed against a live fetch), not a documented page size.</summary>
+    private const int AliasPageStep = 50;
+
+    private static string DecodeTagName(string value) => WebUtility.HtmlDecode(Uri.UnescapeDataString(value));
+
+    /// <summary>
+    /// Streams Gelbooru's own active tag-alias table by scraping <c>page=alias&amp;s=list</c>
+    /// (there is no JSON <c>dapi</c> equivalent — see <see cref="AliasRowPattern"/>'s own
+    /// doc comment). Danbooru's <see cref="DanbooruClient.ListActiveTagAliasesAsync"/>
+    /// doc comment used to claim Gelbooru had no alias listing at all and that Danbooru's
+    /// table alone was enough since a raw name from either site could be looked up
+    /// against it — that's wrong: Gelbooru maintains its own, independently-diverging
+    /// alias table (e.g. Danbooru's <c>nude_male_clothed_female</c> is Gelbooru's own
+    /// <c>clothed_female_nude_male</c>; a "deprecated" Gelbooru tag like
+    /// <c>curvy_figure</c> aliases to <c>curvy</c> with no Danbooru-side equivalent at
+    /// all), invisible to a search from the OTHER site's canonical spelling. Searching a
+    /// raw name Gelbooru itself has aliased away silently returns posts under Gelbooru's
+    /// own current tag instead — same failure mode as an unknown Danbooru alias, just
+    /// from the other direction, and only fixable by knowing Gelbooru's own table too.
+    /// </summary>
+    public async IAsyncEnumerable<BooruTagAlias> ListActiveTagAliasesAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        for (var pid = 0; ; pid += AliasPageStep)
+        {
+            var uri = new Uri($"{_baseUrl}/index.php?page=alias&s=list&pid={pid}");
+            var html = await GetStringAsync(uri, cancellationToken).ConfigureAwait(false);
+
+            var matches = AliasRowPattern.Matches(html);
+            if (matches.Count == 0)
+                yield break;
+
+            foreach (Match match in matches)
+                yield return new BooruTagAlias(DecodeTagName(match.Groups[1].Value), DecodeTagName(match.Groups[2].Value));
         }
     }
 

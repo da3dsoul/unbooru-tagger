@@ -179,4 +179,67 @@ public class GelbooruClientTests
 
         Assert.Empty(page.Posts);
     }
+
+    // Real row shape scraped from https://gelbooru.com/index.php?page=alias&s=list — no
+    // JSON dapi equivalent exists for this listing (see GelbooruClient.ListActiveTagAliasesAsync's
+    // own doc comment), so this is HTML, not JSON.
+    private const string SampleAliasListHtml =
+        """
+        <table width="100%">
+        <tr><th>Tags</th></tr>
+        <tr class="even">
+        <td><a href="index.php?page=post&amp;s=list&amp;tags=curvy_figure">curvy figure</a> <span class="tag-count">1241</span> <b>&rarr;</b> <a href="index.php?page=post&amp;s=list&amp;tags=curvy">curvy</a> <span class="tag-count">173668</span></td>
+        </tr><tr class="even">
+        <td><a href="index.php?page=post&amp;s=list&amp;tags=nude_male_clothed_female">nude male clothed female</a> <span class="tag-count">1236</span> <b>&rarr;</b> <a href="index.php?page=post&amp;s=list&amp;tags=clothed_female_nude_male">clothed female nude male</a> <span class="tag-count">106783</span></td>
+        </tr></table>
+        """;
+
+    [Fact]
+    public async Task ListActiveTagAliasesAsync_ParsesAntecedentAndConsequentFromTagsQueryParam()
+    {
+        var httpClient = new HttpClient(new SinglePageThenEmptyHttpMessageHandler(SampleAliasListHtml));
+        var client = new GelbooruClient(httpClient, new ImmediateRateLimiter());
+
+        var aliases = new List<BooruTagAlias>();
+        await foreach (var alias in client.ListActiveTagAliasesAsync())
+            aliases.Add(alias);
+
+        Assert.Equal(2, aliases.Count);
+        // Read from each link's own tags= query param (the raw, underscored booru name),
+        // not the display text (which has underscores rendered back out as spaces).
+        Assert.Contains(aliases, a => a.Antecedent == "curvy_figure" && a.Consequent == "curvy");
+        Assert.Contains(aliases, a => a.Antecedent == "nude_male_clothed_female" && a.Consequent == "clothed_female_nude_male");
+    }
+
+    [Fact]
+    public async Task ListActiveTagAliasesAsync_StopsPaging_OnPageWithNoMatchingRows()
+    {
+        var handler = new RecordingHttpMessageHandler("<html><body>no rows here</body></html>");
+        var httpClient = new HttpClient(handler);
+        var client = new GelbooruClient(httpClient, new ImmediateRateLimiter());
+
+        var aliases = new List<BooruTagAlias>();
+        await foreach (var alias in client.ListActiveTagAliasesAsync())
+            aliases.Add(alias);
+
+        Assert.Empty(aliases);
+        Assert.Single(handler.RequestUris); // stopped after the first (empty) page, no second request
+    }
+
+    [Fact]
+    public async Task ListActiveTagAliasesAsync_RequestsThePlainAliasListingPage()
+    {
+        var handler = new RecordingHttpMessageHandler("<html></html>");
+        var httpClient = new HttpClient(handler);
+        var client = new GelbooruClient(httpClient, new ImmediateRateLimiter());
+
+        await foreach (var _ in client.ListActiveTagAliasesAsync())
+        {
+        }
+
+        Assert.NotEmpty(handler.RequestUris);
+        var query = handler.RequestUris[0].Query;
+        Assert.Contains("page=alias", query);
+        Assert.Contains("s=list", query);
+    }
 }
