@@ -56,8 +56,8 @@ static async Task<(Dictionary<string, string>? TagAliases, bool Failed)> FetchTa
     }
     catch (Exception ex) when (ex is not OperationCanceledException)
     {
-        Console.Error.WriteLine($"Failed to fetch Danbooru's active tag aliases: {ex.Message}");
-        Console.Error.WriteLine($"'{commandName}' depends on this to correctly merge/reconcile cross-site tag aliases (e.g. head_pat/headpat) — exiting without making any changes rather than risk a silently wrong result. Try again once connectivity is restored.");
+        Console.Error.WriteLine($"Failed to fetch active tag aliases: {ex.Message}");
+        Console.Error.WriteLine($"'{commandName}' depends on this to correctly merge/reconcile cross-site tag aliases (e.g. head_pat/headpat, or Gelbooru's own curvy_figure/curvy) — exiting without making any changes rather than risk a silently wrong result. Try again once connectivity is restored.");
         return (null, true);
     }
 }
@@ -411,12 +411,95 @@ shrinkCacheCommand.SetAction((parseResult, cancellationToken) =>
     return Task.FromResult(0);
 });
 
+var applyOption = new Option<bool>("--apply") { Description = "Actually delete the stale rows — without this, only reports what would be removed", DefaultValueFactory = _ => false };
+
+var pruneAliasedTagsCommand = new Command(
+    "prune-aliased-tags",
+    "One-off crawl.sqlite correction: re-fetches Danbooru's and Gelbooru's current tag-alias tables and removes any tag still surveyed as its own eligible tag that one of them has since aliased away to a different canonical spelling (e.g. Gelbooru's own 'curvy_figure' -> 'curvy', or Danbooru's 'nude_male_clothed_female' vs. Gelbooru's own 'clothed_female_nude_male') — without re-running the full 'survey-tags' pass. A tag stuck like this can never earn that site's fairness-floor credit under its own identity: every post the site's search returns for it genuinely carries the ALIAS TARGET's raw tag, not the searched one, so the crawler pages through the site's entire result set for zero counted progress. Also refreshes the on-disk alias cache so 'crawl --resume'/'refresh-tags' pick up the correction. Defaults to a dry run — pass --apply to actually delete.");
+pruneAliasedTagsCommand.Options.Add(sitesOption);
+pruneAliasedTagsCommand.Options.Add(outputDirOption);
+pruneAliasedTagsCommand.Options.Add(danbooruLoginOption);
+pruneAliasedTagsCommand.Options.Add(danbooruApiKeyOption);
+pruneAliasedTagsCommand.Options.Add(gelbooruApiKeyOption);
+pruneAliasedTagsCommand.Options.Add(gelbooruUserIdOption);
+pruneAliasedTagsCommand.Options.Add(rateDanbooruOption);
+pruneAliasedTagsCommand.Options.Add(rateGelbooruOption);
+pruneAliasedTagsCommand.Options.Add(applyOption);
+pruneAliasedTagsCommand.SetAction(async (parseResult, cancellationToken) =>
+{
+    var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
+    var sites = parseResult.GetRequiredValue(sitesOption);
+    var rateDanbooru = parseResult.GetRequiredValue(rateDanbooruOption);
+    var rateGelbooru = parseResult.GetRequiredValue(rateGelbooruOption);
+    var apply = parseResult.GetRequiredValue(applyOption);
+
+    using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
+
+    var allTags = await db.GetAllSurveyedTagsAsync(cancellationToken);
+    if (allTags.Count == 0)
+    {
+        Console.Error.WriteLine("No surveyed tags found — run 'survey-tags' against this --output-dir first.");
+        return 1;
+    }
+
+    var clients = BuildClients(
+        sites, httpClient, rateDanbooru, rateGelbooru,
+        parseResult.GetValue(danbooruLoginOption), parseResult.GetValue(danbooruApiKeyOption),
+        parseResult.GetValue(gelbooruApiKeyOption), parseResult.GetValue(gelbooruUserIdOption));
+    var (tagAliases, tagAliasFetchFailed) = await FetchTagAliasesOrFailAsync("prune-aliased-tags", outputDirectory, clients, cancellationToken);
+    if (tagAliasFetchFailed)
+        return 1;
+    if (tagAliases is not { Count: > 0 })
+    {
+        Console.WriteLine("No active tag aliases found on any configured site — nothing to prune.");
+        return 0;
+    }
+
+    // Same test TagSurveyor.SurveyAsync uses to identify a stale antecedent row: a
+    // currently-surveyed tag whose own raw name is now a known alias antecedent.
+    var staleRows = allTags.Where(t => tagAliases.ContainsKey(TagCategoryNaming.RawName(t.Name))).ToList();
+    if (staleRows.Count == 0)
+    {
+        Console.WriteLine($"Checked {allTags.Count} surveyed tag(s) against {tagAliases.Count} active alias(es) across {clients.Count} site(s) — none of them are a known alias antecedent. Nothing to prune.");
+        return 0;
+    }
+
+    var reportTable = new Table().Border(TableBorder.Rounded);
+    reportTable.AddColumn("Currently its own tag");
+    reportTable.AddColumn("Actually an alias of");
+    reportTable.AddColumn("Danbooru count");
+    reportTable.AddColumn("Gelbooru count");
+    foreach (var tag in staleRows)
+    {
+        var target = tagAliases[TagCategoryNaming.RawName(tag.Name)];
+        reportTable.AddRow(tag.Name, target, tag.DanbooruCount?.ToString() ?? "-", tag.GelbooruCount?.ToString() ?? "-");
+    }
+    AnsiConsole.Write(reportTable);
+
+    if (!apply)
+    {
+        Console.WriteLine($"{staleRows.Count} tag(s) would be removed from Tags/TagProgress (dry run — pass --apply to actually delete them).");
+        return 0;
+    }
+
+    var names = staleRows.Select(t => t.Name).ToList();
+    await db.DeleteTagSurveysAsync(names, cancellationToken);
+    await db.DeleteTagProgressAsync(names, cancellationToken);
+
+    Console.WriteLine($"Removed {names.Count} tag(s) from Tags/TagProgress — 'crawl' will no longer iterate them as their own tag.");
+    Console.WriteLine($"If any already have downloaded images tagged under the old identity, reconcile them onto their alias target with:");
+    Console.WriteLine($"  refresh-tags --output-dir {outputDirectory} --only-tags {string.Join(' ', names)}");
+    Console.WriteLine("A 'crawl' run re-reads the full tag list from crawl.sqlite on every invocation (including --resume), so restarting it — no special flag needed — is enough to pick up this correction.");
+    return 0;
+});
+
 var rootCommand = new RootCommand("unbooru-tagger booru crawler (downloads Danbooru/Gelbooru images+tags directly into a trainable dataset directory)")
 {
     surveyCommand,
     crawlCommand,
     refreshCommand,
-    shrinkCacheCommand
+    shrinkCacheCommand,
+    pruneAliasedTagsCommand
 };
 
 return await rootCommand.Parse(args).InvokeAsync();

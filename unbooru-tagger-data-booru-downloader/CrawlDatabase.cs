@@ -330,6 +330,34 @@ public sealed class CrawlDatabase : IDisposable
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }, cancellationToken);
 
+    /// <summary>
+    /// Deletes every <c>TagProgress</c> row (any site, any phase) for the given tag
+    /// names — the cleanup <see cref="DeleteTagSurveysAsync"/> never did for a
+    /// newly-discovered alias antecedent, leaving its pagination/fairness-floor state
+    /// to linger forever, orphaned, once the corresponding <c>Tags</c> row is gone (see
+    /// <c>prune-aliased-tags</c> in <c>Program.cs</c>, the tool that pairs the two
+    /// deletes for a tag a fresh alias table just revealed was never its own tag).
+    /// </summary>
+    public Task DeleteTagProgressAsync(IEnumerable<string> tagNames, CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            await using var transaction = _connection.BeginTransaction();
+
+            var command = _connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "DELETE FROM TagProgress WHERE TagName = $name;";
+            var nameParam = command.Parameters.Add("$name", SqliteType.Text);
+
+            foreach (var name in tagNames)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                nameParam.Value = name;
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }, cancellationToken);
+
     /// <summary>All surveyed tags, eligible or not — the caller filters/orders as needed (see <see cref="TagEligibility"/>/<see cref="CrawlScheduling"/>).</summary>
     public Task<IReadOnlyList<TagSurveyResult>> GetAllSurveyedTagsAsync(CancellationToken cancellationToken = default) =>
         WithLockAsync(async () =>

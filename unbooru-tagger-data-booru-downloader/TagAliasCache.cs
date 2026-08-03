@@ -3,13 +3,14 @@ using System.Text.Json;
 namespace UnbooruTagger.Crawler;
 
 /// <summary>
-/// Persists Danbooru's active tag-alias table (antecedent raw name -&gt; consequent raw
-/// name — see <see cref="DanbooruClient.ListActiveTagAliasesAsync"/>) to <c>--output-dir</c>
-/// so every command that needs it (<see cref="TagRowMutations.BuildEligibleIdentities"/>,
+/// Persists the combined Danbooru+Gelbooru active tag-alias table (antecedent raw name
+/// -&gt; consequent raw name — see <see cref="DanbooruClient.ListActiveTagAliasesAsync"/>/
+/// <see cref="GelbooruClient.ListActiveTagAliasesAsync"/>) to <c>--output-dir</c> so every
+/// command that needs it (<see cref="TagRowMutations.BuildEligibleIdentities"/>,
 /// <see cref="TagSurveyor.SurveyAsync"/>) isn't forced to re-fetch tens of thousands of
-/// aliases from Danbooru on every single invocation — that used to happen even for a
-/// <c>crawl</c> run with nothing to do with aliases, and crashed the whole command outright
-/// if Danbooru's alias endpoint was ever briefly unreachable.
+/// aliases on every single invocation — that used to happen even for a <c>crawl</c> run
+/// with nothing to do with aliases, and crashed the whole command outright if a site's
+/// alias listing was ever briefly unreachable.
 ///
 /// <c>survey-tags</c> and <c>refresh-tags</c> are this cache's only writers — both
 /// unconditionally re-fetch and overwrite the on-disk cache every run, since correctness
@@ -24,24 +25,51 @@ public static class TagAliasCache
     public const string FileName = "tag_aliases.json";
 
     /// <summary>
-    /// Always re-fetches Danbooru's current active alias table and overwrites the
-    /// on-disk cache with it. Returns <see langword="null"/> if no Danbooru client is
-    /// configured this run — nothing to fetch from, nothing to cache, and callers treat
-    /// that the same as "no alias data available."
+    /// Always re-fetches every configured site's current active alias table and
+    /// overwrites the on-disk cache with the merge. Returns <see langword="null"/> only
+    /// if NEITHER a Danbooru nor a Gelbooru client is configured this run — nothing to
+    /// fetch from, nothing to cache, and callers treat that the same as "no alias data
+    /// available." On an antecedent both sites claim (rare — the two alias tables mostly
+    /// cover disjoint tags), Danbooru's own mapping wins, matching <see cref="TagSurveyor"/>'s
+    /// existing "Danbooru is the better-curated site" tie-break for category disagreements.
     /// </summary>
     public static async Task<Dictionary<string, string>?> FetchAndCacheAsync(
         string outputDirectory,
         IReadOnlyDictionary<string, IBooruClient> clients,
         CancellationToken cancellationToken = default)
     {
-        if (!clients.TryGetValue("danbooru", out var danbooruClient) || danbooruClient is not DanbooruClient danbooru)
+        var hasDanbooru = clients.TryGetValue("danbooru", out var danbooruClient) && danbooruClient is DanbooruClient;
+        var hasGelbooru = clients.TryGetValue("gelbooru", out var gelbooruClient) && gelbooruClient is GelbooruClient;
+        if (!hasDanbooru && !hasGelbooru)
             return null;
 
-        Console.WriteLine("Fetching Danbooru's active tag aliases...");
         var tagAliases = new Dictionary<string, string>(StringComparer.Ordinal);
-        await foreach (var alias in danbooru.ListActiveTagAliasesAsync(cancellationToken))
-            tagAliases[alias.Antecedent] = alias.Consequent;
-        Console.WriteLine($"Loaded {tagAliases.Count} active tag alias(es).");
+
+        if (hasGelbooru)
+        {
+            Console.WriteLine("Fetching Gelbooru's active tag aliases...");
+            var gelbooruCount = 0;
+            await foreach (var alias in ((GelbooruClient)gelbooruClient!).ListActiveTagAliasesAsync(cancellationToken))
+            {
+                tagAliases[alias.Antecedent] = alias.Consequent;
+                gelbooruCount++;
+            }
+            Console.WriteLine($"Loaded {gelbooruCount} active Gelbooru tag alias(es).");
+        }
+
+        if (hasDanbooru)
+        {
+            Console.WriteLine("Fetching Danbooru's active tag aliases...");
+            var danbooruCount = 0;
+            await foreach (var alias in ((DanbooruClient)danbooruClient!).ListActiveTagAliasesAsync(cancellationToken))
+            {
+                tagAliases[alias.Antecedent] = alias.Consequent; // Danbooru wins on overlap — fetched second so it overwrites
+                danbooruCount++;
+            }
+            Console.WriteLine($"Loaded {danbooruCount} active Danbooru tag alias(es).");
+        }
+
+        Console.WriteLine($"{tagAliases.Count} active tag alias(es) total after merging.");
 
         Directory.CreateDirectory(outputDirectory);
         var path = Path.Combine(outputDirectory, FileName);
