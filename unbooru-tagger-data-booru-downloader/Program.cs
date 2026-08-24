@@ -1,6 +1,7 @@
 using System.CommandLine;
 using Spectre.Console;
 using UnbooruTagger.Core.Dataset;
+using UnbooruTagger.Core.Vocabulary;
 using UnbooruTagger.Crawler;
 
 var outputDirOption = new Option<string>("--output-dir") { Description = "Dataset directory — gets images.bin/tag_rows.jsonl/tag_vocabulary.json (same format build-large-cache produces) plus crawl.sqlite", Required = true };
@@ -82,7 +83,7 @@ var sitesOption = new Option<string[]>("--sites")
     AllowMultipleArgumentsPerToken = true
 };
 
-var danbooruLoginOption = new Option<string?>("--danbooru-login") { Description = "Danbooru username (paired with --danbooru-api-key) for a higher rate-limit tier" };
+var danbooruLoginOption = new Option<string?>("--danbooru-login") { Description = "Danbooru username (paired with --danbooru-api-key) for a higher rate-limit tier — also required to download the image file for login-gated posts (e.g. loli/shota-adjacent tags): those posts still show up in search results without it, but come back with no file_url and get silently skipped, so an account with access to that content is needed to actually crawl those tags" };
 var danbooruApiKeyOption = new Option<string?>("--danbooru-api-key") { Description = "Danbooru API key" };
 var gelbooruApiKeyOption = new Option<string?>("--gelbooru-api-key") { Description = "Gelbooru API key — Gelbooru now requires this (paired with --gelbooru-user-id) even for read-only tag/post listing, or requests fail with 401" };
 var gelbooruUserIdOption = new Option<string?>("--gelbooru-user-id") { Description = "Gelbooru user id (paired with --gelbooru-api-key)" };
@@ -493,13 +494,361 @@ pruneAliasedTagsCommand.SetAction(async (parseResult, cancellationToken) =>
     return 0;
 });
 
+var seedVocabularyOption = new Option<string>("--seed-vocabulary")
+{
+    Description = "Path to a known-good tag_vocabulary.json to rebuild from -- e.g. a training checkpoint's own copy (Checkpoint.Save writes one byte-for-byte identical to the dataset's vocabulary at that moment). Every tag it already contains keeps its exact row index (row indices are append-only everywhere in this codebase, so an older snapshot is always a verified-correct prefix of a newer one) -- required if a checkpoint trained against this dataset exists, since renumbering those rows would silently invalidate its tag_embeddings.bin.",
+    Required = true
+};
+
+var rebuildVocabularyCommand = new Command(
+    "rebuild-vocabulary",
+    "Disaster recovery for a lost/corrupted tag_vocabulary.json: re-derives the tag<->row-index mapping and tag_rows.sqlite from crawl.sqlite's own ImageSources.Tags snapshots (the same ground truth 'refresh-tags' reconciles against), seeded from --seed-vocabulary so any tag it already knows keeps its exact row index. Defaults to a dry run that only reports what it would do -- pass --apply to actually back up and overwrite tag_rows.sqlite/tag_vocabulary.json.");
+rebuildVocabularyCommand.Options.Add(outputDirOption);
+rebuildVocabularyCommand.Options.Add(seedVocabularyOption);
+rebuildVocabularyCommand.Options.Add(minImagesOption);
+rebuildVocabularyCommand.Options.Add(applyOption);
+rebuildVocabularyCommand.SetAction(async (parseResult, cancellationToken) =>
+{
+    var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
+    var seedVocabularyPath = parseResult.GetRequiredValue(seedVocabularyOption);
+    var apply = parseResult.GetRequiredValue(applyOption);
+
+    var savedCommand = await CrawlCommandRecord.TryLoadAsync(outputDirectory, cancellationToken);
+    int minImages;
+    if (savedCommand is not null)
+    {
+        minImages = savedCommand.MinImages;
+        Console.WriteLine($"Using --min-images {minImages} from '{CrawlCommandRecord.FileName}' (the value the original crawl actually used).");
+    }
+    else
+    {
+        minImages = parseResult.GetRequiredValue(minImagesOption);
+        Console.WriteLine($"[warning] No '{CrawlCommandRecord.FileName}' found -- using --min-images {minImages}. If this doesn't match the value the original crawl used, eligible-tag membership (and therefore which tags get recovered) will be wrong.");
+    }
+
+    var pixelHeaderPath = Path.Combine(outputDirectory, "images.bin");
+    int confirmedImageCount;
+    await using (var pixelStream = File.OpenRead(pixelHeaderPath))
+    {
+        using var reader = new BinaryReader(pixelStream);
+        reader.ReadInt32(); // format magic -- not re-validated here, images.bin itself is untouched by this command
+        confirmedImageCount = reader.ReadInt32();
+    }
+
+    var seedVocabulary = TagVocabulary.Load(seedVocabularyPath);
+    Console.WriteLine($"Seed vocabulary: {seedVocabulary.Records.Count} tag(s) from '{seedVocabularyPath}'.");
+
+    using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
+    var excludedTags = await TagExclusions.LoadOrCreateAsync(outputDirectory, cancellationToken);
+    var tagAliases = await TagAliasCache.TryLoadAsync(outputDirectory, cancellationToken);
+
+    var (rows, result) = await VocabularyRebuilder.Rebuild(
+        db, seedVocabulary, minImages, excludedTags, tagAliases, confirmedImageCount,
+        onPhase: phase => Console.WriteLine(phase));
+
+    var reportTable = new Table().Border(TableBorder.Rounded);
+    reportTable.AddColumn("Metric");
+    reportTable.AddColumn("Value");
+    reportTable.AddRow("Seed tag count", result.SeedTagCount.ToString());
+    reportTable.AddRow("Final tag count", result.FinalTagCount.ToString());
+    reportTable.AddRow("Newly appended tags", (result.FinalTagCount - result.SeedTagCount).ToString());
+    reportTable.AddRow("Confirmed images (images.bin)", result.ConfirmedImageCount.ToString());
+    reportTable.AddRow("Images recovered from crawl.sqlite", result.ImagesWithSourceData.ToString());
+    reportTable.AddRow("Images with no recoverable tags", result.ImagesWithoutSourceData.ToString());
+    AnsiConsole.Write(reportTable);
+
+    if (!apply)
+    {
+        Console.WriteLine("Dry run -- nothing was written. Pass --apply to back up and overwrite tag_rows.sqlite/tag_vocabulary.json.");
+        return 0;
+    }
+
+    var tagRowsPath = Path.Combine(outputDirectory, "tag_rows.sqlite");
+    var tagRowsBackupPath = tagRowsPath + ".pre-rebuild-backup";
+    if (File.Exists(tagRowsPath) && !File.Exists(tagRowsBackupPath))
+    {
+        Console.WriteLine($"Backing up '{tagRowsPath}' to '{tagRowsBackupPath}'...");
+        File.Copy(tagRowsPath, tagRowsBackupPath);
+    }
+
+    Console.WriteLine("Writing tag_rows.sqlite...");
+    TagRowsSqliteWriter.WriteAtomically(outputDirectory, rows);
+
+    Console.WriteLine("Writing tag_vocabulary.json...");
+    seedVocabulary.Save(Path.Combine(outputDirectory, "tag_vocabulary.json"));
+
+    var deltaPath = Path.Combine(outputDirectory, "tag_vocabulary.delta.jsonl");
+    if (File.Exists(deltaPath))
+        File.Delete(deltaPath); // superseded -- the fresh snapshot above already reflects everything a delta would have replayed
+
+    Console.WriteLine("Done.");
+    return 0;
+});
+
+var pruneUnsupportedMediaCommand = new Command(
+    "prune-unsupported-media",
+    "One-off correction for images that never should have entered the dataset: 'crawl' now skips video (.webm/.mp4/.mov/.avi/.swf) and .gif URLs before ever downloading them (see UnsupportedMedia.cs -- video always fails to decode as a still image, but GIF is worse: SkiaSharp silently decodes just its first frame instead of failing, so it reads as real complete artwork with nothing marking it as wrong), but this only prevents NEW ones -- it does nothing about ones already sitting in an existing corpus from before that skip existed. This command finds every image whose only recorded source is one of those URLs and removes it entirely (crawl.sqlite rows AND its images.bin/tag_rows.sqlite pixel-cache row), strips just the bad source row off an image that also has a real source, and -- while it's already paying for a full cache rewrite -- also sweeps up pixel-cache rows with no crawl.sqlite tracking at all (e.g. left behind by a past crash that lost the tracking row without the pixel data ever being cleaned up alongside it). Defaults to a dry run -- pass --apply to actually rewrite images.bin/tag_rows.sqlite (a full streaming copy of the whole cache -- can take hours on a large corpus) and crawl.sqlite. Run rebuild-vocabulary afterward to reconcile tag_vocabulary.json's per-tag counts against the now-smaller corpus.");
+pruneUnsupportedMediaCommand.Options.Add(outputDirOption);
+pruneUnsupportedMediaCommand.Options.Add(applyOption);
+pruneUnsupportedMediaCommand.SetAction(async (parseResult, cancellationToken) =>
+{
+    var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
+    var apply = parseResult.GetRequiredValue(applyOption);
+
+    var pixelHeaderPath = Path.Combine(outputDirectory, "images.bin");
+    int confirmedImageCount;
+    await using (var pixelStream = File.OpenRead(pixelHeaderPath))
+    {
+        using var reader = new BinaryReader(pixelStream);
+        reader.ReadInt32(); // format magic -- not re-validated here, images.bin itself is untouched by this read
+        confirmedImageCount = reader.ReadInt32();
+    }
+
+    using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
+
+    Console.WriteLine("Scanning ImageSources for video/GIF-sourced images...");
+    var groups = await db.GetUnsupportedMediaGroupsAsync(cancellationToken);
+    var soleSourceGroups = groups.Where(g => g.UnsupportedSourceCount == g.TotalSourceCount).ToList();
+    var mixedSourceGroups = groups.Where(g => g.UnsupportedSourceCount < g.TotalSourceCount).ToList();
+    var soleSourceMd5s = soleSourceGroups.Select(g => g.Md5).ToHashSet(StringComparer.Ordinal);
+
+    var badRows = await db.GetUnsupportedMediaSourceRowsAsync(cancellationToken);
+    var extraSourcesToStrip = badRows
+        .Where(r => !soleSourceMd5s.Contains(r.Md5))
+        .Select(r => (r.Site, r.PostId))
+        .ToList();
+
+    Console.WriteLine("Scanning for pixel-cache rows with no crawl.sqlite tracking...");
+    var trackedCacheRows = await db.GetAllCacheRowIndicesAsync(cancellationToken);
+    var orphanedCacheRows = Enumerable.Range(0, confirmedImageCount).Where(i => !trackedCacheRows.Contains(i)).ToList();
+
+    var rowsToDrop = soleSourceGroups.Select(g => g.CacheRowIndex).Concat(orphanedCacheRows).ToHashSet();
+
+    var reportTable = new Table().Border(TableBorder.Rounded);
+    reportTable.AddColumn("Finding");
+    reportTable.AddColumn("Count");
+    reportTable.AddRow("Images sourced ONLY from video/GIF URLs (fully removed)", soleSourceGroups.Count.ToString());
+    reportTable.AddRow("Images with a mix of sources (bad source row(s) stripped, image kept)", mixedSourceGroups.Count.ToString());
+    reportTable.AddRow("  ...of which, bad source rows to strip", extraSourcesToStrip.Count.ToString());
+    reportTable.AddRow("Untracked pixel-cache rows (no crawl.sqlite row at all)", orphanedCacheRows.Count.ToString());
+    reportTable.AddRow("Total pixel-cache rows to drop", rowsToDrop.Count.ToString());
+    reportTable.AddRow("Pixel-cache rows before/after", $"{confirmedImageCount} / {confirmedImageCount - rowsToDrop.Count}");
+    AnsiConsole.Write(reportTable);
+
+    if (rowsToDrop.Count == 0 && extraSourcesToStrip.Count == 0)
+    {
+        Console.WriteLine("Nothing to prune.");
+        return 0;
+    }
+
+    if (!apply)
+    {
+        Console.WriteLine("Dry run -- nothing was changed. Pass --apply to actually rewrite images.bin/tag_rows.sqlite/crawl.sqlite.");
+        return 0;
+    }
+
+    var oldToNewCacheRowIndex = (IReadOnlyDictionary<int, int>)new Dictionary<int, int>();
+    if (rowsToDrop.Count > 0)
+    {
+        Console.WriteLine($"Compacting the pixel cache -- dropping {rowsToDrop.Count} of {confirmedImageCount} rows. This rewrites the entire cache and can take a long time on a large corpus.");
+        var compactionResult = AnsiConsole.Progress()
+            .Columns(ProgressBarColumns.Default)
+            .Start(ctx =>
+            {
+                var task = ctx.AddTask("Compacting images.bin/tag_rows.sqlite...");
+                task.MaxValue = confirmedImageCount;
+                return PreprocessedDatasetCacheCompactor.DropRows(
+                    outputDirectory,
+                    rowsToDrop,
+                    onProgress: (processed, total) =>
+                    {
+                        task.MaxValue = total;
+                        task.Value = processed;
+                    },
+                    cancellationToken);
+            });
+        oldToNewCacheRowIndex = compactionResult.OldToNewIndex;
+        Console.WriteLine($"Cache compacted: {compactionResult.OriginalCount} -> {compactionResult.KeptCount} rows.");
+    }
+
+    Console.WriteLine("Applying crawl.sqlite changes...");
+    await db.ApplyUnsupportedMediaPruneAsync(soleSourceMd5s, extraSourcesToStrip, oldToNewCacheRowIndex, cancellationToken);
+
+    Console.WriteLine("Done. Run rebuild-vocabulary against this --output-dir to reconcile tag_vocabulary.json's per-tag counts with the now-smaller corpus.");
+    return 0;
+});
+
+var stagingDirOption = new Option<string>("--staging-dir")
+{
+    Description = "Fresh directory to build the recovered pixel cache into -- must not be --output-dir. Never touched by anything except this command; left exactly as-is between runs until --finalize succeeds, so it's always safe to interrupt and re-run.",
+    Required = true
+};
+var recoveryConcurrencyOption = new Option<int>("--concurrency") { Description = "How many images to download+decode+encode at once during the slow, network-bound re-download phase", DefaultValueFactory = _ => 8 };
+var finalizeOption = new Option<bool>("--finalize")
+{
+    Description = "Only after the staging cache is fully built and verified: swap it into --output-dir (the damaged images.bin/tag_rows.sqlite there are renamed to '*.broken-pre-recovery.bak', never deleted automatically) and reconcile crawl.sqlite to match. Without this flag, only builds/resumes the staging cache and reports status -- never touches --output-dir beyond reading crawl.sqlite.",
+    DefaultValueFactory = _ => false
+};
+
+var recoverCorruptedImagesCommand = new Command(
+    "recover-corrupted-images",
+    "Disaster recovery for a damaged images.bin/tag_rows.sqlite -- e.g. a prune-unsupported-media compaction that reported success at the right final row count while actually writing empty 0x0 records for part of the corpus (a real incident this command exists to recover from; see PreprocessedDatasetCacheCompactor's own doc comments for the write-side verification gap that let it happen). Rebuilds a fresh, independently-verified pixel cache in --staging-dir: copies whatever's still genuinely valid at the front of the damaged cache (fast, local, read-only against --output-dir), then re-downloads everything past that point from crawl.sqlite's own recorded source URLs for each image (slow, network-bound -- can take a very long time re-fetching a large fraction of a corpus; MD5-verified against the identity already on record before trusting any download, so a site serving different content at an old URL now can't silently reintroduce a wrong image under someone else's identity). Resumable at every stage. --output-dir's crawl.sqlite is read-only unless --finalize is passed.");
+recoverCorruptedImagesCommand.Options.Add(outputDirOption);
+recoverCorruptedImagesCommand.Options.Add(stagingDirOption);
+recoverCorruptedImagesCommand.Options.Add(danbooruLoginOption);
+recoverCorruptedImagesCommand.Options.Add(danbooruApiKeyOption);
+recoverCorruptedImagesCommand.Options.Add(gelbooruApiKeyOption);
+recoverCorruptedImagesCommand.Options.Add(gelbooruUserIdOption);
+recoverCorruptedImagesCommand.Options.Add(rateDanbooruOption);
+recoverCorruptedImagesCommand.Options.Add(rateGelbooruOption);
+recoverCorruptedImagesCommand.Options.Add(recoveryConcurrencyOption);
+recoverCorruptedImagesCommand.Options.Add(finalizeOption);
+recoverCorruptedImagesCommand.SetAction(async (parseResult, cancellationToken) =>
+{
+    var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
+    var stagingDirectory = parseResult.GetRequiredValue(stagingDirOption);
+    var rateDanbooru = parseResult.GetRequiredValue(rateDanbooruOption);
+    var rateGelbooru = parseResult.GetRequiredValue(rateGelbooruOption);
+    var concurrency = parseResult.GetRequiredValue(recoveryConcurrencyOption);
+    var finalize = parseResult.GetRequiredValue(finalizeOption);
+
+    if (string.Equals(Path.GetFullPath(stagingDirectory), Path.GetFullPath(outputDirectory), StringComparison.Ordinal))
+    {
+        Console.Error.WriteLine("--staging-dir must not be the same directory as --output-dir.");
+        return 1;
+    }
+
+    var brokenPixelPath = Path.Combine(outputDirectory, "images.bin");
+    int inputSize;
+    using (var headerStream = File.OpenRead(brokenPixelPath))
+    using (var headerReader = new BinaryReader(headerStream))
+    {
+        headerReader.ReadInt32(); // magic
+        headerReader.ReadInt32(); // row count -- not trusted here, DetectValidPrefixLength below is the source of truth
+        inputSize = headerReader.ReadInt32();
+    }
+
+    using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
+
+    Console.WriteLine("Computing recovery plan from crawl.sqlite...");
+    var plan = await DatasetRecovery.ComputePlanAsync(db, cancellationToken);
+    Console.WriteLine($"Target: {plan.OrderedMd5s.Count} images ({plan.SoleSourceMd5s.Count} sole-unsupported-media-source excluded, {plan.ExtraSourcesToStrip.Count} extra bad source row(s) to strip on finalize).");
+
+    // --output-dir is never written to by this command (the whole point is recovering
+    // INTO --staging-dir without risking further damage there), so the valid-prefix
+    // length can never change between runs of the same recovery -- cached in
+    // --staging-dir so a restart (this command is meant to be interrupted and re-run
+    // freely) doesn't re-pay a full read of the damaged cache's multi-terabyte valid
+    // portion just to re-derive an answer that can only ever come out the same.
+    Directory.CreateDirectory(stagingDirectory);
+    var validPrefixCachePath = Path.Combine(stagingDirectory, "valid-prefix-length.txt");
+    int validPrefixLength;
+    if (File.Exists(validPrefixCachePath) && int.TryParse(File.ReadAllText(validPrefixCachePath), out var cachedValidPrefixLength))
+    {
+        validPrefixLength = cachedValidPrefixLength;
+        Console.WriteLine($"Using cached valid-prefix length from a prior run: {validPrefixLength} row(s).");
+    }
+    else
+    {
+        Console.WriteLine("Checking how much of the damaged cache still has real pixel content...");
+        validPrefixLength = PreprocessedDatasetCacheCompactor.DetectValidPrefixLength(outputDirectory);
+        File.WriteAllText(validPrefixCachePath, validPrefixLength.ToString());
+    }
+    Console.WriteLine($"{validPrefixLength} of {plan.OrderedMd5s.Count} row(s) still valid; {plan.OrderedMd5s.Count - validPrefixLength} need re-downloading.");
+
+    if (validPrefixLength > 0)
+    {
+        Console.WriteLine("Copying the still-valid prefix into the staging cache (source is never modified)...");
+        AnsiConsole.Progress().Columns(ProgressBarColumns.Default).Start(ctx =>
+        {
+            var task = ctx.AddTask("Copying valid rows...");
+            task.MaxValue = validPrefixLength;
+            PreprocessedDatasetCacheCompactor.CopyPrefix(
+                outputDirectory, stagingDirectory, validPrefixLength,
+                onProgress: (done, total) => { task.MaxValue = total; task.Value = done; },
+                cancellationToken);
+        });
+    }
+
+    Console.WriteLine("Re-downloading the rest from their recorded source URLs -- this can take a very long time. Safe to interrupt (Ctrl-C) and re-run; it resumes automatically.");
+    var clients = BuildClients(
+        ["danbooru", "gelbooru"], httpClient, rateDanbooru, rateGelbooru,
+        parseResult.GetValue(danbooruLoginOption), parseResult.GetValue(danbooruApiKeyOption),
+        parseResult.GetValue(gelbooruApiKeyOption), parseResult.GetValue(gelbooruUserIdOption));
+    var rateLimiterBySite = clients.ToDictionary(kv => kv.Key, kv => kv.Value.RateLimiter, StringComparer.Ordinal);
+    var ratesBySite = new Dictionary<string, double> { ["danbooru"] = rateDanbooru, ["gelbooru"] = rateGelbooru }
+        .Where(kv => clients.ContainsKey(kv.Key))
+        .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
+    var sourceUrls = await db.GetAllImageSourceUrlsAsync(cancellationToken);
+
+    var fillResult = await AnsiConsole.Progress().Columns(ProgressBarColumns.Default).StartAsync(async ctx =>
+    {
+        var task = ctx.AddTask("Re-downloading missing rows...");
+        task.MaxValue = plan.OrderedMd5s.Count;
+        return await DatasetRecovery.FillRemainingAsync(
+            stagingDirectory, outputDirectory, inputSize, plan.OrderedMd5s, sourceUrls, httpClient, rateLimiterBySite, ratesBySite, concurrency,
+            onProgress: (done, total) => { task.MaxValue = total; task.Value = done; },
+            cancellationToken);
+    });
+
+    Console.WriteLine($"Recovered {fillResult.WrittenMd5s.Count} of {plan.OrderedMd5s.Count} images ({fillResult.PermanentlyFailedMd5s.Count} permanently unrecoverable -- see '{Path.Combine(stagingDirectory, DatasetRecovery.FailuresLogFileName)}').");
+
+    Console.WriteLine("Verifying the staging cache (row count + full structural scan)...");
+    var stagingValidCount = PreprocessedDatasetCacheCompactor.DetectValidPrefixLength(stagingDirectory);
+    if (stagingValidCount != fillResult.WrittenMd5s.Count)
+    {
+        Console.Error.WriteLine($"Staging cache at '{stagingDirectory}' has {stagingValidCount} row(s) with real content but expected {fillResult.WrittenMd5s.Count} -- NOT finalizing. Something is wrong; investigate before re-running.");
+        return 1;
+    }
+    Console.WriteLine("Staging cache verified: every row has real content and the count matches.");
+
+    if (!finalize)
+    {
+        Console.WriteLine($"Staging cache is ready at '{stagingDirectory}'. Re-run this same command with --finalize to swap it into '{outputDirectory}' and reconcile crawl.sqlite.");
+        return 0;
+    }
+
+    Console.WriteLine("Finalizing: swapping the staging cache into --output-dir...");
+    var brokenTagRowPath = Path.Combine(outputDirectory, "tag_rows.sqlite");
+    var backupPixelPath = brokenPixelPath + ".broken-pre-recovery.bak";
+    var backupTagRowPath = brokenTagRowPath + ".broken-pre-recovery.bak";
+    // No overwrite: a pre-existing backup means an earlier --finalize attempt already
+    // got this far and something went wrong after -- investigate rather than silently
+    // clobber whatever that attempt preserved.
+    File.Move(brokenPixelPath, backupPixelPath);
+    File.Move(brokenTagRowPath, backupTagRowPath);
+    File.Move(Path.Combine(stagingDirectory, "images.bin"), brokenPixelPath);
+    File.Move(Path.Combine(stagingDirectory, "tag_rows.sqlite"), brokenTagRowPath);
+    Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); // see PreprocessedDatasetCacheCompactor.SwapIn's own doc comment on why this matters after a rename-based swap
+    var resumeIndexPath = Path.Combine(outputDirectory, "images.bin.resume");
+    var stagingResumeIndexPath = Path.Combine(stagingDirectory, "images.bin.resume");
+    if (File.Exists(stagingResumeIndexPath))
+        File.Move(stagingResumeIndexPath, resumeIndexPath, overwrite: true);
+    else if (File.Exists(resumeIndexPath))
+        File.Delete(resumeIndexPath);
+
+    Console.WriteLine("Reconciling crawl.sqlite...");
+    var md5sToDelete = plan.SoleSourceMd5s.Concat(fillResult.PermanentlyFailedMd5s).ToList();
+    var newCacheRowIndexByMd5 = fillResult.WrittenMd5s
+        .Select((md5, index) => (md5, index))
+        .ToDictionary(t => t.md5, t => t.index, StringComparer.Ordinal);
+    var extraSourcesToStrip = plan.ExtraSourcesToStrip.Select(s => (s.Site, s.PostId)).ToList();
+    await db.ApplyRecoveryReconciliationAsync(md5sToDelete, extraSourcesToStrip, newCacheRowIndexByMd5, cancellationToken);
+
+    Console.WriteLine($"Done. '{backupPixelPath}' and '{backupTagRowPath}' hold the damaged pre-recovery files -- kept, not deleted; remove them yourself once you've confirmed the recovery looks right. Run rebuild-vocabulary against this --output-dir to reconcile tag_vocabulary.json's per-tag counts.");
+    return 0;
+});
+
 var rootCommand = new RootCommand("unbooru-tagger booru crawler (downloads Danbooru/Gelbooru images+tags directly into a trainable dataset directory)")
 {
     surveyCommand,
     crawlCommand,
     refreshCommand,
     shrinkCacheCommand,
-    pruneAliasedTagsCommand
+    pruneAliasedTagsCommand,
+    rebuildVocabularyCommand,
+    pruneUnsupportedMediaCommand,
+    recoverCorruptedImagesCommand
 };
 
 return await rootCommand.Parse(args).InvokeAsync();

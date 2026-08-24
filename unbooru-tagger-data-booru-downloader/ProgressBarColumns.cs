@@ -113,7 +113,13 @@ public static class ProgressBarColumns
 
         void ReportTagProgress(string tagName, long completed, long target, long duplicates)
         {
-            tagProgressTask.Description = Markup.Escape($"[{site}] Current tag: {tagName} ({completed}/{target}/{duplicates} dupes)");
+            // Literally "new + dupe = actual total / max images", not a single
+            // pre-combined number — new and dupe read very differently (a tag that's
+            // mostly re-finding known duplicates is a very different situation from one
+            // genuinely turning up fresh images), so both stay visible instead of being
+            // collapsed into one number or buried in a "(N dupes)" aside.
+            var actualTotal = completed + duplicates;
+            tagProgressTask.Description = Markup.Escape($"[{site}] Current tag: {tagName} ({completed} new + {duplicates} dupes = {actualTotal} / {target})");
             tagProgressTask.MaxValue = target;
             // A tag can already be over target the moment its phase starts (e.g. the
             // negative top-up's "current negatives" is corpus-wide arithmetic, not

@@ -212,7 +212,16 @@ public sealed class TagVocabulary
     public void Save(string path)
     {
         var json = JsonSerializer.Serialize(_byRow, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(path, json);
+
+        // Written under a temp name first and only swapped into place with a rename —
+        // File.Move onto an existing path is atomic on the same volume. A plain
+        // File.WriteAllText(path, ...) truncates path immediately on open, so a crash
+        // mid-write (or mid-flush) leaves a truncated/empty file with no way back; this
+        // way a crash at any point before the Move leaves the previous, still-valid
+        // snapshot untouched.
+        var tempPath = path + ".tmp";
+        File.WriteAllText(tempPath, json);
+        File.Move(tempPath, path, overwrite: true);
 
         // Everything pending is now captured in the base snapshot, so it shouldn't be
         // re-appended by a later SaveDelta call.

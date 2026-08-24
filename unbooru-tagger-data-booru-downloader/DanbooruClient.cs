@@ -108,8 +108,17 @@ public sealed class DanbooruClient(HttpClient http, IRateLimiter rateLimiter, st
             var id = element.GetProperty("id").GetInt64();
             lastRawId = id;
 
-            // Deleted/flagged/banned posts can be missing md5 or file_url entirely —
-            // skip rather than throw, since one bad post shouldn't kill an entire page.
+            // Deleted/flagged/banned posts can be missing md5 or file_url entirely — skip
+            // rather than throw, since one bad post shouldn't kill an entire page. The far
+            // more common source of a missing file_url, though, is login-gated content
+            // (verified live: an unauthenticated request for a loli/shota-adjacent tag can
+            // come back with 100% of a page's posts missing file_url, tag_string intact —
+            // the post itself isn't gone, just the file, unless login/apiKey names an
+            // account with access). rawCount (not posts.Count) driving nextCursor below is
+            // what keeps pagination correct either way, but a tag whose matching posts are
+            // entirely gated for the calling account still ends up with zero credited
+            // images and a legitimately-exhausted Done — no fix here recovers that; it
+            // needs an account with access, passed via login/apiKey.
             if (!element.TryGetProperty("md5", out var md5Prop) || md5Prop.ValueKind != JsonValueKind.String)
                 continue;
             if (!element.TryGetProperty("file_url", out var fileUrlProp) || fileUrlProp.ValueKind != JsonValueKind.String)

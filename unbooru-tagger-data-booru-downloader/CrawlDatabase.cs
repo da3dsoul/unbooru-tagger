@@ -459,6 +459,82 @@ public sealed class CrawlDatabase : IDisposable
             return (IReadOnlyList<(string Md5, int CacheRowIndex, ulong PHash)>)results;
         }, cancellationToken);
 
+    /// <summary>
+    /// Every known source's raw tag snapshot for every image in one bulk scan, keyed by
+    /// <c>Md5</c> — the same data <see cref="GetImageSourceSnapshotsAsync"/> returns one
+    /// image at a time, but without the per-image round trip, for a caller (<c>rebuild-
+    /// vocabulary</c>'s recovery pass) that needs to walk every image in the corpus once
+    /// rather than look up a specific one. A <see langword="null"/> <c>Tags</c> means
+    /// "never captured" (see <see cref="ImageSourceSnapshot"/>'s own doc comment) —
+    /// callers must not treat that the same as a confirmed-empty tag list.
+    /// </summary>
+    public Task<IReadOnlyList<(string Md5, IReadOnlyList<string>? Tags)>> GetAllImageSourceTagsAsync(CancellationToken cancellationToken = default, Action<int>? onProgress = null) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = "SELECT Md5, Tags FROM ImageSources;";
+            var results = new List<(string, IReadOnlyList<string>?)>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var tags = reader.IsDBNull(1) ? null : JsonSerializer.Deserialize<List<string>>(reader.GetString(1));
+                results.Add((reader.GetString(0), tags));
+                if (onProgress is not null && results.Count % ImageLoadProgressInterval == 0)
+                    onProgress(results.Count);
+            }
+
+            onProgress?.Invoke(results.Count);
+            return (IReadOnlyList<(string Md5, IReadOnlyList<string>? Tags)>)results;
+        }, cancellationToken);
+
+    /// <summary>
+    /// Every <c>ImageSources</c> row's raw download URL, keyed by <c>Md5</c> — the
+    /// candidate source(s) a dataset-recovery pass can re-download a lost image from,
+    /// most-recently-observed first within a site (<c>FetchedAt</c> descending is the
+    /// best available proxy for "still likely reachable" this table has). Deliberately
+    /// NOT sorted by site here -- a Md5 with sources on both sites needs that choice
+    /// made per-image, at scheduling time, weighted by each site's actual configured
+    /// rate limit so both stay saturated concurrently (see <see cref="DatasetRecovery"/>'s
+    /// site round-robin); baking in a fixed site preference this early would make one
+    /// site's rate limiter the effective ceiling on the WHOLE re-download phase's
+    /// throughput whenever a Md5 happens to have a source on that preferred site,
+    /// leaving the other site's capacity unused. One bulk streamed scan (matching
+    /// <see cref="GetAllImageSourceTagsAsync"/>'s own shape) rather than a per-Md5
+    /// lookup — a recovery pass needs this for every image it's rebuilding at once,
+    /// which for a large loss can be millions of rows, far more than a WHERE...IN
+    /// clause (or one query per row) is a reasonable way to ask for.
+    /// </summary>
+    public Task<IReadOnlyDictionary<string, IReadOnlyList<(string Site, string PostUrl)>>> GetAllImageSourceUrlsAsync(CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            // No ORDER BY here -- FetchedAt has no index, so sorting all 8.5M+ rows in
+            // SQLite forces a full disk-backed temp-btree sort (confirmed for real: this
+            // used to carry an `ORDER BY FetchedAt DESC` and a cold-cache run of this
+            // query took well over an hour and was still reading MORE bytes than
+            // crawl.sqlite's own file size, i.e. thrashing, not just slow). Each Md5's
+            // handful of candidates is sorted in memory below instead -- free by
+            // comparison at that size.
+            var command = _connection.CreateCommand();
+            command.CommandText = "SELECT Md5, Site, PostUrl, FetchedAt FROM ImageSources;";
+            var results = new Dictionary<string, List<(string Site, string PostUrl, DateTimeOffset FetchedAt)>>(StringComparer.Ordinal);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var md5 = reader.GetString(0);
+                if (!results.TryGetValue(md5, out var list))
+                    results[md5] = list = [];
+                list.Add((reader.GetString(1), reader.GetString(2), DateTimeOffset.Parse(reader.GetString(3))));
+            }
+
+            return (IReadOnlyDictionary<string, IReadOnlyList<(string Site, string PostUrl)>>)results.ToDictionary(
+                kv => kv.Key,
+                kv => (IReadOnlyList<(string Site, string PostUrl)>)kv.Value
+                    .OrderByDescending(s => s.FetchedAt)
+                    .Select(s => (s.Site, s.PostUrl))
+                    .ToList(),
+                StringComparer.Ordinal);
+        }, cancellationToken);
+
     /// <summary>Every surveyed tag's durable <c>CombinedPositiveCount</c>, for seeding the in-memory counters a crawl run updates live and only checkpoints periodically (see <see cref="CommitPendingImagesAsync"/>).</summary>
     public Task<IReadOnlyDictionary<string, int>> GetAllCombinedPositiveCountsAsync(CancellationToken cancellationToken = default) =>
         WithLockAsync(async () =>
@@ -470,6 +546,272 @@ public sealed class CrawlDatabase : IDisposable
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 results[reader.GetString(0)] = reader.GetInt32(1);
             return (IReadOnlyDictionary<string, int>)results;
+        }, cancellationToken);
+
+    /// <summary>
+    /// One Md5's disposition for <c>prune-unsupported-media</c>: <see cref="TotalSourceCount"/>
+    /// vs. <see cref="UnsupportedSourceCount"/> tells the caller whether EVERY recorded
+    /// source for this image is a video/GIF URL (equal — the image itself needs the
+    /// full drop-from-cache treatment) or just some of them (image is real and stays;
+    /// only its bad source rows get stripped). <see cref="CacheRowIndex"/> is always
+    /// populated — every <c>ImageSources</c> row's <c>Md5</c> has a corresponding
+    /// <c>Images</c> row by construction (see <see cref="CommitPendingImagesAsync"/> and
+    /// <see cref="DatasetCrawler.MergeDuplicateTags"/>, the only two places that ever
+    /// insert into <c>ImageSources</c>, both of which require the Md5 already be — or
+    /// simultaneously become — a real <c>Images</c> row).
+    /// </summary>
+    public sealed record UnsupportedMediaGroup(string Md5, int CacheRowIndex, int TotalSourceCount, int UnsupportedSourceCount);
+
+    /// <summary>
+    /// Every image with at least one video/GIF-URL source, grouped by <c>Md5</c> — the
+    /// first of the two queries <c>prune-unsupported-media</c> needs (the second,
+    /// <see cref="GetUnsupportedMediaSourceRowsAsync"/>, gets the actual bad rows to
+    /// delete for the images that aren't dropped entirely). One pass over
+    /// <c>ImageSources</c>; cheap even at millions of rows since only genuinely
+    /// matching groups are ever materialized.
+    ///
+    /// Groups (and filters via <c>HAVING</c>) BEFORE joining against <c>Images</c>,
+    /// deliberately -- joining first (one <c>Images</c> lookup per <c>ImageSources</c>
+    /// row, i.e. millions of them, almost all for groups that end up discarded by
+    /// <c>HAVING</c> anyway) versus joining the ~tens-of-thousands-row post-<c>HAVING</c>
+    /// result instead is the difference between one full-table aggregate scan and that
+    /// same scan PLUS millions of extra B-tree lookups. Confirmed for real: under a cold
+    /// page cache, the join-first version was still reading MORE total bytes than
+    /// crawl.sqlite's own file size after 90 minutes and hadn't finished -- classic
+    /// thrashing, not just slow disk.
+    /// </summary>
+    public Task<IReadOnlyList<UnsupportedMediaGroup>> GetUnsupportedMediaGroupsAsync(CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText =
+                $"""
+                SELECT g.Md5, i.CacheRowIndex, g.Total, g.Unsupported
+                FROM (
+                    SELECT Md5, COUNT(*) AS Total,
+                           SUM(CASE WHEN {UnsupportedMedia.BuildSqlLikeClause("PostUrl")} THEN 1 ELSE 0 END) AS Unsupported
+                    FROM ImageSources
+                    GROUP BY Md5
+                    HAVING Unsupported > 0
+                ) g
+                JOIN Images i ON i.Md5 = g.Md5;
+                """;
+            var results = new List<UnsupportedMediaGroup>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                results.Add(new UnsupportedMediaGroup(
+                    reader.GetString(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetInt32(3)));
+            }
+            return (IReadOnlyList<UnsupportedMediaGroup>)results;
+        }, cancellationToken);
+
+    /// <summary>Every individual <c>ImageSources</c> row whose <c>PostUrl</c> is a video/GIF URL — row-level detail <see cref="GetUnsupportedMediaGroupsAsync"/> doesn't carry, needed to strip specific rows off an image that also has a real source (an image being fully dropped instead gets every one of its source rows deleted in bulk by Md5, so those don't need picking out individually).</summary>
+    public Task<IReadOnlyList<(string Md5, string Site, long PostId)>> GetUnsupportedMediaSourceRowsAsync(CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = $"SELECT Md5, Site, PostId FROM ImageSources WHERE {UnsupportedMedia.BuildSqlLikeClause("PostUrl")};";
+            var results = new List<(string, string, long)>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                results.Add((reader.GetString(0), reader.GetString(1), reader.GetInt64(2)));
+            return (IReadOnlyList<(string Md5, string Site, long PostId)>)results;
+        }, cancellationToken);
+
+    /// <summary>
+    /// Every currently-tracked pixel-cache row index — for a caller (<c>prune-unsupported-media</c>)
+    /// that needs to find the OPPOSITE gap: cache rows <c>images.bin</c> actually holds
+    /// (0..confirmedImageCount-1, read from the cache's own header) with no
+    /// <c>Images</c> row at all, e.g. left behind by a past crash that lost its
+    /// crawl.sqlite tracking without the pixel data itself ever being cleaned up
+    /// alongside it (see the 2026-08-04 vocabulary-corruption recovery this same corpus
+    /// went through). Loaded as one in-memory set rather than a per-index existence
+    /// query — cheaper at a multi-million-row corpus, and the whole point of this query
+    /// is a single index-space diff the caller does once anyway.
+    /// </summary>
+    public Task<IReadOnlySet<int>> GetAllCacheRowIndicesAsync(CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = "SELECT CacheRowIndex FROM Images;";
+            var results = new HashSet<int>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                results.Add(reader.GetInt32(0));
+            return (IReadOnlySet<int>)results;
+        }, cancellationToken);
+
+    /// <summary>
+    /// Applies a <c>prune-unsupported-media --apply</c> run's full set of crawl.sqlite
+    /// changes in one transaction: strips the specific bad-source rows off images that
+    /// also have a real source (<paramref name="extraSourcesToStrip"/>), fully deletes
+    /// every source and the <c>Images</c> row for images being dropped entirely
+    /// (<paramref name="soleSourceMd5sToDelete"/> — their pixel-cache rows are the
+    /// caller's separate <c>PreprocessedDatasetCacheCompactor</c> concern, not
+    /// this database's), and remaps every surviving image's <c>CacheRowIndex</c> to
+    /// match the now-compacted cache (<paramref name="oldToNewCacheRowIndex"/> — from
+    /// that same compaction call; empty if nothing was ever dropped from the cache
+    /// itself, e.g. a run that only found extra-source rows to strip).
+    ///
+    /// The remap is a bulk temp-table join rather than one <c>UPDATE</c> per row: with a
+    /// multi-million-row <c>Images</c> table and drops scattered roughly uniformly
+    /// across the whole corpus's history, nearly every surviving row's index shifts by
+    /// some amount, so "one UPDATE per changed row" and "one UPDATE per row, period" end
+    /// up costing about the same here anyway — the temp table at least turns that into a
+    /// single indexed join instead of millions of separate round trips.
+    /// </summary>
+    public Task ApplyUnsupportedMediaPruneAsync(
+        IReadOnlyCollection<string> soleSourceMd5sToDelete,
+        IReadOnlyCollection<(string Site, long PostId)> extraSourcesToStrip,
+        IReadOnlyDictionary<int, int> oldToNewCacheRowIndex,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            await using var transaction = _connection.BeginTransaction();
+
+            var deleteExtra = _connection.CreateCommand();
+            deleteExtra.Transaction = transaction;
+            deleteExtra.CommandText = "DELETE FROM ImageSources WHERE Site = $site AND PostId = $postId;";
+            var extraSite = deleteExtra.Parameters.Add("$site", SqliteType.Text);
+            var extraPostId = deleteExtra.Parameters.Add("$postId", SqliteType.Integer);
+            foreach (var (site, postId) in extraSourcesToStrip)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                extraSite.Value = site;
+                extraPostId.Value = postId;
+                await deleteExtra.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            var deleteSources = _connection.CreateCommand();
+            deleteSources.Transaction = transaction;
+            deleteSources.CommandText = "DELETE FROM ImageSources WHERE Md5 = $md5;";
+            var delSourcesMd5 = deleteSources.Parameters.Add("$md5", SqliteType.Text);
+
+            var deleteImage = _connection.CreateCommand();
+            deleteImage.Transaction = transaction;
+            deleteImage.CommandText = "DELETE FROM Images WHERE Md5 = $md5;";
+            var delImageMd5 = deleteImage.Parameters.Add("$md5", SqliteType.Text);
+
+            foreach (var md5 in soleSourceMd5sToDelete)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                delSourcesMd5.Value = md5;
+                await deleteSources.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                delImageMd5.Value = md5;
+                await deleteImage.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (oldToNewCacheRowIndex.Count > 0)
+            {
+                var createTemp = _connection.CreateCommand();
+                createTemp.Transaction = transaction;
+                createTemp.CommandText = "CREATE TEMP TABLE _RowRemap (OldIndex INTEGER PRIMARY KEY, NewIndex INTEGER NOT NULL);";
+                await createTemp.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+
+                var insertRemap = _connection.CreateCommand();
+                insertRemap.Transaction = transaction;
+                insertRemap.CommandText = "INSERT INTO _RowRemap (OldIndex, NewIndex) VALUES ($old, $new);";
+                var oldParam = insertRemap.Parameters.Add("$old", SqliteType.Integer);
+                var newParam = insertRemap.Parameters.Add("$new", SqliteType.Integer);
+                foreach (var (oldIndex, newIndex) in oldToNewCacheRowIndex)
+                {
+                    if (oldIndex == newIndex)
+                        continue; // no-op remap -- skip, cheaper than an UPDATE that changes nothing
+                    cancellationToken.ThrowIfCancellationRequested();
+                    oldParam.Value = oldIndex;
+                    newParam.Value = newIndex;
+                    await insertRemap.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                var remapImages = _connection.CreateCommand();
+                remapImages.Transaction = transaction;
+                remapImages.CommandText =
+                    """
+                    UPDATE Images
+                    SET CacheRowIndex = (SELECT NewIndex FROM _RowRemap WHERE OldIndex = Images.CacheRowIndex)
+                    WHERE CacheRowIndex IN (SELECT OldIndex FROM _RowRemap);
+                    """;
+                await remapImages.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+
+                var dropTemp = _connection.CreateCommand();
+                dropTemp.Transaction = transaction;
+                dropTemp.CommandText = "DROP TABLE _RowRemap;";
+                await dropTemp.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }, cancellationToken);
+
+    /// <summary>
+    /// The <c>recover-corrupted-images</c> equivalent of <see cref="ApplyUnsupportedMediaPruneAsync"/>:
+    /// applied once a rebuilt staging cache has been fully verified and swapped into
+    /// place, reconciling crawl.sqlite to match it. Differs from the ordinary prune path
+    /// in two ways a straight compaction never has to deal with: <paramref name="md5sToDelete"/>
+    /// covers BOTH the usual sole-unsupported-media-source images AND any that turned
+    /// out permanently unrecoverable during the rebuild (no candidate source still
+    /// served matching content) -- either way, that Md5 has no row in the rebuilt cache
+    /// at all, so its crawl.sqlite bookkeeping must go too, not just get remapped. And
+    /// the remap itself is keyed by <c>Md5</c> (<paramref name="newCacheRowIndexByMd5"/>)
+    /// rather than by an old-&gt;new index formula, since a rebuild can drop rows
+    /// (permanent failures) in a way a pure in-place compaction never does, breaking any
+    /// clean arithmetic relationship between old and new positions.
+    /// </summary>
+    public Task ApplyRecoveryReconciliationAsync(
+        IReadOnlyCollection<string> md5sToDelete,
+        IReadOnlyCollection<(string Site, long PostId)> extraSourcesToStrip,
+        IReadOnlyDictionary<string, int> newCacheRowIndexByMd5,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            await using var transaction = _connection.BeginTransaction();
+
+            var deleteExtra = _connection.CreateCommand();
+            deleteExtra.Transaction = transaction;
+            deleteExtra.CommandText = "DELETE FROM ImageSources WHERE Site = $site AND PostId = $postId;";
+            var extraSite = deleteExtra.Parameters.Add("$site", SqliteType.Text);
+            var extraPostId = deleteExtra.Parameters.Add("$postId", SqliteType.Integer);
+            foreach (var (site, postId) in extraSourcesToStrip)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                extraSite.Value = site;
+                extraPostId.Value = postId;
+                await deleteExtra.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            var deleteSources = _connection.CreateCommand();
+            deleteSources.Transaction = transaction;
+            deleteSources.CommandText = "DELETE FROM ImageSources WHERE Md5 = $md5;";
+            var delSourcesMd5 = deleteSources.Parameters.Add("$md5", SqliteType.Text);
+
+            var deleteImage = _connection.CreateCommand();
+            deleteImage.Transaction = transaction;
+            deleteImage.CommandText = "DELETE FROM Images WHERE Md5 = $md5;";
+            var delImageMd5 = deleteImage.Parameters.Add("$md5", SqliteType.Text);
+
+            foreach (var md5 in md5sToDelete)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                delSourcesMd5.Value = md5;
+                await deleteSources.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                delImageMd5.Value = md5;
+                await deleteImage.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            var remapImage = _connection.CreateCommand();
+            remapImage.Transaction = transaction;
+            remapImage.CommandText = "UPDATE Images SET CacheRowIndex = $newIndex WHERE Md5 = $md5;";
+            var remapNewIndex = remapImage.Parameters.Add("$newIndex", SqliteType.Integer);
+            var remapMd5 = remapImage.Parameters.Add("$md5", SqliteType.Text);
+            foreach (var (md5, newIndex) in newCacheRowIndexByMd5)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                remapNewIndex.Value = newIndex;
+                remapMd5.Value = md5;
+                await remapImage.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }, cancellationToken);
 
     /// <summary>

@@ -287,6 +287,34 @@ internal sealed class TagRowStore : IDisposable
         return result;
     }
 
+    /// <summary>
+    /// Streams every confirmed row (<c>startAtIndex &lt;= CacheRowIndex &lt; imageCount</c>),
+    /// in index order, one at a time — the sequential-access counterpart to
+    /// <see cref="ReadAll"/>, for a caller (<see cref="PreprocessedDatasetCacheCompactor"/>)
+    /// that walks the whole store forward exactly once and would rather not pay for
+    /// materializing every row into memory up front just to immediately re-serialize
+    /// most of them back out unchanged. <paramref name="startAtIndex"/> lets a resumed
+    /// walk skip straight past rows an earlier, interrupted pass already consumed,
+    /// without re-reading them.
+    /// </summary>
+    public IEnumerable<(int Index, IReadOnlyList<int> TagRows)> StreamAll(int imageCount, int startAtIndex = 0)
+    {
+        using var select = _connection.CreateCommand();
+        select.CommandText = "SELECT CacheRowIndex, TagRows FROM TagRows WHERE CacheRowIndex >= $start AND CacheRowIndex < $imageCount ORDER BY CacheRowIndex;";
+        select.Parameters.AddWithValue("$start", startAtIndex);
+        select.Parameters.AddWithValue("$imageCount", imageCount);
+
+        using var reader = select.ExecuteReader();
+        while (reader.Read())
+        {
+            var index = (int)reader.GetInt64(0);
+            using var blobStream = reader.GetStream(1);
+            using var buffer = new MemoryStream();
+            blobStream.CopyTo(buffer);
+            yield return (index, Unpack(buffer.ToArray()));
+        }
+    }
+
     private static byte[] Pack(IReadOnlyList<int> tagRows)
     {
         var blob = new byte[tagRows.Count * sizeof(int)];

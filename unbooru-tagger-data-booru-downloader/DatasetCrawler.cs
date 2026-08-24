@@ -830,11 +830,23 @@ public static class DatasetCrawler
     }
 
     /// <summary>
+    /// Checked against <see cref="BooruPost.FileUrl"/> directly, before any network
+    /// request, so a booru repeatedly resurfacing the same dead-end file across
+    /// pages/resumes never costs a download+decode attempt more than once (there wasn't
+    /// one to begin with). See <see cref="UnsupportedMedia"/> for why these extensions
+    /// specifically.
+    /// </summary>
+    private static bool IsUnsupportedMedia(Uri fileUrl) => UnsupportedMedia.IsUnsupportedMediaUrl(fileUrl.AbsolutePath);
+
+    /// <summary>
     /// Dedup-skips a known image (exact md5 match — buffers only an additional-source
     /// record and returns null), or downloads it to a fresh temp file and returns that
     /// path for <see cref="ProcessDownloadedPostAsync"/> to pick up. Also returns null
     /// (nothing to process, no temp file left behind) for a 404/410 — the file is
-    /// permanently gone, not corrupt or worth decoding.
+    /// permanently gone, not corrupt or worth decoding — and for a
+    /// <see cref="IsUnsupportedMedia"/> match, for the same reason: nothing downstream
+    /// could ever make good use of the bytes, so there's no point spending a download on
+    /// them at all.
     ///
     /// Only the dedup pre-check runs under <paramref name="stateLock"/>; the download
     /// itself deliberately runs unlocked (gated only by <paramref name="downloadPool"/>
@@ -859,6 +871,9 @@ public static class DatasetCrawler
         SemaphoreSlim downloadPool,
         CancellationToken cancellationToken)
     {
+        if (IsUnsupportedMedia(post.FileUrl))
+            return null; // no network request, no temp file, no dedup/duplicate accounting -- see IsUnsupportedMedia's doc comment
+
         await stateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -1045,6 +1060,18 @@ public static class DatasetCrawler
                 }
 
                 var eligibleTagsOnPost = TagRowMutations.EligibleIdentities(post.Tags, eligibleTagIdentities).Distinct(StringComparer.Ordinal).ToList();
+
+                // A positive-phase search found this post BY searching for searchedTag —
+                // true even if post.Tags's raw spelling doesn't literally round-trip
+                // through EligibleIdentities. See MergeDuplicateTags's own doc comment for
+                // why (a site can silently substitute a tag's current spelling for a
+                // deprecated one that isn't in its own public alias listing yet — observed
+                // for real on Gelbooru: searching a real, unaliased-per-its-own-tag-index
+                // tag still came back with every post's raw tags reading as a totally
+                // different tag instead).
+                if (searchedTag is not null && !eligibleTagsOnPost.Contains(searchedTag, StringComparer.Ordinal))
+                    eligibleTagsOnPost.Add(searchedTag);
+
                 var tagRows = new List<int>(eligibleTagsOnPost.Count);
                 foreach (var tagName in eligibleTagsOnPost)
                 {
@@ -1139,6 +1166,23 @@ public static class DatasetCrawler
     /// whose search results page happens to be entirely redundant with what's already
     /// known gets zero credit for any of it and grinds through its own remaining
     /// pagination stuck at 0/floor — indistinguishable from that site not trying at all.
+    ///
+    /// <paramref name="searchedTag"/> is folded into <c>observedTags</c> itself (not just
+    /// credited separately) before any of the above, on the same trust-the-search
+    /// principle <see cref="TagRowMutations.EligibleIdentities"/> already applies to a
+    /// KNOWN alias antecedent — except here the alias isn't known ahead of time at all,
+    /// just observed live: a site's positive-phase search returned this post specifically
+    /// because it matched <paramref name="searchedTag"/>, even on a page where every
+    /// post's raw tag list reads as some other, unrelated-looking spelling. Confirmed for
+    /// real against Gelbooru: querying its own search API for a tag its own tag-index API
+    /// reports as real, unaliased, and non-ambiguous (e.g. <c>water_fountain</c> — a
+    /// real tag id, a nonzero count of its own) still returned the exact same posts, in
+    /// the exact same order, as querying a completely different tag (<c>fountain</c>) —
+    /// a silent server-side substitution nowhere on Gelbooru's own public alias listing
+    /// page (<see cref="GelbooruClient.ListActiveTagAliasesAsync"/>), so <c>tagAliases</c>
+    /// can never backfill it into <c>eligibleTagIdentities</c> ahead of time. Without
+    /// this, the tag being searched for earns zero credit no matter how many pages of
+    /// genuinely-matching posts come back.
     /// </summary>
     private static IReadOnlyList<string> MergeDuplicateTags(
         BooruPost post,
@@ -1153,6 +1197,8 @@ public static class DatasetCrawler
         var currentTagRows = state.ImageTagRowsByCacheRow[cacheRowIndex];
 
         var observedTags = TagRowMutations.EligibleIdentities(post.Tags, eligibleTagIdentities).Distinct(StringComparer.Ordinal).ToList();
+        if (searchedTag is not null && !observedTags.Contains(searchedTag, StringComparer.Ordinal))
+            observedTags.Add(searchedTag);
 
         List<string>? newlyAddedTags = null;
         foreach (var tagName in observedTags)
@@ -1174,12 +1220,12 @@ public static class DatasetCrawler
             }
         }
 
-        if (searchedTag is not null
-            && (newlyAddedTags is null || !newlyAddedTags.Contains(searchedTag, StringComparer.Ordinal))
-            && observedTags.Contains(searchedTag, StringComparer.Ordinal))
-        {
+        // observedTags always contains searchedTag by now when it's non-null (folded in
+        // above), so this site's search genuinely matched it either way — newly added
+        // (already credited above) or already on the image (credited here instead, since
+        // CombinedPositiveCounts must not move twice for the same association).
+        if (searchedTag is not null && (newlyAddedTags is null || !newlyAddedTags.Contains(searchedTag, StringComparer.Ordinal)))
             mySitePositiveCounts[searchedTag] = mySitePositiveCounts.GetValueOrDefault(searchedTag) + 1;
-        }
 
         return observedTags;
     }

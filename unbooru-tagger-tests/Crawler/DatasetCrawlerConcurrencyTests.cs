@@ -410,14 +410,20 @@ public class DatasetCrawlerConcurrencyTests
     }
 
     [Fact]
-    public async Task RunAsync_WithoutTagAliases_SilentlyDropsAnAliasedAwayRawTagName()
+    public async Task RunAsync_WithoutTagAliases_StillCreditsTheSearchedTagViaSearchItself()
     {
-        // Regression guard for the bug the previous test's fix corrected: without a
-        // tagAliases map, an already-merged tag's antecedent raw name isn't in
+        // Without a tagAliases map, an already-merged tag's antecedent raw name isn't in
         // eligibleTagIdentities at all anymore (TagSurveyor folded it away at survey
-        // time), so a post still using that raw spelling loses the tag entirely instead
-        // of crediting either identity — worse than before the merge, which at least
-        // recorded it under the wrong name.
+        // time), so a post still using that raw spelling can't be resolved back to
+        // "headpat" via EligibleIdentities alone. This used to mean the tag was lost
+        // entirely — worse than before the merge, which at least recorded it under the
+        // wrong name. Fixed by trusting the search itself: a positive-phase search FOR
+        // "headpat" that returns this post is treated as proof the post matches
+        // "headpat", regardless of what spelling its own raw tag list uses — the same
+        // failure mode observed for real against Gelbooru, where a site can silently
+        // substitute a tag's current spelling for a deprecated one that isn't even on
+        // its own public alias listing yet, so tagAliases could never have caught it
+        // ahead of time no matter how it was populated.
         var directory = Directory.CreateTempSubdirectory().FullName;
         try
         {
@@ -435,12 +441,9 @@ public class DatasetCrawlerConcurrencyTests
                 minImages: 1, maxImages: 1, negativeTarget: 0, vocabCompactIntervalPages: 1,
                 progress: null, CancellationToken.None); // no tagAliases passed
 
-            // GetAllCombinedPositiveCountsAsync returns every surveyed tag row, including
-            // untouched ones at their default 0 — "headpat" being a KEY is expected (it's
-            // the one surveyed tag); the bug this guards is its VALUE never moving.
             var combinedCounts = await db.GetAllCombinedPositiveCountsAsync();
-            Assert.Equal(0, combinedCounts.GetValueOrDefault("headpat"));
-            Assert.Equal(0, combinedCounts.GetValueOrDefault("head_pat"));
+            Assert.Equal(1, combinedCounts.GetValueOrDefault("headpat"));
+            Assert.False(combinedCounts.ContainsKey("head_pat")); // never recorded under the raw, unresolved spelling
         }
         finally
         {
