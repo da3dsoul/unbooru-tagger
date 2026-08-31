@@ -273,10 +273,7 @@ internal sealed class TagRowStore : IDisposable
         while (reader.Read())
         {
             var index = (int)reader.GetInt64(0);
-            using var blobStream = reader.GetStream(1);
-            using var buffer = new MemoryStream();
-            blobStream.CopyTo(buffer);
-            result[index] = Unpack(buffer.ToArray());
+            result[index] = Unpack(reader.GetFieldValue<byte[]>(1));
 
             read++;
             if (onProgress is not null && read % ProgressReportInterval == 0)
@@ -308,10 +305,7 @@ internal sealed class TagRowStore : IDisposable
         while (reader.Read())
         {
             var index = (int)reader.GetInt64(0);
-            using var blobStream = reader.GetStream(1);
-            using var buffer = new MemoryStream();
-            blobStream.CopyTo(buffer);
-            yield return (index, Unpack(buffer.ToArray()));
+            yield return (index, Unpack(reader.GetFieldValue<byte[]>(1)));
         }
     }
 

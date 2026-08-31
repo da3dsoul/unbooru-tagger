@@ -44,9 +44,11 @@ public sealed class DanbooruClient(HttpClient http, IRateLimiter rateLimiter, st
                 var category = element.TryGetProperty("category", out var categoryProp) && categoryProp.TryGetInt32(out var categoryCode)
                     ? TagCategoryNaming.FromRawCode(categoryCode)
                     : TagCategory.General;
+                var deprecated = element.TryGetProperty("is_deprecated", out var deprecatedProp) && deprecatedProp.ValueKind == JsonValueKind.True;
                 yield return new BooruTagCount(
                     TagCategoryNaming.Identity(element.GetProperty("name").GetString()!, category),
-                    element.GetProperty("post_count").GetInt32());
+                    element.GetProperty("post_count").GetInt32(),
+                    deprecated);
             }
 
             if (!any)

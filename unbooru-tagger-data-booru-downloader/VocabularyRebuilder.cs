@@ -37,6 +37,13 @@ public sealed record VocabularyRebuildResult(
 /// grew between the seed snapshot and now -- no need to know exactly which image the
 /// seed snapshot was taken at.
 ///
+/// Note that <c>ImageSources.Tags</c> holds already-resolved tag IDENTITIES (it's written
+/// from <see cref="DatasetCrawler"/>'s own <c>eligibleTagsOnPost</c>), not the raw booru
+/// names a live post carries — so a non-General tag reads as <c>character:frieren</c>
+/// there, not <c>frieren</c>. <see cref="TagRowMutations.EligibleIdentities"/> normalizes
+/// either shape back to a raw name before resolving it against the current survey; see its
+/// doc comment for why that's both necessary here and a no-op for the live-crawl callers.
+///
 /// An image with no <c>ImageSources</c> row at all (crawl.sqlite itself is missing that
 /// bookkeeping -- see <c>rebuild-vocabulary</c>'s own remarks on why a handful of
 /// recently-committed images can end up in this state after a crash) gets an empty tag

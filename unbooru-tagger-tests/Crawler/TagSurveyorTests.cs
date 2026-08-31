@@ -38,10 +38,13 @@ public class TagSurveyorTests
             var db = await CrawlDatabase.OpenOrCreateAsync(directory);
             try
             {
-                // Danbooru files "elvaan" as General (unprefixed); Gelbooru files the same
-                // raw tag as Character ("character:elvaan"). Before the fix, this produced
-                // two separate eligible survey rows that collided downstream when keyed by
-                // raw name (DatasetCrawler/TagRefresher's eligibleTagIdentities lookup).
+                // Danbooru files "elvaan" as General (unprefixed) — very often just meaning
+                // "nobody has recategorized this tag yet" rather than a confirmed General
+                // judgment — while Gelbooru files the same raw tag as Character
+                // ("character:elvaan"). This produces one merged row keyed by raw name
+                // (DatasetCrawler/TagRefresher's eligibleTagIdentities lookup requires that),
+                // and the merge must prefer Gelbooru's specific category over Danbooru's
+                // uninformative General rather than silently losing it.
                 var clients = new List<IBooruClient>
                 {
                     new FakeSurveyClient("danbooru", [new BooruTagCount("elvaan", 1000)]),
@@ -57,8 +60,9 @@ public class TagSurveyorTests
                 Assert.Equal("elvaan", TagCategoryNaming.RawName(survived.Name));
                 Assert.Equal(1000, survived.DanbooruCount);
                 Assert.Equal(2000, survived.GelbooruCount);
-                // Danbooru's categorization wins on disagreement — see TagSurveyor.SurveyAsync.
-                Assert.Equal("elvaan", survived.Name);
+                // A non-General category from either site wins over Danbooru's General —
+                // see TagSurveyor.SurveyAsync.
+                Assert.Equal("character:elvaan", survived.Name);
             }
             finally
             {
@@ -162,7 +166,7 @@ public class TagSurveyorTests
                 // iterating a tag it can now never earn credit toward (see
                 // TagSurveyor.SurveyAsync's tagAliases doc comment).
                 await db.UpsertTagSurveysAsync(
-                    [("head_pat", null, 1020, true)], DateTimeOffset.UtcNow, onRowWritten: null);
+                    [("head_pat", null, 1020, true, false)], DateTimeOffset.UtcNow, onRowWritten: null);
 
                 var clients = new List<IBooruClient>
                 {
@@ -177,6 +181,112 @@ public class TagSurveyorTests
                 Assert.DoesNotContain(allTags, t => t.Name == "head_pat");
                 var survived = Assert.Single(allTags);
                 Assert.Equal("headpat", survived.Name);
+            }
+            finally
+            {
+                db.Dispose();
+            }
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SurveyAsync_PrefersDanbooruCategory_OnGenuineDisagreementBetweenTwoSpecificCategories()
+    {
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var db = await CrawlDatabase.OpenOrCreateAsync(directory);
+            try
+            {
+                // Danbooru calls the tag Artist, Gelbooru calls it Character — a genuine
+                // disagreement between two *specific* categories (neither is General's
+                // uninformative default), where Danbooru's curation still wins.
+                var clients = new List<IBooruClient>
+                {
+                    new FakeSurveyClient("danbooru", [new BooruTagCount("artist:someone", 1000)]),
+                    new FakeSurveyClient("gelbooru", [new BooruTagCount("character:someone", 2000)]),
+                };
+
+                await TagSurveyor.SurveyAsync(db, clients, minImages: 1, maxImages: 100);
+
+                var survived = Assert.Single(await db.GetAllSurveyedTagsAsync());
+                Assert.Equal("artist:someone", survived.Name);
+            }
+            finally
+            {
+                db.Dispose();
+            }
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SurveyAsync_RecordsDeprecated_WhenEitherSiteFlagsIt()
+    {
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var db = await CrawlDatabase.OpenOrCreateAsync(directory);
+            try
+            {
+                var clients = new List<IBooruClient>
+                {
+                    new FakeSurveyClient("danbooru", [new BooruTagCount("curvy_figure", 1000, Deprecated: true)]),
+                    new FakeSurveyClient("gelbooru", [new BooruTagCount("curvy_figure", 2000)]),
+                };
+
+                var summary = await TagSurveyor.SurveyAsync(db, clients, minImages: 1, maxImages: 100);
+
+                Assert.Equal(1, summary.DeprecatedTagCount);
+                var survived = Assert.Single(await db.GetAllSurveyedTagsAsync());
+                Assert.True(survived.Deprecated);
+            }
+            finally
+            {
+                db.Dispose();
+            }
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SurveyAsync_DeletesStaleRow_WhenARaraNameNowResolvesToADifferentIdentity()
+    {
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var db = await CrawlDatabase.OpenOrCreateAsync(directory);
+            try
+            {
+                // Simulates a crawl.sqlite surveyed by an older category-merge rule that
+                // let Danbooru's uninformative General override Gelbooru's Character: the
+                // stale "elvaan" row must be deleted once a re-survey recomputes the
+                // correct "character:elvaan" identity, not left behind alongside it.
+                await db.UpsertTagSurveysAsync(
+                    [("elvaan", (int?)1000, null, true, false)], DateTimeOffset.UtcNow, onRowWritten: null);
+
+                var clients = new List<IBooruClient>
+                {
+                    new FakeSurveyClient("danbooru", [new BooruTagCount("elvaan", 1000)]),
+                    new FakeSurveyClient("gelbooru", [new BooruTagCount("character:elvaan", 2000)]),
+                };
+
+                await TagSurveyor.SurveyAsync(db, clients, minImages: 1, maxImages: 100);
+
+                var allTags = await db.GetAllSurveyedTagsAsync();
+                Assert.DoesNotContain(allTags, t => t.Name == "elvaan");
+                var survived = Assert.Single(allTags);
+                Assert.Equal("character:elvaan", survived.Name);
             }
             finally
             {

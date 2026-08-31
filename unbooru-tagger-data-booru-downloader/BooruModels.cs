@@ -11,8 +11,13 @@ public sealed record BooruPost(
     int Width,
     int Height);
 
-/// <summary>A tag name and its post count, as returned by a site's tag-listing endpoint.</summary>
-public sealed record BooruTagCount(string Name, int PostCount);
+/// <summary>
+/// A tag name and its post count, as returned by a site's tag-listing endpoint.
+/// <paramref name="Deprecated"/> is Danbooru's own <c>is_deprecated</c> flag, or (on
+/// Gelbooru, which has no separate boolean) whether the site's own <c>type</c> code was
+/// its dedicated deprecated-tag category (6) — see <see cref="GelbooruClient.ListTagsByCountDescendingAsync"/>.
+/// </summary>
+public sealed record BooruTagCount(string Name, int PostCount, bool Deprecated = false);
 
 /// <summary>
 /// A resolved tag alias: searching/tagging <paramref name="Antecedent"/> on this site is

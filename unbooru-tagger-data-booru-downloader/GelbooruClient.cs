@@ -51,12 +51,17 @@ public sealed class GelbooruClient(HttpClient http, IRateLimiter rateLimiter, st
 
             foreach (var element in tagsElement.EnumerateArray())
             {
-                var category = element.TryGetProperty("type", out var typeProp) && typeProp.TryGetInt32(out var typeCode)
-                    ? TagCategoryNaming.FromRawCode(typeCode)
-                    : TagCategory.General;
+                var typeCode = 0;
+                var hasType = element.TryGetProperty("type", out var typeProp) && typeProp.TryGetInt32(out typeCode);
+                // Gelbooru has no separate deprecated boolean — it overloads `type` with its
+                // own dedicated code (6, unrecognized by TagCategoryNaming.FromRawCode/the
+                // shared TagCategory enum) for a deprecated tag instead.
+                var deprecated = hasType && typeCode == 6;
+                var category = hasType ? TagCategoryNaming.FromRawCode(typeCode) : TagCategory.General;
                 yield return new BooruTagCount(
                     TagCategoryNaming.Identity(WebUtility.HtmlDecode(element.GetProperty("name").GetString()!), category),
-                    element.GetProperty("count").GetInt32());
+                    element.GetProperty("count").GetInt32(),
+                    deprecated);
             }
         }
     }

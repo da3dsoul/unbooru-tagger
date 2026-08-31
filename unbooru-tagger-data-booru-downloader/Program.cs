@@ -148,7 +148,7 @@ surveyCommand.SetAction(async (parseResult, cancellationToken) =>
     if (stopNotes.Any(n => n.Contains("stopped after 0 eligible")))
         AnsiConsole.MarkupLine("[yellow]A site found zero eligible tags — if that's unexpected, the site's tag-list API may not actually be honoring the sort-by-count-descending request, so this stopped on the very first (effectively random) tag instead of the least popular eligible one.[/]");
 
-    Console.WriteLine($"Surveyed {summary.TotalTagsSeen} tags; {summary.EligibleTagCount} eligible at --min-images {minImages} ({summary.ExcludedTagCount} excluded via '{TagExclusions.FileName}').");
+    Console.WriteLine($"Surveyed {summary.TotalTagsSeen} tags; {summary.EligibleTagCount} eligible at --min-images {minImages} ({summary.ExcludedTagCount} excluded via '{TagExclusions.FileName}', {summary.DeprecatedTagCount} deprecated on at least one site — still crawled, informational only).");
     PrintEstimate(new CrawlEstimate(summary.EligibleTagCount, summary.EstimatedImageSlots, 0, TimeSpan.Zero));
     return 0;
 });
@@ -412,7 +412,11 @@ shrinkCacheCommand.SetAction((parseResult, cancellationToken) =>
     return Task.FromResult(0);
 });
 
-var applyOption = new Option<bool>("--apply") { Description = "Actually delete the stale rows — without this, only reports what would be removed", DefaultValueFactory = _ => false };
+// Shared by every dry-run-by-default correction command (prune-aliased-tags,
+// detect-deprecated-redirects, rebuild-vocabulary, prune-unsupported-media), so the
+// wording has to stay generic — it used to describe only prune-aliased-tags' own deletes
+// and read as plainly wrong on the three commands that don't delete anything.
+var applyOption = new Option<bool>("--apply") { Description = "Actually make the changes — without this, only reports what would be done", DefaultValueFactory = _ => false };
 
 var pruneAliasedTagsCommand = new Command(
     "prune-aliased-tags",
@@ -494,6 +498,264 @@ pruneAliasedTagsCommand.SetAction(async (parseResult, cancellationToken) =>
     return 0;
 });
 
+var redirectLimitOption = new Option<int>("--limit") { Description = "Only probe the first N deprecated tags (highest post count first, so a partial run covers the most valuable ones) — every tag needs at least two live searches, so a full corpus-wide run is thousands of rate-limited round-trips; 0 means no limit", DefaultValueFactory = _ => 0 };
+var redirectSamplePagesOption = new Option<int>("--sample-pages") { Description = "Pages of search results sampled per tag and per candidate (~200 posts per page-pair on either site). Bigger samples make an exact match stronger evidence and shrink the candidate set, at proportionally more requests — though a candidate that already differs on page 1 is rejected without fetching the rest", DefaultValueFactory = _ => 2 };
+var redirectMinSampleOption = new Option<int>("--min-sample-posts") { Description = "Leave a tag unresolved rather than trust a match, if the site returned fewer than this many posts for it — an exact match over a handful of posts is cheap coincidence, not evidence", DefaultValueFactory = _ => 20 };
+var redirectMaxCandidatesOption = new Option<int>("--max-candidates") { Description = "Skip a tag entirely (rather than verify an arbitrary subset) if more than this many tags are present on 100% of its sampled posts — a candidate set that big means the sample was too small to discriminate, and the fix is a larger --sample-pages", DefaultValueFactory = _ => 8 };
+var redirectMaxAntecedentsOption = new Option<int>("--max-antecedents-per-target") { Description = "Distrust and write NOTHING for every confirmation pointing at a target that more than this many distinct tags converged on in the same run — the signature of a site-wide search FALLBACK, not a redirect (Gelbooru answers a query it can't parse, e.g. 'l' or '1:1', with a shared default result set identical to a real search for 'bad_tag', so every such query verifies against it with a genuinely exact match). A real target absorbing dozens of typo/synonym variants is normal; hundreds of unrelated ones is not. The default sits ~3x above the largest real cluster seen so far (47) and ~7x below the observed artifact (1000)", DefaultValueFactory = _ => 150 };
+var redirectOnlyTagsOption = new Option<string[]>("--only-tags")
+{
+    Description = "Probe only these tag identities instead of every deprecated+eligible tag — for a scoped re-verification (e.g. re-checking just the tags a previous run got wrong) where re-probing the whole corpus would be thousands of needless rate-limited round-trips. Takes the same stored identities this command's own report prints. Applied before --limit.",
+    AllowMultipleArgumentsPerToken = true,
+    DefaultValueFactory = _ => []
+};
+
+var detectDeprecatedRedirectsCommand = new Command(
+    "detect-deprecated-redirects",
+    "Finds tags a site has DEPRECATED and now silently redirects searches for, with zero trace in any alias API — the gap 'prune-aliased-tags' can't cover, since that one only knows what Danbooru/Gelbooru actually publish as aliases. Confirmed live: Gelbooru's 'pussy_licking' (deprecated via its own type=6) returns the identical post-id sequence as 'cunnilingus' while appearing in no alias listing anywhere. Detection is empirical and per-tag: sample the deprecated tag's own search, take the tags present on 100% of those posts as candidates, then independently re-search each candidate and require an exact, ordered post-id match — co-occurrence alone proves nothing, only the exact match proves the two are the same underlying query. Confirmed pairs are MERGED into tag_aliases.json (never overwriting an official alias already there) and recorded separately in detected_tag_redirects.json so a later survey-tags run folds them back in instead of discarding them. Defaults to a dry run — pass --apply to actually write.");
+detectDeprecatedRedirectsCommand.Options.Add(sitesOption);
+detectDeprecatedRedirectsCommand.Options.Add(outputDirOption);
+detectDeprecatedRedirectsCommand.Options.Add(minImagesOption);
+detectDeprecatedRedirectsCommand.Options.Add(danbooruLoginOption);
+detectDeprecatedRedirectsCommand.Options.Add(danbooruApiKeyOption);
+detectDeprecatedRedirectsCommand.Options.Add(gelbooruApiKeyOption);
+detectDeprecatedRedirectsCommand.Options.Add(gelbooruUserIdOption);
+detectDeprecatedRedirectsCommand.Options.Add(rateDanbooruOption);
+detectDeprecatedRedirectsCommand.Options.Add(rateGelbooruOption);
+detectDeprecatedRedirectsCommand.Options.Add(redirectLimitOption);
+detectDeprecatedRedirectsCommand.Options.Add(redirectSamplePagesOption);
+detectDeprecatedRedirectsCommand.Options.Add(redirectMinSampleOption);
+detectDeprecatedRedirectsCommand.Options.Add(redirectMaxCandidatesOption);
+detectDeprecatedRedirectsCommand.Options.Add(redirectMaxAntecedentsOption);
+detectDeprecatedRedirectsCommand.Options.Add(redirectOnlyTagsOption);
+detectDeprecatedRedirectsCommand.Options.Add(applyOption);
+detectDeprecatedRedirectsCommand.SetAction(async (parseResult, cancellationToken) =>
+{
+    var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
+    var sites = parseResult.GetRequiredValue(sitesOption);
+    var rateDanbooru = parseResult.GetRequiredValue(rateDanbooruOption);
+    var rateGelbooru = parseResult.GetRequiredValue(rateGelbooruOption);
+    var limit = parseResult.GetRequiredValue(redirectLimitOption);
+    var onlyTags = parseResult.GetRequiredValue(redirectOnlyTagsOption);
+    var apply = parseResult.GetRequiredValue(applyOption);
+    var options = new DeprecatedRedirectOptions
+    {
+        SamplePages = parseResult.GetRequiredValue(redirectSamplePagesOption),
+        MinSamplePosts = parseResult.GetRequiredValue(redirectMinSampleOption),
+        MaxCandidates = parseResult.GetRequiredValue(redirectMaxCandidatesOption),
+        MaxAntecedentsPerTarget = parseResult.GetRequiredValue(redirectMaxAntecedentsOption),
+    };
+
+    using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
+
+    var allTags = await db.GetAllSurveyedTagsAsync(cancellationToken);
+    if (allTags.Count == 0)
+    {
+        Console.Error.WriteLine("No surveyed tags found — run 'survey-tags' against this --output-dir first.");
+        return 1;
+    }
+
+    // Same source of truth for eligibility as rebuild-vocabulary: the crawl's own recorded
+    // --min-images, since eligibility is always recomputed live from it (plus
+    // excluded_tags.txt) rather than read back out of crawl.sqlite's stored Eligible column.
+    var savedCommand = await CrawlCommandRecord.TryLoadAsync(outputDirectory, cancellationToken);
+    int minImages;
+    if (savedCommand is not null)
+    {
+        minImages = savedCommand.MinImages;
+        Console.WriteLine($"Using --min-images {minImages} from '{CrawlCommandRecord.FileName}' (the value the original crawl actually used).");
+    }
+    else
+    {
+        minImages = parseResult.GetRequiredValue(minImagesOption);
+        Console.WriteLine($"[warning] No '{CrawlCommandRecord.FileName}' found — using --min-images {minImages}. If that doesn't match the value the original crawl used, which tags count as eligible (and therefore get probed) will be wrong.");
+    }
+
+    var clients = BuildClients(
+        sites, httpClient, rateDanbooru, rateGelbooru,
+        parseResult.GetValue(danbooruLoginOption), parseResult.GetValue(danbooruApiKeyOption),
+        parseResult.GetValue(gelbooruApiKeyOption), parseResult.GetValue(gelbooruUserIdOption));
+    var excludedTags = await TagExclusions.LoadOrCreateAsync(outputDirectory, cancellationToken);
+    // Refreshed rather than read off disk on purpose: an antecedent a site has since
+    // aliased officially must be skipped, both to avoid spending two live searches
+    // re-deriving something already published and to avoid writing a second, possibly
+    // contradicting mapping for it.
+    var (tagAliases, tagAliasFetchFailed) = await FetchTagAliasesOrFailAsync("detect-deprecated-redirects", outputDirectory, clients, cancellationToken);
+    if (tagAliasFetchFailed)
+        return 1;
+
+    var deprecatedTags = allTags
+        .Where(t => t.Deprecated && TagEligibility.IsEligible(t, minImages, excludedTags))
+        .OrderByDescending(t => t.BestCount)
+        .ThenBy(t => t.Name, StringComparer.Ordinal)
+        .ToList();
+    if (deprecatedTags.Count == 0)
+    {
+        Console.WriteLine($"None of the {allTags.Count} surveyed tag(s) are both currently eligible and flagged deprecated — nothing to probe.");
+        return 0;
+    }
+
+    if (onlyTags.Length > 0)
+    {
+        // Matches stored tag IDENTITIES (category-prefixed for anything but General),
+        // exactly like refresh-tags' own --only-tags and exactly what this command's
+        // confirmed/suppressed tables print — so a name copied out of a previous report
+        // pastes straight back in here.
+        var wanted = new HashSet<string>(onlyTags, StringComparer.Ordinal);
+        var scoped = deprecatedTags.Where(t => wanted.Contains(t.Name)).ToList();
+
+        var unmatched = wanted.Except(scoped.Select(t => t.Name), StringComparer.Ordinal).ToList();
+        if (unmatched.Count > 0)
+            AnsiConsole.MarkupLine($"[yellow]{unmatched.Count} of the {wanted.Count} --only-tags name(s) are not currently deprecated+eligible surveyed tags and were skipped (identities, not raw names — e.g. '{Markup.Escape(unmatched[0])}').[/]");
+
+        if (scoped.Count == 0)
+        {
+            Console.Error.WriteLine("--only-tags matched none of the deprecated+eligible tags — nothing to probe.");
+            return 1;
+        }
+
+        Console.WriteLine($"--only-tags: scoped from {deprecatedTags.Count} deprecated+eligible tag(s) down to {scoped.Count}.");
+        deprecatedTags = scoped;
+    }
+
+    var totalDeprecated = deprecatedTags.Count;
+    if (limit > 0 && limit < deprecatedTags.Count)
+        deprecatedTags = deprecatedTags.Take(limit).ToList();
+    Console.WriteLine($"Probing {deprecatedTags.Count} of {totalDeprecated} deprecated+eligible tag(s) across {clients.Count} site(s), against {tagAliases?.Count ?? 0} already-known alias(es).");
+
+    var result = await AnsiConsole.Progress()
+        .Columns(ProgressBarColumns.Default)
+        .StartAsync(async ctx =>
+        {
+            var task = ctx.AddTask("Probing deprecated tags...");
+            task.MaxValue = deprecatedTags.Count;
+            var confirmed = 0;
+            var progress = new DeprecatedRedirectProgress
+            {
+                OnTagStarted = (done, total, tagName) =>
+                {
+                    task.MaxValue = total;
+                    task.Value = done;
+                    task.Description = Markup.Escape($"Probing '{tagName}'... ({done}/{total}, {confirmed} redirect(s) confirmed)");
+                },
+                OnFinding = finding =>
+                {
+                    if (finding.Outcome == DeprecatedRedirectOutcome.Confirmed)
+                        confirmed++;
+                }
+            };
+            var detection = await DeprecatedRedirectDetector.DetectAsync(
+                deprecatedTags, clients, tagAliases, options, progress, cancellationToken);
+            task.Value = task.MaxValue;
+            return detection;
+        });
+
+    var outcomeTable = new Table().Border(TableBorder.Rounded);
+    outcomeTable.AddColumn("Outcome");
+    outcomeTable.AddColumn("Probes");
+    foreach (var group in result.Findings.GroupBy(f => f.Outcome).OrderByDescending(g => g.Count()))
+        outcomeTable.AddRow(Markup.Escape(group.Key.ToString()), group.Count().ToString());
+    outcomeTable.AddRow("[grey]Search requests made[/]", result.RequestsMade.ToString());
+    AnsiConsole.Write(outcomeTable);
+
+    var confirmedFindings = result.Findings.Where(f => f.Outcome == DeprecatedRedirectOutcome.Confirmed).ToList();
+    if (confirmedFindings.Count > 0)
+    {
+        var reportTable = new Table().Border(TableBorder.Rounded);
+        reportTable.AddColumn("Deprecated tag");
+        reportTable.AddColumn("Silently redirects to");
+        reportTable.AddColumn("Site");
+        reportTable.AddColumn("Posts compared");
+        reportTable.AddColumn("Candidates");
+        foreach (var finding in confirmedFindings)
+            reportTable.AddRow(
+                Markup.Escape(finding.TagName),
+                Markup.Escape(finding.Target!),
+                Markup.Escape(finding.SiteName ?? "-"),
+                finding.SampledPosts.ToString(),
+                finding.Candidates.Count.ToString());
+        AnsiConsole.Write(reportTable);
+    }
+
+    var needsAHuman = result.Findings
+        .Where(f => f.Outcome is DeprecatedRedirectOutcome.AmbiguousCandidates or DeprecatedRedirectOutcome.WouldCreateCycle)
+        .ToList();
+    if (needsAHuman.Count > 0)
+    {
+        AnsiConsole.MarkupLine("[yellow]The following tag(s) produced a match this command deliberately refuses to act on by itself — nothing was written for them:[/]");
+        var ambiguousTable = new Table().Border(TableBorder.Rounded);
+        ambiguousTable.AddColumn("Deprecated tag");
+        ambiguousTable.AddColumn("Site");
+        ambiguousTable.AddColumn("Why");
+        ambiguousTable.AddColumn("Exact-matching tag(s)");
+        foreach (var finding in needsAHuman)
+            ambiguousTable.AddRow(
+                Markup.Escape(finding.TagName),
+                Markup.Escape(finding.SiteName ?? "-"),
+                Markup.Escape(finding.Outcome == DeprecatedRedirectOutcome.AmbiguousCandidates
+                    ? "several tags reproduce its results exactly — which one the site redirects to is undecidable from searches alone"
+                    : "would close an alias cycle against the aliases already known"),
+                Markup.Escape(string.Join(", ", finding.VerifiedTargets)));
+        AnsiConsole.Write(ambiguousTable);
+    }
+
+    // Deliberately its own table rather than another row class in needsAHuman above: this is
+    // a RUN-level verdict on a target, not a per-tag one, and a single fallback hub produced
+    // a thousand of these in the first real run — folding them in would bury the handful of
+    // genuinely per-tag rows a human can actually act on. One row per target, with the
+    // antecedent count that IS the evidence, says everything the per-tag rows would.
+    var hubFindings = result.Findings
+        .Where(f => f.Outcome == DeprecatedRedirectOutcome.SuspectedHubTarget)
+        .ToList();
+    if (hubFindings.Count > 0)
+    {
+        var hubGroups = hubFindings
+            .GroupBy(f => f.Target!, StringComparer.Ordinal)
+            .OrderByDescending(g => g.Count())
+            .ToList();
+        AnsiConsole.MarkupLine($"[yellow]{hubFindings.Count} confirmation(s) across {hubGroups.Count} target(s) were HELD BACK and not written: more than --max-antecedents-per-target ({options.MaxAntecedentsPerTarget}) distinct tags verified against the same target in this one run. Each match really was exact — which is exactly the problem: a site that answers an unparseable query with a shared fallback result set makes every such query match whatever real tag returns that same set (Gelbooru's 'bad_tag'). Raise the option if one of these is a genuine tag that really does absorb this many variants.[/]");
+        var hubTable = new Table().Border(TableBorder.Rounded);
+        hubTable.AddColumn("Suspected hub target");
+        hubTable.AddColumn("Distinct tags that 'confirmed' against it");
+        hubTable.AddColumn("Examples");
+        foreach (var group in hubGroups)
+            hubTable.AddRow(
+                Markup.Escape(group.Key),
+                group.Count().ToString(),
+                Markup.Escape(string.Join(", ", group.Take(5).Select(f => f.TagName)) + (group.Count() > 5 ? ", ..." : "")));
+        AnsiConsole.Write(hubTable);
+    }
+
+    if (result.NewAliases.Count == 0)
+    {
+        Console.WriteLine(hubFindings.Count > 0
+            ? "No silent redirects left to write — every confirmation this run made was held back as a suspected hub target (see above). A tag left unresolved is the expected outcome, not an error."
+            : "No silent redirects confirmed — nothing to write. A tag left unresolved is the expected outcome, not an error.");
+        return 0;
+    }
+
+    if (!apply)
+    {
+        Console.WriteLine($"{result.NewAliases.Count} redirect(s) would be merged into '{TagAliasCache.FileName}' and recorded in '{TagAliasCache.DetectedRedirectsFileName}' (dry run — pass --apply to actually write).");
+        return 0;
+    }
+
+    var detectedRedirects = new Dictionary<string, string>(
+        await TagAliasCache.TryLoadDetectedRedirectsAsync(outputDirectory, cancellationToken) ?? [], StringComparer.Ordinal);
+    foreach (var (antecedent, consequent) in result.NewAliases)
+        detectedRedirects[antecedent] = consequent;
+    await TagAliasCache.SaveDetectedRedirectsAsync(outputDirectory, detectedRedirects, cancellationToken);
+
+    var added = await TagAliasCache.MergeIntoCacheAsync(outputDirectory, result.NewAliases, cancellationToken);
+    Console.WriteLine($"Merged {added.Count} new alias(es) into '{Path.Combine(outputDirectory, TagAliasCache.FileName)}' ({detectedRedirects.Count} detected redirect(s) recorded in '{TagAliasCache.DetectedRedirectsFileName}' in total).");
+    Console.WriteLine("These tags are now known alias antecedents, so:");
+    Console.WriteLine($"  prune-aliased-tags --output-dir {outputDirectory} --apply   # stop crawling them as their own tag");
+    // --only-tags matches stored tag IDENTITIES (category-prefixed for anything but
+    // General), not the raw names the alias table is keyed by — see TagCategoryNaming.
+    Console.WriteLine($"  refresh-tags --output-dir {outputDirectory} --only-tags {string.Join(' ', confirmedFindings.Select(f => f.TagName))}   # move any images already tagged under the old identity");
+    return 0;
+});
+
 var seedVocabularyOption = new Option<string>("--seed-vocabulary")
 {
     Description = "Path to a known-good tag_vocabulary.json to rebuild from -- e.g. a training checkpoint's own copy (Checkpoint.Save writes one byte-for-byte identical to the dataset's vocabulary at that moment). Every tag it already contains keeps its exact row index (row indices are append-only everywhere in this codebase, so an older snapshot is always a verified-correct prefix of a newer one) -- required if a checkpoint trained against this dataset exists, since renumbering those rows would silently invalidate its tag_embeddings.bin.",
@@ -571,11 +833,24 @@ rebuildVocabularyCommand.SetAction(async (parseResult, cancellationToken) =>
         File.Copy(tagRowsPath, tagRowsBackupPath);
     }
 
+    // tag_vocabulary.json is overwritten below by seedVocabulary.Save -- back it up first
+    // regardless of whether --seed-vocabulary pointed at this same live file or a separate
+    // (e.g. checkpoint) copy, the same way tag_rows.sqlite already is just above. This file
+    // is the one that actually mattered in a real incident: rebuild-vocabulary --apply used
+    // to overwrite it with no backup at all.
+    var vocabularyPath = Path.Combine(outputDirectory, "tag_vocabulary.json");
+    var vocabularyBackupPath = vocabularyPath + ".pre-rebuild-backup";
+    if (File.Exists(vocabularyPath) && !File.Exists(vocabularyBackupPath))
+    {
+        Console.WriteLine($"Backing up '{vocabularyPath}' to '{vocabularyBackupPath}'...");
+        File.Copy(vocabularyPath, vocabularyBackupPath);
+    }
+
     Console.WriteLine("Writing tag_rows.sqlite...");
     TagRowsSqliteWriter.WriteAtomically(outputDirectory, rows);
 
     Console.WriteLine("Writing tag_vocabulary.json...");
-    seedVocabulary.Save(Path.Combine(outputDirectory, "tag_vocabulary.json"));
+    seedVocabulary.Save(vocabularyPath);
 
     var deltaPath = Path.Combine(outputDirectory, "tag_vocabulary.delta.jsonl");
     if (File.Exists(deltaPath))
@@ -846,6 +1121,7 @@ var rootCommand = new RootCommand("unbooru-tagger booru crawler (downloads Danbo
     refreshCommand,
     shrinkCacheCommand,
     pruneAliasedTagsCommand,
+    detectDeprecatedRedirectsCommand,
     rebuildVocabularyCommand,
     pruneUnsupportedMediaCommand,
     recoverCorruptedImagesCommand

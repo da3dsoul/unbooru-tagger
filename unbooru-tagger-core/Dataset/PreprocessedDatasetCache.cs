@@ -44,6 +44,27 @@ public static class PreprocessedDatasetCache
     internal const int ResumeIndexMagic = 0x52534D31; // "RSM1"
 
     /// <summary>
+    /// Caches <see cref="PreprocessedImageIndex.BuildOffsets"/>'s full per-image
+    /// random-access offset table for <see cref="PreprocessedDatasetCacheReader"/> —
+    /// distinct from <see cref="ResumeIndexFileName"/>, which only ever stores the
+    /// single end-of-data offset the writer needs to resume appending. Without this,
+    /// every reader construction (i.e. every `train` invocation) rebuilds the whole
+    /// table from scratch by walking every record's 16-byte box header in turn —
+    /// individually cheap, but each of a multi-million-image corpus's box headers sits
+    /// at a different, widely-separated offset in a pixel file far too large to ever
+    /// be fully page-cached, so the walk is millions of effectively-random small reads
+    /// against the backing storage. Persisting the finished table turns every open
+    /// after the first into one sequential read of this file instead. Self-healing
+    /// exactly like <see cref="ResumeIndexFileName"/>: only trusted when its stored
+    /// image count matches the pixel file's current one, and rewritten whenever it
+    /// doesn't (e.g. after a later crawl appended more images) rather than trusted or
+    /// patched incrementally.
+    /// </summary>
+    internal const string OffsetIndexFileName = "images.bin.offsets";
+
+    internal const int OffsetIndexMagic = 0x4F464931; // "OFI1"
+
+    /// <summary>
     /// Distinguishes the current format from older ones — an old cache read under a
     /// newer layout would otherwise silently misinterpret its bytes instead of failing
     /// loudly. Bumped from "LBX1" to "LBX2" when records switched from fixed-size
@@ -126,6 +147,68 @@ internal static class PreprocessedImageIndex
         var width = BitConverter.ToInt32(boxBuffer, 8);
         var height = BitConverter.ToInt32(boxBuffer, 12);
         return PreprocessedDatasetCache.BoxBytes + PreprocessedDatasetCache.ContentByteLength(width, height);
+    }
+
+    /// <summary>
+    /// <see cref="BuildOffsets"/>, but backed by <see cref="PreprocessedDatasetCache.OffsetIndexFileName"/>
+    /// so a second (and every later) call against the same, unchanged pixel file is one
+    /// sequential read of a small file instead of a full re-walk — see that constant's
+    /// own doc comment for why the walk is expensive enough to matter.
+    /// </summary>
+    public static long[] LoadOrBuildOffsets(string directory, Stream stream, int imageCount)
+    {
+        var indexPath = Path.Combine(directory, PreprocessedDatasetCache.OffsetIndexFileName);
+
+        var cached = TryReadOffsetIndex(indexPath, imageCount);
+        if (cached is not null)
+            return cached;
+
+        var offsets = BuildOffsets(stream, imageCount);
+        WriteOffsetIndex(indexPath, offsets);
+        return offsets;
+    }
+
+    /// <summary>Returns the stored table only if it exists, isn't corrupt, and was written for exactly <paramref name="expectedImageCount"/> — anything else (missing, corrupt, or stale after the pixel file grew/shrank) is treated as "not cached" and silently falls back to rebuilding, same as <see cref="PreprocessedDatasetCacheWriter"/>'s own resume index.</summary>
+    private static long[]? TryReadOffsetIndex(string path, int expectedImageCount)
+    {
+        if (!File.Exists(path))
+            return null;
+
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read);
+            using var reader = new BinaryReader(stream);
+            if (reader.ReadInt32() != PreprocessedDatasetCache.OffsetIndexMagic)
+                return null;
+            if (reader.ReadInt32() != expectedImageCount)
+                return null;
+
+            var offsets = new long[expectedImageCount];
+            for (var i = 0; i < expectedImageCount; i++)
+                offsets[i] = reader.ReadInt64();
+            return offsets;
+        }
+        catch (IOException)
+        {
+            // Covers EndOfStreamException (a truncated/corrupt index file) too — it derives from IOException.
+            return null;
+        }
+    }
+
+    /// <summary>Written under a temp name and renamed into place — same reasoning as every other atomic write in this codebase: a crash mid-write leaves the previous (or no) index behind instead of a truncated one <see cref="TryReadOffsetIndex"/> would otherwise have to detect.</summary>
+    private static void WriteOffsetIndex(string path, long[] offsets)
+    {
+        var tempPath = path + ".tmp";
+        using (var stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write))
+        using (var writer = new BinaryWriter(stream))
+        {
+            writer.Write(PreprocessedDatasetCache.OffsetIndexMagic);
+            writer.Write(offsets.Length);
+            foreach (var offset in offsets)
+                writer.Write(offset);
+        }
+
+        File.Move(tempPath, path, overwrite: true);
     }
 }
 
@@ -389,10 +472,10 @@ public sealed class PreprocessedDatasetCacheReader : IDisposable
         }
 
         // Records are variable-length (content-only, no padding stored), so random
-        // access needs an offset table. Building it costs one sequential pass over just
-        // the box headers (16 bytes each) — never the pixel payloads — so it stays cheap
-        // even at a multi-million-image corpus.
-        _offsets = PreprocessedImageIndex.BuildOffsets(_pixelStream, ImageCount);
+        // access needs an offset table. See PreprocessedDatasetCache.OffsetIndexFileName's
+        // doc comment for why this is cached on disk rather than rebuilt from the box
+        // headers on every open.
+        _offsets = PreprocessedImageIndex.LoadOrBuildOffsets(directory, _pixelStream, ImageCount);
 
         // Migrates an existing tag_rows.jsonl automatically on first open, same as the
         // writer — training can open a cache directly that no writer in this process

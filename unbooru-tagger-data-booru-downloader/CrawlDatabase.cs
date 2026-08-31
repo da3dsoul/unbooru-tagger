@@ -202,6 +202,12 @@ public sealed class CrawlDatabase : IDisposable
         // an ImageSources scan.
         await EnsureColumnAsync("TagProgress", "SitePositiveCount", "INTEGER NOT NULL DEFAULT 0", cancellationToken).ConfigureAwait(false);
         await EnsureColumnAsync("TagProgress", "SiteDuplicateCount", "INTEGER NOT NULL DEFAULT 0", cancellationToken).ConfigureAwait(false);
+
+        // True if either site currently flags the tag deprecated (Danbooru's own
+        // `is_deprecated`, or Gelbooru's dedicated type=6) — see TagSurveyor.SurveyAsync.
+        // Informational only: a pre-existing row defaults to 0/not-deprecated until the
+        // next survey-tags run actually observes and records the real value.
+        await EnsureColumnAsync("Tags", "Deprecated", "INTEGER NOT NULL DEFAULT 0", cancellationToken).ConfigureAwait(false);
     }
 
     private async Task EnsureColumnAsync(string table, string column, string definition, CancellationToken cancellationToken)
@@ -258,7 +264,7 @@ public sealed class CrawlDatabase : IDisposable
     /// the caller still report per-row progress.
     /// </summary>
     public Task UpsertTagSurveysAsync(
-        IEnumerable<(string Name, int? DanbooruCount, int? GelbooruCount, bool Eligible)> entries,
+        IEnumerable<(string Name, int? DanbooruCount, int? GelbooruCount, bool Eligible, bool Deprecated)> entries,
         DateTimeOffset surveyedAt,
         Action<int>? onRowWritten,
         CancellationToken cancellationToken = default) =>
@@ -270,19 +276,21 @@ public sealed class CrawlDatabase : IDisposable
             command.Transaction = transaction;
             command.CommandText =
                 """
-                INSERT INTO Tags (Name, DanbooruCount, GelbooruCount, Eligible, SurveyedAt, CombinedPositiveCount)
-                VALUES ($name, $danbooru, $gelbooru, $eligible, $surveyedAt, 0)
+                INSERT INTO Tags (Name, DanbooruCount, GelbooruCount, Eligible, SurveyedAt, CombinedPositiveCount, Deprecated)
+                VALUES ($name, $danbooru, $gelbooru, $eligible, $surveyedAt, 0, $deprecated)
                 ON CONFLICT(Name) DO UPDATE SET
                     DanbooruCount = $danbooru,
                     GelbooruCount = $gelbooru,
                     Eligible = $eligible,
-                    SurveyedAt = $surveyedAt;
+                    SurveyedAt = $surveyedAt,
+                    Deprecated = $deprecated;
                 """;
             var nameParam = command.Parameters.Add("$name", SqliteType.Text);
             var danbooruParam = command.Parameters.Add("$danbooru", SqliteType.Integer);
             var gelbooruParam = command.Parameters.Add("$gelbooru", SqliteType.Integer);
             var eligibleParam = command.Parameters.Add("$eligible", SqliteType.Integer);
             var surveyedAtParam = command.Parameters.Add("$surveyedAt", SqliteType.Text);
+            var deprecatedParam = command.Parameters.Add("$deprecated", SqliteType.Integer);
             surveyedAtParam.Value = surveyedAt.ToString("O");
 
             var written = 0;
@@ -294,6 +302,7 @@ public sealed class CrawlDatabase : IDisposable
                 danbooruParam.Value = (object?)entry.DanbooruCount ?? DBNull.Value;
                 gelbooruParam.Value = (object?)entry.GelbooruCount ?? DBNull.Value;
                 eligibleParam.Value = entry.Eligible ? 1 : 0;
+                deprecatedParam.Value = entry.Deprecated ? 1 : 0;
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
 
                 written++;
@@ -363,7 +372,7 @@ public sealed class CrawlDatabase : IDisposable
         WithLockAsync(async () =>
         {
             var command = _connection.CreateCommand();
-            command.CommandText = "SELECT Name, DanbooruCount, GelbooruCount FROM Tags;";
+            command.CommandText = "SELECT Name, DanbooruCount, GelbooruCount, Deprecated FROM Tags;";
             var results = new List<TagSurveyResult>();
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -371,7 +380,8 @@ public sealed class CrawlDatabase : IDisposable
                 results.Add(new TagSurveyResult(
                     reader.GetString(0),
                     reader.IsDBNull(1) ? null : reader.GetInt32(1),
-                    reader.IsDBNull(2) ? null : reader.GetInt32(2)));
+                    reader.IsDBNull(2) ? null : reader.GetInt32(2),
+                    reader.GetInt32(3) != 0));
             }
             return (IReadOnlyList<TagSurveyResult>)results;
         }, cancellationToken);

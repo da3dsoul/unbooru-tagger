@@ -27,6 +27,24 @@ internal sealed class RecordingHttpMessageHandler(string responseBody) : HttpMes
     }
 }
 
+/// <summary>
+/// Returns <paramref name="firstPageBody"/> for the first request and Gelbooru's own
+/// empty-page shape (<c>{"tag": []}</c>) after that — <see cref="FakeHttpMessageHandler"/>'s
+/// single fixed non-empty response never terminates <see cref="GelbooruClient.ListTagsByCountDescendingAsync"/>'s
+/// page-until-empty loop (it isn't Danbooru's bare-array shape either, which
+/// <c>JsonElement.TryGetProperty</c> would throw on for this endpoint).
+/// </summary>
+internal sealed class GelbooruSinglePageThenEmptyTagHttpMessageHandler(string firstPageBody) : HttpMessageHandler
+{
+    private int _calls;
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        var body = Interlocked.Increment(ref _calls) == 1 ? firstPageBody : """{ "tag": [] }""";
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(body) });
+    }
+}
+
 public class GelbooruClientTests
 {
     private const string SamplePostJson =
@@ -112,6 +130,34 @@ public class GelbooruClientTests
         // orderby=count alone silently falls back to an unspecified order.
         Assert.Contains("orderby=count", query);
         Assert.Contains("order=DESC", query);
+    }
+
+    [Fact]
+    public async Task ListTagsByCountDescendingAsync_MarksTypeSixAsDeprecated()
+    {
+        const string tagResponse =
+            """
+            {
+              "tag": [
+                { "name": "curvy_figure", "count": 500, "type": 6 },
+                { "name": "1girl", "count": 900, "type": 0 }
+              ]
+            }
+            """;
+        var httpClient = new HttpClient(new GelbooruSinglePageThenEmptyTagHttpMessageHandler(tagResponse));
+        var client = new GelbooruClient(httpClient, new ImmediateRateLimiter());
+
+        var tags = new List<BooruTagCount>();
+        await foreach (var tag in client.ListTagsByCountDescendingAsync())
+            tags.Add(tag);
+
+        // Gelbooru has no separate deprecated boolean — 6 is its own dedicated code for
+        // it, unrecognized by TagCategoryNaming.FromRawCode, so the tag still falls back
+        // to General rather than losing information about being deprecated altogether.
+        var deprecatedTag = Assert.Single(tags, t => t.Name == "curvy_figure");
+        Assert.True(deprecatedTag.Deprecated);
+        var normalTag = Assert.Single(tags, t => t.Name == "1girl");
+        Assert.False(normalTag.Deprecated);
     }
 
     [Fact]

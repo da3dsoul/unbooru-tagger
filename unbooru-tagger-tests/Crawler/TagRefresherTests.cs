@@ -62,7 +62,7 @@ public class TagRefresherTests
 
         var db = await CrawlDatabase.OpenOrCreateAsync(directory);
         await db.UpsertTagSurveysAsync(
-            [("1girl", (int?)1000, (int?)1000, true), ("outdoors", (int?)1000, (int?)1000, true)],
+            [("1girl", (int?)1000, (int?)1000, true, false), ("outdoors", (int?)1000, (int?)1000, true, false)],
             DateTimeOffset.UtcNow, null);
 
         var image = new PendingNewImage("abc", 0, 100, 100, DateTimeOffset.UtcNow, "danbooru", 1, "https://x/1.jpg", "g", DateTimeOffset.UtcNow, ["1girl"], PHash: 0);
@@ -192,7 +192,7 @@ public class TagRefresherTests
             // identity lookup (TagRowMutations.BuildEligibleIdentities), and should
             // deterministically pick the identity with the higher combined post count.
             await db.UpsertTagSurveysAsync(
-                [("elvaan", (int?)1000, null, true), ("character:elvaan", null, (int?)2000, true)],
+                [("elvaan", (int?)1000, null, true, false), ("character:elvaan", null, (int?)2000, true, false)],
                 DateTimeOffset.UtcNow, null);
 
             var clients = new Dictionary<string, IBooruClient>
@@ -240,7 +240,7 @@ public class TagRefresherTests
         try
         {
             // Post-merge survey state: only "headpat" is its own eligible tag now.
-            await db.UpsertTagSurveysAsync([("headpat", (int?)1000, (int?)1000, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("headpat", (int?)1000, (int?)1000, true, false)], DateTimeOffset.UtcNow, null);
 
             var image = new PendingNewImage("headpat-img", 0, 100, 100, DateTimeOffset.UtcNow, "gelbooru", 2, "https://x/2.jpg", "g", DateTimeOffset.UtcNow, ["head_pat"], PHash: 0);
             await db.CommitPendingImagesAsync([image], [], [], CancellationToken.None);
@@ -288,7 +288,7 @@ public class TagRefresherTests
         var db = await CrawlDatabase.OpenOrCreateAsync(directory);
         try
         {
-            await db.UpsertTagSurveysAsync([("headpat", (int?)1000, (int?)1000, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("headpat", (int?)1000, (int?)1000, true, false)], DateTimeOffset.UtcNow, null);
 
             var targetedImage = new PendingNewImage("target-img", 0, 100, 100, DateTimeOffset.UtcNow, "gelbooru", 10, "https://x/10.jpg", "g", DateTimeOffset.UtcNow, ["head_pat"], PHash: 0);
             var untouchedImage = new PendingNewImage("untouched-img", 1, 100, 100, DateTimeOffset.UtcNow, "gelbooru", 20, "https://x/20.jpg", "g", DateTimeOffset.UtcNow, ["1girl"], PHash: 0);

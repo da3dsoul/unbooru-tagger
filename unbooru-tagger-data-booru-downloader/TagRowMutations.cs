@@ -37,14 +37,43 @@ internal static class TagRowMutations
     }
 
     /// <summary>
-    /// Maps a post's raw (un-prefixed) tag names — the only form a site's API ever
-    /// returns — to their eligible <see cref="TagCategoryNaming"/> identities, dropping
-    /// any raw tag that isn't a currently-eligible tag at all. <paramref name="eligibleTagIdentities"/>
-    /// is keyed by raw name (see <see cref="BuildEligibleIdentities"/> for how it's built
-    /// from the survey) since that's the only form a post's tags ever arrive in.
+    /// Maps a tag list to the currently-eligible <see cref="TagCategoryNaming"/> identities
+    /// it resolves to, dropping any tag that isn't a currently-eligible tag at all.
+    /// <paramref name="eligibleTagIdentities"/> is keyed by raw (un-prefixed) name — see
+    /// <see cref="BuildEligibleIdentities"/> — so every input string is reduced to its raw
+    /// name before lookup.
+    ///
+    /// That normalization step matters because <paramref name="tags"/> arrives in two
+    /// different shapes depending on the caller, and both must resolve identically:
+    /// <list type="bullet">
+    /// <item>Genuinely raw names straight off a site's API (<see cref="DatasetCrawler"/>'s
+    /// crawl/duplicate-merge paths and <see cref="TagRefresher"/>'s re-fetches, all reading
+    /// <c>BooruPost.Tags</c>). A booru tag name can never contain <c>:</c> (reserved for
+    /// site search-query syntax — see <see cref="TagCategoryNaming"/>), so
+    /// <see cref="TagCategoryNaming.RawName"/> is a guaranteed no-op on these.</item>
+    /// <item>Already-resolved identity strings replayed out of <c>crawl.sqlite</c>'s
+    /// <c>ImageSources.Tags</c> snapshots (<see cref="VocabularyRebuilder"/>) — which
+    /// <see cref="DatasetCrawler"/> wrote as the OUTPUT of an earlier call to this very
+    /// method, so a non-General tag is stored category-prefixed
+    /// (<c>character:megurine_luka</c>).</item>
+    /// </list>
+    /// Looking the input up verbatim silently dropped every prefixed identity in the second
+    /// shape (the dictionary only ever holds raw keys, which never contain <c>:</c>, so a
+    /// prefixed string can only ever miss) — a real incident that zeroed roughly half the
+    /// vocabulary's <c>ImageCount</c>s on a <c>rebuild-vocabulary</c> pass without throwing
+    /// or logging anything. Stripping first is exactly equivalent to "try verbatim, then
+    /// strip" — the two only ever differ for a string containing <c>:</c>, which can never
+    /// be a key — so it fixes the replay case while provably changing nothing for the
+    /// raw-input callers.
+    ///
+    /// Resolution is always against the CURRENT survey, never the stored spelling: a stored
+    /// identity whose raw name is now excluded or below quota is correctly dropped, and one
+    /// whose category has since been reconciled (a raw <c>inkling</c> stored as General that
+    /// the survey now files as <c>character:inkling</c>, or vice versa) is correctly
+    /// re-credited to the identity in force today.
     /// </summary>
-    public static IEnumerable<string> EligibleIdentities(IEnumerable<string> rawTags, IReadOnlyDictionary<string, string> eligibleTagIdentities) =>
-        rawTags.Select(eligibleTagIdentities.GetValueOrDefault).OfType<string>();
+    public static IEnumerable<string> EligibleIdentities(IEnumerable<string> tags, IReadOnlyDictionary<string, string> eligibleTagIdentities) =>
+        tags.Select(tag => eligibleTagIdentities.GetValueOrDefault(TagCategoryNaming.RawName(tag))).OfType<string>();
 
     /// <summary>
     /// Builds the raw-name -&gt; identity lookup <see cref="EligibleIdentities"/> consumes.

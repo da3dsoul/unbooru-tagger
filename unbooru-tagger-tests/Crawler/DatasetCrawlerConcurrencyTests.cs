@@ -296,7 +296,7 @@ public class DatasetCrawlerConcurrencyTests
         try
         {
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)10, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)10, true, false)], DateTimeOffset.UtcNow, null);
 
             var imageBytes = MakeTestPng();
             var fileUrl = new Uri("https://example.test/img.png");
@@ -345,7 +345,7 @@ public class DatasetCrawlerConcurrencyTests
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
             // The survey records a tag's identity — its raw booru name prefixed with
             // its category (see TagCategoryNaming) — not the raw name itself.
-            await db.UpsertTagSurveysAsync([("character:frieren", (int?)10, (int?)null, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("character:frieren", (int?)10, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
 
             var imageBytes = MakeTestPng();
             // A site's own API only ever returns a post's tags by their raw name.
@@ -381,7 +381,7 @@ public class DatasetCrawlerConcurrencyTests
             // Simulates the post-merge survey state: only "headpat" survived as its own
             // eligible tag row (TagSurveyor folds "head_pat" into it before this point) —
             // "head_pat" is NOT a separate eligible tag anymore.
-            await db.UpsertTagSurveysAsync([("headpat", (int?)10, (int?)10, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("headpat", (int?)10, (int?)10, true, false)], DateTimeOffset.UtcNow, null);
 
             var imageBytes = MakeTestPng();
             // Gelbooru's own posts keep using its own raw spelling forever — it has no
@@ -428,7 +428,7 @@ public class DatasetCrawlerConcurrencyTests
         try
         {
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("headpat", (int?)10, (int?)10, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("headpat", (int?)10, (int?)10, true, false)], DateTimeOffset.UtcNow, null);
 
             var imageBytes = MakeTestPng();
             var post = new BooruPost(1, "head-pat-image-no-alias", new Uri("https://example.test/img.png"), ["head_pat"], "g", DateTimeOffset.UtcNow, 8, 8);
@@ -458,7 +458,7 @@ public class DatasetCrawlerConcurrencyTests
         try
         {
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)null, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
 
             var imageBytes = MakeTestPng();
             var post = new BooruPost(1, "flaky-retry-image", new Uri("https://example.test/img.png"), ["1girl"], "g", DateTimeOffset.UtcNow, 8, 8);
@@ -511,7 +511,7 @@ public class DatasetCrawlerConcurrencyTests
         try
         {
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)10, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)10, true, false)], DateTimeOffset.UtcNow, null);
 
             var imageBytes = MakeTestPng();
             var gelbooruPost = new BooruPost(1, "gelbooru-only-image", new Uri("https://example.test/img.png"), ["1girl"], "g", DateTimeOffset.UtcNow, 8, 8);
@@ -576,7 +576,7 @@ public class DatasetCrawlerConcurrencyTests
         try
         {
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)10, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)10, true, false)], DateTimeOffset.UtcNow, null);
 
             var danbooruUrl = new Uri("https://example.test/danbooru.png");
             var gelbooruUrl = new Uri("https://example.test/gelbooru.png");
@@ -654,7 +654,7 @@ public class DatasetCrawlerConcurrencyTests
         try
         {
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)null, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
 
             var post1 = new BooruPost(1, "maybe-appended-before-cancel-1", new Uri("https://example.test/1.png"), ["1girl"], "g", DateTimeOffset.UtcNow, 8, 8);
             var post2 = new BooruPost(2, "maybe-appended-before-cancel-2", new Uri("https://example.test/2.png"), ["1girl"], "g", DateTimeOffset.UtcNow, 8, 8);
@@ -714,7 +714,7 @@ public class DatasetCrawlerConcurrencyTests
         try
         {
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)10, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)10, true, false)], DateTimeOffset.UtcNow, null);
 
             var sharedUrl = new Uri("https://example.test/shared.png");
             var exclusiveUrl = new Uri("https://example.test/exclusive.png");
@@ -790,7 +790,7 @@ public class DatasetCrawlerConcurrencyTests
         try
         {
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)null, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
 
             var deadUrl = new Uri("https://example.test/dead.png");
             var liveUrl = new Uri("https://example.test/live.png");
@@ -842,7 +842,7 @@ public class DatasetCrawlerConcurrencyTests
         try
         {
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)null, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)10, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
 
             var unauthorizedUrl = new Uri("https://example.test/unauthorized.png");
             var post = new BooruPost(1, "unauthorized-post", unauthorizedUrl, ["1girl"], "g", DateTimeOffset.UtcNow, 8, 8);
@@ -908,7 +908,7 @@ public class DatasetCrawlerConcurrencyTests
         try
         {
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("1girl", (int?)50, (int?)null, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)50, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
 
             const int postCount = 40;
             var posts = Enumerable.Range(0, postCount)
@@ -1010,7 +1010,7 @@ public class DatasetCrawlerConcurrencyTests
                 writer.Append(new EncodedImage(Enumerable.Range(0, inputSize * inputSize * 3).Select(i => (byte)i).ToArray(), new LetterboxBox(0, 0, inputSize, inputSize)), [0]);
 
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("head_pat", (int?)10, (int?)null, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("head_pat", (int?)10, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
 
             var seedImage = new PendingNewImage(
                 "already-known-image", 0, 100, 100, DateTimeOffset.UtcNow,
@@ -1090,7 +1090,7 @@ public class DatasetCrawlerConcurrencyTests
             }
 
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("head_pat", (int?)1000, (int?)null, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("head_pat", (int?)1000, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
 
             var seedImages = Enumerable.Range(0, alreadyKnownCount)
                 .Select(i => new PendingNewImage($"already-known-{i}", i, 100, 100, DateTimeOffset.UtcNow, "danbooru", i, $"https://example.test/known-{i}.png", "g", DateTimeOffset.UtcNow, ["head_pat"], PHash: 0))
@@ -1165,7 +1165,7 @@ public class DatasetCrawlerConcurrencyTests
         try
         {
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
 
             // More posts than maxImages needs, on a single page whose NextCursor is
             // deliberately non-null: this site's own pagination is NOT exhausted, so the
@@ -1228,7 +1228,7 @@ public class DatasetCrawlerConcurrencyTests
         try
         {
             using var db = await CrawlDatabase.OpenOrCreateAsync(directory);
-            await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true)], DateTimeOffset.UtcNow, null);
+            await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
 
             // First page satisfies firstRunMaxImages without exhausting pagination (same
             // setup as RunAsync_ResumedWithQuotaAlreadySatisfied_SkipsRefetchingEntirely);

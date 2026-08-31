@@ -1,7 +1,12 @@
 namespace UnbooruTagger.Crawler;
 
-/// <summary>One tag's surveyed post count per site, as recorded by <c>survey-tags</c>.</summary>
-public readonly record struct TagSurveyResult(string Name, int? DanbooruCount, int? GelbooruCount)
+/// <summary>
+/// One tag's surveyed post count per site, as recorded by <c>survey-tags</c>.
+/// <paramref name="Deprecated"/> is true if either site currently flags the tag deprecated
+/// — informational only today; eligibility/crawling still ignore it (a deprecated tag's
+/// posts are real, currently-tagged images, not a reason to skip them).
+/// </summary>
+public readonly record struct TagSurveyResult(string Name, int? DanbooruCount, int? GelbooruCount, bool Deprecated = false)
 {
     /// <summary>The count a crawl budgets against — the larger of the two sites' counts, since a tag only needs to be worth crawling on at least one of them.</summary>
     public int BestCount => Math.Max(DanbooruCount ?? 0, GelbooruCount ?? 0);

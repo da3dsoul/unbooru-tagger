@@ -310,6 +310,12 @@ public static class TrainCommandHandler
         var batchesDone = 0;
         for (var offset = 0; offset < validationIndices.Count; offset += batchSize)
         {
+            // Same reasoning as the training loop's stepScope (see there): without this,
+            // every validation batch's tensors (including the discarded pooled global
+            // embedding from imageTower.forward below) leak native/CUDA memory that
+            // outlives this method, across every epoch's validation pass.
+            using var batchScope = NewDisposeScope();
+
             var chunk = validationIndices.Skip(offset).Take(batchSize).ToList();
 
             var (rawPixelBatch, boxes) = loadBatch(chunk);

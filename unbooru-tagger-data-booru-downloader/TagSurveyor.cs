@@ -5,7 +5,8 @@ public sealed record TagSurveySummary(
     int TotalTagsSeen,
     int EligibleTagCount,
     long EstimatedImageSlots,
-    int ExcludedTagCount);
+    int ExcludedTagCount,
+    int DeprecatedTagCount);
 
 /// <summary>Reports what <see cref="TagSurveyor"/> is doing right now, for a caller to render as a live status line.</summary>
 public sealed class TagSurveyProgress
@@ -58,12 +59,12 @@ public static class TagSurveyor
         TagSurveyProgress? progress = null,
         CancellationToken cancellationToken = default)
     {
-        // Site -> (tag -> count), merged into one per-tag record per site below.
-        var countsBySite = new Dictionary<string, Dictionary<string, int>>();
+        // Site -> (tag -> (count, deprecated)), merged into one per-tag record per site below.
+        var countsBySite = new Dictionary<string, Dictionary<string, (int Count, bool Deprecated)>>();
 
         foreach (var client in clients)
         {
-            var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var counts = new Dictionary<string, (int, bool)>(StringComparer.Ordinal);
             await foreach (var tagCount in client.ListTagsByCountDescendingAsync(cancellationToken).WithCancellation(cancellationToken))
             {
                 if (tagCount.PostCount < minImages)
@@ -73,7 +74,7 @@ public static class TagSurveyor
                     break;
                 }
 
-                counts[tagCount.Name] = tagCount.PostCount;
+                counts[tagCount.Name] = (tagCount.PostCount, tagCount.Deprecated);
                 progress?.OnSiteTagCount?.Invoke(client.SiteName, counts.Count);
             }
 
@@ -85,15 +86,14 @@ public static class TagSurveyor
         // calls it Character) that merging by identity would keep both as separate rows —
         // which downstream code can't tolerate, since everything past this point (vocab,
         // exclusions, TagRowMutations.EligibleIdentities) assumes a raw name maps to
-        // exactly one identity. Danbooru's categorization wins on disagreement since it's
-        // looked up first below and is generally the better-curated of the two.
-        Dictionary<string, (TagCategory Category, int Count)> ByRawName(string site)
+        // exactly one identity.
+        Dictionary<string, (TagCategory Category, int Count, bool Deprecated)> ByRawName(string site)
         {
-            var byRaw = new Dictionary<string, (TagCategory, int)>(StringComparer.Ordinal);
-            foreach (var (identity, count) in countsBySite.GetValueOrDefault(site) ?? [])
+            var byRaw = new Dictionary<string, (TagCategory, int, bool)>(StringComparer.Ordinal);
+            foreach (var (identity, value) in countsBySite.GetValueOrDefault(site) ?? [])
             {
                 var (rawName, category) = TagCategoryNaming.Split(identity);
-                byRaw[rawName] = (category, count);
+                byRaw[rawName] = (category, value.Count, value.Deprecated);
             }
             return byRaw;
         }
@@ -104,17 +104,17 @@ public static class TagSurveyor
         // alias table came from: the antecedent spelling can show up as the CURRENT raw
         // name on the other site even though the alias itself is only known from
         // Danbooru's own table.
-        Dictionary<string, (TagCategory Category, int Count)> ResolveAliases(Dictionary<string, (TagCategory Category, int Count)> byRaw)
+        Dictionary<string, (TagCategory Category, int Count, bool Deprecated)> ResolveAliases(Dictionary<string, (TagCategory Category, int Count, bool Deprecated)> byRaw)
         {
             if (tagAliases is not { Count: > 0 })
                 return byRaw;
 
-            var resolved = new Dictionary<string, (TagCategory Category, int Count)>(StringComparer.Ordinal);
+            var resolved = new Dictionary<string, (TagCategory Category, int Count, bool Deprecated)>(StringComparer.Ordinal);
             foreach (var (rawName, value) in byRaw)
             {
                 var canonical = TagRowMutations.ResolveAlias(rawName, tagAliases);
                 resolved[canonical] = resolved.TryGetValue(canonical, out var existing)
-                    ? (existing.Category, existing.Count + value.Count)
+                    ? (existing.Category, existing.Count + value.Count, existing.Deprecated || value.Deprecated)
                     : value;
             }
             return resolved;
@@ -126,7 +126,7 @@ public static class TagSurveyor
 
         var surveyedAt = DateTimeOffset.UtcNow;
         var results = new List<TagSurveyResult>(rawNames.Count);
-        var entries = new List<(string Name, int? DanbooruCount, int? GelbooruCount, bool Eligible)>(rawNames.Count);
+        var entries = new List<(string Name, int? DanbooruCount, int? GelbooruCount, bool Eligible, bool Deprecated)>(rawNames.Count);
 
         foreach (var rawName in rawNames)
         {
@@ -135,13 +135,26 @@ public static class TagSurveyor
             int? danbooruCount = hasDanbooru ? danbooru.Count : null;
             int? gelbooruCount = hasGelbooru ? gelbooru.Count : null;
 
-            var category = hasDanbooru ? danbooru.Category : hasGelbooru ? gelbooru.Category : TagCategory.General;
+            // Prefer whichever site reports a specific (non-General) category first, and
+            // only fall back to Danbooru's/Gelbooru's own General when neither has one —
+            // Danbooru's own "General" very often just means "nobody has recategorized
+            // this tag yet" rather than a confirmed judgment, so trusting it unconditionally
+            // over a site that DID call the same raw tag Character/Copyright/Artist/Meta
+            // was silently swallowing real character/series tags into General. A genuine
+            // disagreement between two non-General categories still prefers Danbooru,
+            // which is generally the better-curated of the two.
+            var category = hasDanbooru && danbooru.Category != TagCategory.General ? danbooru.Category
+                : hasGelbooru && gelbooru.Category != TagCategory.General ? gelbooru.Category
+                : hasDanbooru ? danbooru.Category
+                : hasGelbooru ? gelbooru.Category
+                : TagCategory.General;
             var identity = TagCategoryNaming.Identity(rawName, category);
+            var deprecated = (hasDanbooru && danbooru.Deprecated) || (hasGelbooru && gelbooru.Deprecated);
 
-            var result = new TagSurveyResult(identity, danbooruCount, gelbooruCount);
+            var result = new TagSurveyResult(identity, danbooruCount, gelbooruCount, deprecated);
             var eligible = TagEligibility.IsEligible(result, minImages, excludedTags);
 
-            entries.Add((identity, danbooruCount, gelbooruCount, eligible));
+            entries.Add((identity, danbooruCount, gelbooruCount, eligible, deprecated));
             results.Add(result);
         }
 
@@ -154,27 +167,36 @@ public static class TagSurveyor
             written => progress?.OnPersisting?.Invoke(written, entries.Count),
             cancellationToken).ConfigureAwait(false);
 
-        // A known antecedent never survives ResolveAliases into `entries` above (it's
-        // folded into its consequent before rawNames is even built), so any row still
-        // sitting in the DB under that identity is left over from before this alias was
-        // known — e.g. a crawl.sqlite surveyed before ListActiveTagAliasesAsync existed.
-        // Deleted outright rather than left at Eligible = 0, since that path is for a tag
-        // that genuinely fell under quota this survey, not one that should never be
-        // iterated as its own tag again. Its TagProgress rows (any site/phase) are
-        // deleted alongside the Tags row, not just left orphaned — a resumed crawl only
-        // ever iterates tags still present in Tags, so leaving them behind is harmless to
-        // correctness, but keeps crawl.sqlite honest for anyone inspecting it directly.
-        if (tagAliases is { Count: > 0 })
+        // Two reasons an existing Tags row can go stale under this survey and need
+        // deleting outright rather than merely left at Eligible = 0 (that path is for a
+        // tag that genuinely fell under quota this run, not one that should never be
+        // iterated under its old identity again):
+        //  1. A known antecedent never survives ResolveAliases into `entries` above (it's
+        //     folded into its consequent before rawNames is even built) — e.g. a
+        //     crawl.sqlite surveyed before ListActiveTagAliasesAsync existed.
+        //  2. This survey now computes a DIFFERENT identity for a raw name than a previous
+        //     survey did (most commonly: the category-merge fix above now resolves a raw
+        //     tag to `character:`/`series:` that used to fall back to unprefixed General) —
+        //     the row from the earlier, wrong identity is left behind under Name unless
+        //     removed here, otherwise it sits around forever still marked Eligible and
+        //     still iterated by a resumed crawl under the stale, wrongly-categorized name.
+        // Its TagProgress rows (any site/phase) are deleted alongside the Tags row, not
+        // just left orphaned — a resumed crawl only ever iterates tags still present in
+        // Tags, so leaving them behind is harmless to correctness, but keeps crawl.sqlite
+        // honest for anyone inspecting it directly.
         {
             var existingRows = await db.GetAllSurveyedTagsAsync(cancellationToken).ConfigureAwait(false);
-            var staleAliasRows = existingRows
+            var newIdentityByRawName = entries.ToDictionary(e => TagCategoryNaming.RawName(e.Name), e => e.Name, StringComparer.Ordinal);
+            var staleRows = existingRows
                 .Select(t => t.Name)
-                .Where(name => tagAliases.ContainsKey(TagCategoryNaming.RawName(name)))
+                .Where(name =>
+                    (tagAliases?.ContainsKey(TagCategoryNaming.RawName(name)) ?? false) ||
+                    (newIdentityByRawName.TryGetValue(TagCategoryNaming.RawName(name), out var newIdentity) && newIdentity != name))
                 .ToList();
-            if (staleAliasRows.Count > 0)
+            if (staleRows.Count > 0)
             {
-                await db.DeleteTagSurveysAsync(staleAliasRows, cancellationToken).ConfigureAwait(false);
-                await db.DeleteTagProgressAsync(staleAliasRows, cancellationToken).ConfigureAwait(false);
+                await db.DeleteTagSurveysAsync(staleRows, cancellationToken).ConfigureAwait(false);
+                await db.DeleteTagProgressAsync(staleRows, cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -184,6 +206,7 @@ public static class TagSurveyor
             results.Count,
             eligibleTags.Count,
             TagEligibility.EstimateImageSlots(eligibleTags, minImages, maxImages, excludedTags),
-            excludedTagCount);
+            excludedTagCount,
+            eligibleTags.Count(t => t.Deprecated));
     }
 }

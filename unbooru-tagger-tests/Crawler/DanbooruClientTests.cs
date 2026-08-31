@@ -58,6 +58,29 @@ public class DanbooruClientTests
     }
 
     [Fact]
+    public async Task ListTagsByCountDescendingAsync_ParsesIsDeprecated()
+    {
+        const string json =
+            """
+            [
+              { "name": "some_old_spelling", "post_count": 500, "category": 0, "is_deprecated": true },
+              { "name": "1girl", "post_count": 900, "category": 0, "is_deprecated": false }
+            ]
+            """;
+        var httpClient = new HttpClient(new SinglePageThenEmptyHttpMessageHandler(json));
+        var client = new DanbooruClient(httpClient, new ImmediateRateLimiter());
+
+        var tags = new List<BooruTagCount>();
+        await foreach (var tag in client.ListTagsByCountDescendingAsync())
+            tags.Add(tag);
+
+        var deprecatedTag = Assert.Single(tags, t => t.Name == "some_old_spelling");
+        Assert.True(deprecatedTag.Deprecated);
+        var normalTag = Assert.Single(tags, t => t.Name == "1girl");
+        Assert.False(normalTag.Deprecated);
+    }
+
+    [Fact]
     public async Task ListActiveTagAliasesAsync_SkipsEntriesMissingExpectedFields()
     {
         const string json = """[ { "id": 1, "status": "active" } ]""";

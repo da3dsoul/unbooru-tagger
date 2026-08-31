@@ -17,9 +17,9 @@ public class CrawlDatabaseTests
         using var db = await OpenTempDatabaseAsync();
         var entries = new[]
         {
-            ("common", (int?)10000, (int?)8000, true),
-            ("danbooru_only", (int?)6000, (int?)null, true),
-            ("gelbooru_only", (int?)null, (int?)6000, true),
+            ("common", (int?)10000, (int?)8000, true, false),
+            ("danbooru_only", (int?)6000, (int?)null, true, false),
+            ("gelbooru_only", (int?)null, (int?)6000, true, false),
         };
 
         var writtenCounts = new List<int>();
@@ -35,11 +35,24 @@ public class CrawlDatabaseTests
     }
 
     [Fact]
+    public async Task UpsertTagSurveysAsync_PersistsAndOverwritesDeprecated()
+    {
+        using var db = await OpenTempDatabaseAsync();
+        await db.UpsertTagSurveysAsync([("tag", (int?)1000, (int?)null, true, true)], DateTimeOffset.UtcNow, null);
+        Assert.True((await db.GetAllSurveyedTagsAsync()).Single().Deprecated);
+
+        // A later re-survey un-deprecating the tag (e.g. the site reverted it) must
+        // overwrite the stored flag, not just leave the earlier value stuck.
+        await db.UpsertTagSurveysAsync([("tag", (int?)1000, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
+        Assert.False((await db.GetAllSurveyedTagsAsync()).Single().Deprecated);
+    }
+
+    [Fact]
     public async Task UpsertTagSurveysAsync_OverwritesOnReSurvey()
     {
         using var db = await OpenTempDatabaseAsync();
-        await db.UpsertTagSurveysAsync([("tag", (int?)100, (int?)null, false)], DateTimeOffset.UtcNow, null);
-        await db.UpsertTagSurveysAsync([("tag", (int?)900, (int?)null, true)], DateTimeOffset.UtcNow, null);
+        await db.UpsertTagSurveysAsync([("tag", (int?)100, (int?)null, false, false)], DateTimeOffset.UtcNow, null);
+        await db.UpsertTagSurveysAsync([("tag", (int?)900, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
 
         var stored = await db.GetAllSurveyedTagsAsync();
         Assert.Single(stored);
@@ -53,7 +66,7 @@ public class CrawlDatabaseTests
     public async Task CommitPendingImagesAsync_PersistsNewImagesAndCreditsEachEligibleTagOnce()
     {
         using var db = await OpenTempDatabaseAsync();
-        await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true), ("solo", (int?)1000, (int?)null, true)], DateTimeOffset.UtcNow, null);
+        await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true, false), ("solo", (int?)1000, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
 
         var image = MakeImage("md5-a", 0, "1girl", "solo");
         await db.CommitPendingImagesAsync([image], [], [], CancellationToken.None);
@@ -71,7 +84,7 @@ public class CrawlDatabaseTests
     public async Task CommitPendingImagesAsync_AdditionalSourceDoesNotDuplicateOrCreditAgain()
     {
         using var db = await OpenTempDatabaseAsync();
-        await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true)], DateTimeOffset.UtcNow, null);
+        await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
         await db.CommitPendingImagesAsync([MakeImage("md5-a", 0, "1girl")], [], [], CancellationToken.None);
 
         // A re-encode of the same artwork found on the other site — just another
@@ -88,7 +101,7 @@ public class CrawlDatabaseTests
     {
         using var db = await OpenTempDatabaseAsync();
         await db.UpsertTagSurveysAsync(
-            [("1girl", (int?)1000, (int?)null, true), ("outdoors", (int?)1000, (int?)null, true)],
+            [("1girl", (int?)1000, (int?)null, true, false), ("outdoors", (int?)1000, (int?)null, true, false)],
             DateTimeOffset.UtcNow, null);
         await db.CommitPendingImagesAsync([MakeImage("md5-a", 0, "1girl")], [], [], CancellationToken.None);
 
@@ -106,7 +119,7 @@ public class CrawlDatabaseTests
     public async Task ImageSources_Upsert_RefreshesTagsAndFetchedAt_InsteadOfIgnoring()
     {
         using var db = await OpenTempDatabaseAsync();
-        await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true)], DateTimeOffset.UtcNow, null);
+        await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
         await db.CommitPendingImagesAsync([MakeImage("md5-a", 0, "1girl")], [], [], CancellationToken.None);
 
         // The same (site, postId) source turns up again in a later crawl pass with a
@@ -123,7 +136,7 @@ public class CrawlDatabaseTests
     public async Task GetImageSourceSnapshotsAsync_NullTagsMeansNeverCaptured()
     {
         using var db = await OpenTempDatabaseAsync();
-        await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true)], DateTimeOffset.UtcNow, null);
+        await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
         // Simulates a pre-migration row: PendingNewImage's own source always gets a
         // real snapshot, so insert a bare additional source with Tags = null directly
         // via ApplyRefreshBatchAsync's update path having never run for it — closest
@@ -140,7 +153,7 @@ public class CrawlDatabaseTests
     public async Task GetSourcesBatchAsync_OrdersByPostIdAscending_AndRespectsAfterCursor()
     {
         using var db = await OpenTempDatabaseAsync();
-        await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true)], DateTimeOffset.UtcNow, null);
+        await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
         await db.CommitPendingImagesAsync(
             [MakeImage("md5-a", 0, "1girl"), MakeImage("md5-b", 1, "1girl") with { Site = "danbooru", PostId = 5 }, MakeImage("md5-c", 2, "1girl") with { Site = "danbooru", PostId = 3 }],
             [], [], CancellationToken.None);
@@ -157,7 +170,7 @@ public class CrawlDatabaseTests
     {
         using var db = await OpenTempDatabaseAsync();
         await db.UpsertTagSurveysAsync(
-            [("1girl", (int?)1000, (int?)null, true), ("outdoors", (int?)1000, (int?)null, true)],
+            [("1girl", (int?)1000, (int?)null, true, false), ("outdoors", (int?)1000, (int?)null, true, false)],
             DateTimeOffset.UtcNow, null);
         await db.CommitPendingImagesAsync([MakeImage("md5-a", 0, "1girl")], [], [], CancellationToken.None);
 
@@ -183,7 +196,7 @@ public class CrawlDatabaseTests
     public async Task ApplyRefreshBatchAsync_RecordsAGonePostAsAConfirmedEmptyList_NotAsUnknownNull()
     {
         using var db = await OpenTempDatabaseAsync();
-        await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true)], DateTimeOffset.UtcNow, null);
+        await db.UpsertTagSurveysAsync([("1girl", (int?)1000, (int?)null, true, false)], DateTimeOffset.UtcNow, null);
         await db.CommitPendingImagesAsync([MakeImage("md5-a", 0, "1girl")], [], [], CancellationToken.None);
 
         // A deleted post is a *confirmed* zero-tags source, not an unverified one — see

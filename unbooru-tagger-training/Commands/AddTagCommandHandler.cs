@@ -126,6 +126,14 @@ public static class AddTagCommandHandler
 
                 for (var step = 0; step < steps; step++)
                 {
+                    // Same reasoning as TrainCommandHandler's stepScope: every tensor a
+                    // step allocates (forward pass, pooled embedding, tag embeddings,
+                    // loss, the validation forward pass below) is native/CUDA memory the
+                    // .NET GC does not reclaim promptly. Without this, `steps` iterations
+                    // leak without bound until the process (or the whole machine, on CPU
+                    // training) runs out of memory.
+                    using var stepScope = NewDisposeScope();
+
                     var (_, spatial) = imageTower.forward(trainingPixelBatch);
                     var pooled = ImageTower.MaskedPool(spatial, trainingMask);
                     var tagEmbeddings = tagTower.forward(allTagIndices);

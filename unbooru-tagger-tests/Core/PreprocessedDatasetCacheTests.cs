@@ -126,6 +126,104 @@ public class PreprocessedDatasetCacheTests
     }
 
     [Fact]
+    public void Reader_WritesAnOffsetIndexSidecar_AndASecondOpenReadsBackTheSameImages()
+    {
+        // The regression this pins: PreprocessedImageIndex.LoadOrBuildOffsets must
+        // produce byte-identical results whether it built the table itself (first open)
+        // or loaded it from images.bin.offsets (every open after) — variable-width
+        // records at three different sizes make sure a wrong cached offset would
+        // actually corrupt a read instead of accidentally lining up.
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var image0 = MakeImage(2, 2, 0);
+            var image1 = MakeImage(3, 1, 50);
+            var image2 = MakeImage(1, 4, 100);
+
+            using (var writer = new PreprocessedDatasetCacheWriter(directory, inputSize: 4))
+            {
+                writer.Append(image0, [0]);
+                writer.Append(image1, [1]);
+                writer.Append(image2, [2]);
+            }
+
+            var offsetIndexPath = Path.Combine(directory, "images.bin.offsets");
+            Assert.False(File.Exists(offsetIndexPath), "shouldn't exist before any reader has opened the cache");
+
+            using (var firstReader = new PreprocessedDatasetCacheReader(directory))
+            {
+                Assert.Equal(image0.Content, firstReader.ReadImage(0).Content);
+                Assert.Equal(image1.Content, firstReader.ReadImage(1).Content);
+                Assert.Equal(image2.Content, firstReader.ReadImage(2).Content);
+            }
+
+            Assert.True(File.Exists(offsetIndexPath), "first open should have persisted the offset table it built");
+
+            using var secondReader = new PreprocessedDatasetCacheReader(directory);
+            Assert.Equal(ImagePreprocessing.Reconstruct(image0, 4).Pixels, secondReader.ReadImage(0).Pixels);
+            Assert.Equal(ImagePreprocessing.Reconstruct(image1, 4).Pixels, secondReader.ReadImage(1).Pixels);
+            Assert.Equal(ImagePreprocessing.Reconstruct(image2, 4).Pixels, secondReader.ReadImage(2).Pixels);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Reader_RebuildsTheOffsetIndex_WhenTheCacheGrewSinceItWasWritten()
+    {
+        // A stale index (wrong image count) must never be trusted -- silently reading
+        // through it against a cache that's since grown would misread every offset
+        // past whatever the stale table actually covered.
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            using (var writer = new PreprocessedDatasetCacheWriter(directory, inputSize: 2))
+                writer.Append(MakeImage(2, 2, 0), [0]);
+
+            using (var firstReader = new PreprocessedDatasetCacheReader(directory))
+                Assert.Equal(1, firstReader.ImageCount); // forces the (now stale) index to be written for count=1
+
+            var image1 = MakeImage(2, 2, 100);
+            using (var writer = PreprocessedDatasetCacheWriter.OpenOrCreate(directory, inputSize: 2))
+                writer.Append(image1, [1]);
+
+            using var secondReader = new PreprocessedDatasetCacheReader(directory);
+            Assert.Equal(2, secondReader.ImageCount);
+            Assert.Equal(ImagePreprocessing.Reconstruct(image1, 2).Pixels, secondReader.ReadImage(1).Pixels);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Reader_FallsBackToRebuilding_WhenTheOffsetIndexIsCorrupt()
+    {
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var image = MakeImage(2, 2, 0);
+            using (var writer = new PreprocessedDatasetCacheWriter(directory, inputSize: 2))
+                writer.Append(image, [0]);
+
+            using (var firstReader = new PreprocessedDatasetCacheReader(directory))
+                _ = firstReader.ImageCount; // writes the sidecar
+
+            File.WriteAllBytes(Path.Combine(directory, "images.bin.offsets"), [1, 2, 3]); // truncated garbage
+
+            using var secondReader = new PreprocessedDatasetCacheReader(directory);
+            Assert.Equal(ImagePreprocessing.Reconstruct(image, 2).Pixels, secondReader.ReadImage(0).Pixels);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
     public void MergeTagRows_NoOp_WhenNothingToMerge()
     {
         var directory = Directory.CreateTempSubdirectory().FullName;

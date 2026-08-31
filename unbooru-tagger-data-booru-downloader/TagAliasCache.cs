@@ -45,6 +45,21 @@ public static class TagAliasCache
 
         var tagAliases = new Dictionary<string, string>(StringComparer.Ordinal);
 
+        // Seeded first (so a later official alias for the same antecedent overwrites it)
+        // from the redirects 'detect-deprecated-redirects' empirically confirmed. Those
+        // aren't re-derivable from any site's API — they exist precisely because the site
+        // publishes no trace of them — so an unconditional overwrite of this file with
+        // freshly-fetched official aliases, which is what every run of this method does,
+        // would otherwise silently discard hours of rate-limited detection work the first
+        // time anyone re-ran survey-tags.
+        var detectedRedirects = await TryLoadDetectedRedirectsAsync(outputDirectory, cancellationToken).ConfigureAwait(false);
+        if (detectedRedirects is { Count: > 0 })
+        {
+            foreach (var (antecedent, consequent) in detectedRedirects)
+                tagAliases[antecedent] = consequent;
+            Console.WriteLine($"Loaded {detectedRedirects.Count} previously-detected silent redirect(s) from '{DetectedRedirectsFileName}'.");
+        }
+
         if (hasGelbooru)
         {
             Console.WriteLine("Fetching Gelbooru's active tag aliases...");
@@ -87,5 +102,69 @@ public static class TagAliasCache
 
         var json = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
         return JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+    }
+
+    /// <summary>
+    /// A durable, append-only-in-practice record of the silent search redirects
+    /// <see cref="DeprecatedRedirectDetector"/> confirmed empirically (same flat
+    /// antecedent -&gt; consequent shape as <see cref="FileName"/>). Kept as its own file
+    /// purely so <see cref="FetchAndCacheAsync"/> — which overwrites <see cref="FileName"/>
+    /// outright on every survey-tags/refresh-tags run — can fold them back in rather than
+    /// destroy them; <see cref="FileName"/> stays the single file every other reader
+    /// (<c>crawl</c>, <see cref="TagRowMutations.BuildEligibleIdentities"/>, ...) consults.
+    /// </summary>
+    public const string DetectedRedirectsFileName = "detected_tag_redirects.json";
+
+    /// <summary>Reads <see cref="DetectedRedirectsFileName"/> — <see langword="null"/> if no detection run has ever written one under this directory.</summary>
+    public static async Task<Dictionary<string, string>?> TryLoadDetectedRedirectsAsync(string outputDirectory, CancellationToken cancellationToken = default)
+    {
+        var path = Path.Combine(outputDirectory, DetectedRedirectsFileName);
+        if (!File.Exists(path))
+            return null;
+
+        var json = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
+        return JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+    }
+
+    /// <summary>
+    /// Merges <paramref name="additions"/> into the on-disk <see cref="FileName"/> cache and
+    /// rewrites it, returning only the entries that were genuinely new. Deliberately a
+    /// merge, never a replace: this file is the combined official Danbooru+Gelbooru alias
+    /// table that <c>crawl</c>/<see cref="TagRowMutations.BuildEligibleIdentities"/> read,
+    /// and a caller with a handful of extra mappings has no business dropping tens of
+    /// thousands of existing ones. An antecedent already present is left exactly as it is
+    /// rather than overwritten — an official alias a site actually publishes outranks
+    /// anything inferred empirically, and silently retargeting one would be the worst
+    /// possible way to find out the two disagreed.
+    /// </summary>
+    public static async Task<IReadOnlyDictionary<string, string>> MergeIntoCacheAsync(
+        string outputDirectory,
+        IReadOnlyDictionary<string, string> additions,
+        CancellationToken cancellationToken = default)
+    {
+        var merged = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (antecedent, consequent) in await TryLoadAsync(outputDirectory, cancellationToken).ConfigureAwait(false) ?? [])
+            merged[antecedent] = consequent;
+
+        var added = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (antecedent, consequent) in additions)
+        {
+            if (merged.ContainsKey(antecedent))
+                continue;
+            merged[antecedent] = consequent;
+            added[antecedent] = consequent;
+        }
+
+        Directory.CreateDirectory(outputDirectory);
+        await File.WriteAllTextAsync(Path.Combine(outputDirectory, FileName), JsonSerializer.Serialize(merged), cancellationToken).ConfigureAwait(false);
+        return added;
+    }
+
+    /// <summary>Overwrites <see cref="DetectedRedirectsFileName"/> with <paramref name="detectedRedirects"/> — callers are expected to have merged whatever <see cref="TryLoadDetectedRedirectsAsync"/> returned into it first, since a detection run only ever probes the tags it hasn't already resolved.</summary>
+    public static async Task SaveDetectedRedirectsAsync(string outputDirectory, IReadOnlyDictionary<string, string> detectedRedirects, CancellationToken cancellationToken = default)
+    {
+        Directory.CreateDirectory(outputDirectory);
+        var path = Path.Combine(outputDirectory, DetectedRedirectsFileName);
+        await File.WriteAllTextAsync(path, JsonSerializer.Serialize(detectedRedirects), cancellationToken).ConfigureAwait(false);
     }
 }
