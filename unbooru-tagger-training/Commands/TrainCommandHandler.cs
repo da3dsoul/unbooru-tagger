@@ -35,7 +35,8 @@ public static class TrainCommandHandler
         int earlyStoppingPatience,
         double localizationWeight = 0.1,
         double localizationTemperature = 0.35,
-        double selfSupervisedWeight = 0.1)
+        double selfSupervisedWeight = 0.1,
+        double checkpointIntervalMinutes = 15.0)
     {
         if ((manifestPath is null) == (cacheDir is null))
             throw new ArgumentException("Provide exactly one of --manifest or --cache-dir.");
@@ -142,7 +143,13 @@ public static class TrainCommandHandler
 
         var allTagIndices = tensor(Enumerable.Range(0, vocabulary.Records.Count).Select(i => (long)i).ToArray(), device: device);
 
-        var (trainingIndices, validationIndices) = SplitForValidation(datasetCount, validationFraction);
+        // Persisted across resumes (TrainingProgress.ValidationSplitSeed) so a mid-epoch
+        // resume reconstructs the exact same split instead of re-shuffling -- otherwise
+        // a resumed run could train on images the original run held out for validation.
+        // Only a genuinely fresh run (or an old checkpoint written before this field
+        // existed) picks a new random seed.
+        var validationSplitSeed = resumingOptimizerState ? resumedProgress.ValidationSplitSeed : Random.Shared.Next();
+        var (trainingIndices, validationIndices) = SplitForValidation(datasetCount, validationFraction, validationSplitSeed);
         var trainingTagRows = trainingIndices.Select(i => imageTagRows[i]).ToList();
         var sampler = new RareTagOversamplingBatchSampler(trainingTagRows, tagFrequencies);
         var earlyStopping = new EarlyStopping(earlyStoppingPatience);
@@ -158,16 +165,24 @@ public static class TrainCommandHandler
             return result;
         }
 
+        // Steps already done in the epoch we're about to resume into (0 for a fresh run,
+        // or for a resume that landed exactly on an epoch boundary). Clamped in case
+        // --batch-size changed across the resume and shifted stepsPerEpoch.
+        var resumedStepsInEpoch = resumingOptimizerState ? Math.Min(resumedProgress.CompletedStepsInEpoch, stepsPerEpoch) : 0;
+        var checkpointInterval = checkpointIntervalMinutes > 0 ? TimeSpan.FromMinutes(checkpointIntervalMinutes) : TimeSpan.MaxValue;
+        var sinceLastCheckpoint = System.Diagnostics.Stopwatch.StartNew();
+
         AnsiConsole.Progress()
             .Columns(TrainingProgressColumns.Columns)
             .Start(ctx =>
             {
-                var reporter = TrainingProgressColumns.AddTasks(ctx, epochs * stepsPerEpoch, startEpoch * stepsPerEpoch);
+                var reporter = TrainingProgressColumns.AddTasks(ctx, epochs * stepsPerEpoch, startEpoch * stepsPerEpoch + resumedStepsInEpoch);
                 try
                 {
                     for (var epoch = startEpoch; epoch < epochs; epoch++)
                     {
-                        for (var step = 0; step < stepsPerEpoch; step++)
+                        var stepStart = epoch == startEpoch ? resumedStepsInEpoch : 0;
+                        for (var step = stepStart; step < stepsPerEpoch; step++)
                         {
                             // Every tensor allocated in a step (pooled/spatial embeddings, the full
                             // tagTower forward pass over the whole vocabulary, each `loss +=`
@@ -227,6 +242,23 @@ public static class TrainCommandHandler
                             // a huge total step count doesn't sit looking stuck near 0% for the
                             // entire first epoch -- the Overall row above already covers that.
                             reporter.ReportPhaseProgress($"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch} loss {lossValue:G4}", step + 1, stepsPerEpoch);
+
+                            // Mid-epoch safety net: an epoch can take multiple days, so waiting
+                            // for the epoch-boundary save below to be the only recovery point
+                            // would mean a crash loses up to a full epoch of work. Same two
+                            // artifacts as the epoch-boundary save, just with CompletedEpochs
+                            // still at the *previous* completed count and CompletedStepsInEpoch
+                            // recording how far into this epoch we got.
+                            if (sinceLastCheckpoint.Elapsed >= checkpointInterval)
+                            {
+                                reporter.ReportPhase($"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch}: saving checkpoint...");
+                                SaveCheckpoint(checkpointDir, imageTower, tagTower, embeddingDim, resolvedInputSize, vocabulary);
+                                TrainingState.Save(
+                                    checkpointDir,
+                                    new TrainingProgress(epoch, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, step + 1, validationSplitSeed),
+                                    optimizer);
+                                sinceLastCheckpoint.Restart();
+                            }
                         }
 
                         // Save after every epoch, not just at the end: a long run (especially on
@@ -234,6 +266,7 @@ public static class TrainCommandHandler
                         // without this, all completed work would be unrecoverable.
                         reporter.ReportPhase($"epoch {epoch + 1}/{epochs}: saving checkpoint...");
                         SaveCheckpoint(checkpointDir, imageTower, tagTower, embeddingDim, resolvedInputSize, vocabulary);
+                        sinceLastCheckpoint.Restart();
 
                         var stopEarly = false;
                         if (validationIndices.Count == 0)
@@ -261,7 +294,7 @@ public static class TrainCommandHandler
                         // EarlyStopping's latest history (unchanged if there was no
                         // validation split to evaluate against).
                         reporter.ReportPhase($"epoch {epoch + 1}/{epochs}: saving training state...");
-                        TrainingState.Save(checkpointDir, new TrainingProgress(epoch + 1, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement), optimizer);
+                        TrainingState.Save(checkpointDir, new TrainingProgress(epoch + 1, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, CompletedStepsInEpoch: 0, validationSplitSeed), optimizer);
 
                         if (stopEarly)
                             break;
@@ -354,11 +387,16 @@ public static class TrainCommandHandler
         return (tensor(flat, [indices.Count, 3, inputSize, inputSize]), boxes);
     }
 
-    /// <summary>Shuffles all dataset indices once and carves off a validation slice, so the same held-out images are used for every epoch's evaluation.</summary>
-    private static (List<int> Training, List<int> Validation) SplitForValidation(int datasetCount, double validationFraction)
+    /// <summary>
+    /// Shuffles all dataset indices once and carves off a validation slice, so the same
+    /// held-out images are used for every epoch's evaluation. Seeded (rather than
+    /// <see cref="Random.Shared"/>) and the seed is persisted in <see cref="TrainingProgress"/>
+    /// so a resumed run reconstructs the identical split instead of re-shuffling.
+    /// </summary>
+    private static (List<int> Training, List<int> Validation) SplitForValidation(int datasetCount, double validationFraction, int seed)
     {
         var indices = Enumerable.Range(0, datasetCount).ToList();
-        var random = Random.Shared;
+        var random = new Random(seed);
         for (var i = indices.Count - 1; i > 0; i--)
         {
             var j = random.Next(i + 1);

@@ -9,8 +9,25 @@ namespace UnbooruTagger.Training.Checkpoints;
 /// covers, so without this a resumed run continues the model from where it left off
 /// but silently restarts the epoch count from zero and gives EarlyStopping a fresh
 /// patience window instead of the one it was partway through.
+///
+/// <paramref name="CompletedStepsInEpoch"/> and <paramref name="ValidationSplitSeed"/>
+/// exist for mid-epoch resume: an epoch can take multiple days, so <see cref="Commands.TrainCommandHandler"/>
+/// also checkpoints periodically *within* an epoch, not just at epoch boundaries.
+/// <paramref name="CompletedStepsInEpoch"/> is how many steps of the *current, not-yet-
+/// finished* epoch were already done (0 once that epoch completes and
+/// <paramref name="CompletedEpochs"/> advances instead). <paramref name="ValidationSplitSeed"/>
+/// is persisted so a resumed run reconstructs the exact same train/validation split
+/// instead of re-shuffling — otherwise a mid-epoch resume could train on former
+/// validation images. Both default to 0 so an older checkpoint written before this
+/// existed still deserializes and resumes (just at an epoch boundary, with a
+/// re-derived split, same as before).
 /// </summary>
-public sealed record TrainingProgress(int CompletedEpochs, double EarlyStoppingBestLoss, int EarlyStoppingEvaluationsSinceImprovement)
+public sealed record TrainingProgress(
+    int CompletedEpochs,
+    double EarlyStoppingBestLoss,
+    int EarlyStoppingEvaluationsSinceImprovement,
+    int CompletedStepsInEpoch = 0,
+    int ValidationSplitSeed = 0)
 {
     public static TrainingProgress Initial => new(0, double.PositiveInfinity, 0);
 }

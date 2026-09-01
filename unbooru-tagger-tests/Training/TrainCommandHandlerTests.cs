@@ -61,15 +61,66 @@ public class TrainCommandHandlerTests
         }
     }
 
-    private static string CreateManifest(string directory, int inputSize)
+    [Fact]
+    public void Run_ResumesFromAMidEpochCheckpoint()
     {
-        var tagSets = new[]
+        manual_seed(11);
+        const int embeddingDim = 4;
+        const int inputSize = 32;
+
+        var checkpointDir = Directory.CreateTempSubdirectory().FullName;
+        var manifestDir = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            // 8 images / batchSize 1 / validationFraction 0.25 -> 6 training steps per
+            // epoch, so there's room for a checkpoint partway through one.
+            var manifestPath = CreateManifest(manifestDir, inputSize, imageCount: 8);
+
+            var firstResult = TrainCommandHandler.Run(
+                manifestPath, cacheDir: null, checkpointDir, embeddingDim, inputSize,
+                epochs: 1, batchSize: 1, learningRate: 1e-3, validationFraction: 0.25, earlyStoppingPatience: 3);
+            Assert.Equal(0, firstResult);
+
+            var completedProgress = TrainingState.LoadProgress(checkpointDir);
+            Assert.Equal(1, completedProgress.CompletedEpochs);
+            Assert.Equal(0, completedProgress.CompletedStepsInEpoch);
+
+            // Simulate a crash 4 steps into what would have been the *next* epoch: same
+            // model/optimizer files a real mid-epoch periodic checkpoint would have left
+            // behind, just hand-edited instead of waiting on --checkpoint-interval-minutes.
+            var progressPath = Directory.GetFiles(checkpointDir, "training_progress.json").Single();
+            var midEpochProgress = completedProgress with { CompletedEpochs = 1, CompletedStepsInEpoch = 4 };
+            File.WriteAllText(progressPath, System.Text.Json.JsonSerializer.Serialize(midEpochProgress));
+
+            var secondResult = TrainCommandHandler.Run(
+                manifestPath, cacheDir: null, checkpointDir, embeddingDim, inputSize,
+                epochs: 2, batchSize: 1, learningRate: 1e-3, validationFraction: 0.25, earlyStoppingPatience: 3);
+            Assert.Equal(0, secondResult);
+
+            var finalProgress = TrainingState.LoadProgress(checkpointDir);
+            Assert.Equal(2, finalProgress.CompletedEpochs);
+            Assert.Equal(0, finalProgress.CompletedStepsInEpoch);
+            // The validation split seed must survive the resume unchanged -- a resumed
+            // run that re-derived a new one could train on former validation images.
+            Assert.Equal(midEpochProgress.ValidationSplitSeed, finalProgress.ValidationSplitSeed);
+        }
+        finally
+        {
+            Directory.Delete(checkpointDir, recursive: true);
+            Directory.Delete(manifestDir, recursive: true);
+        }
+    }
+
+    private static string CreateManifest(string directory, int inputSize, int imageCount = 4)
+    {
+        var baseTagSets = new[]
         {
             new[] { "solo" },
             new[] { "1girl" },
             new[] { "solo", "1girl" },
             new[] { "twintails" },
         };
+        var tagSets = Enumerable.Range(0, imageCount).Select(i => baseTagSets[i % baseTagSets.Length]).ToArray();
 
         var entries = new List<DatasetImageEntry>();
         for (var i = 0; i < tagSets.Length; i++)

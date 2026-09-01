@@ -458,11 +458,16 @@ dotnet run --project unbooru-tagger-training -- train \
 ```
 
 Re-running against the same `--checkpoint-dir` automatically resumes
-(model weights, optimizer state, epoch count, and early-stopping history
-if present). A checkpoint is saved after every epoch. Uses CUDA if
-available, CPU otherwise. Key flags: `--embedding-dim` (default 512),
-`--lr` (default 1e-4), `--validation-fraction` (default 0.1),
-`--early-stopping-patience` (default 3).
+(model weights, optimizer state, epoch count, step within the current
+epoch, validation split, and early-stopping history if present). A
+checkpoint is saved after every epoch, and also every
+`--checkpoint-interval-minutes` (default 15) *within* an epoch — an
+epoch can take multiple days, so a crash only loses up to that interval
+of work, not the whole epoch. Set it to `0` to disable mid-epoch
+checkpointing. Uses CUDA if available, CPU otherwise. Key flags:
+`--embedding-dim` (default 512), `--lr` (default 1e-4),
+`--validation-fraction` (default 0.1), `--early-stopping-patience`
+(default 3).
 
 Two auxiliary, label-free training objectives are on by default, each
 individually disableable by setting its weight to `0` (the

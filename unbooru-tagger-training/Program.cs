@@ -31,6 +31,11 @@ var selfSupervisedWeightOption = new Option<double>("--self-supervised-weight")
     Description = "Weight of the label-free SimSiam-style consistency loss between two augmented crops of the same image. 0 disables it (skips the extra forward passes entirely).",
     DefaultValueFactory = _ => 0.1
 };
+var checkpointIntervalMinutesOption = new Option<double>("--checkpoint-interval-minutes")
+{
+    Description = "How often to save a checkpoint mid-epoch, in addition to the checkpoint already saved at every epoch boundary -- an epoch can take multiple days, so this bounds how much training a crash can lose. 0 disables mid-epoch checkpointing.",
+    DefaultValueFactory = _ => 15.0
+};
 
 var trainCommand = new Command("train", "Full/periodic fine-tune pass over a dataset manifest or preprocessed cache");
 trainCommand.Options.Add(manifestOption);
@@ -46,6 +51,7 @@ trainCommand.Options.Add(earlyStoppingPatienceOption);
 trainCommand.Options.Add(localizationWeightOption);
 trainCommand.Options.Add(localizationTemperatureOption);
 trainCommand.Options.Add(selfSupervisedWeightOption);
+trainCommand.Options.Add(checkpointIntervalMinutesOption);
 trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
     parseResult.GetValue(manifestOption),
     parseResult.GetValue(cacheDirOption),
@@ -59,7 +65,8 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
     parseResult.GetRequiredValue(earlyStoppingPatienceOption),
     parseResult.GetRequiredValue(localizationWeightOption),
     parseResult.GetRequiredValue(localizationTemperatureOption),
-    parseResult.GetRequiredValue(selfSupervisedWeightOption)));
+    parseResult.GetRequiredValue(selfSupervisedWeightOption),
+    parseResult.GetRequiredValue(checkpointIntervalMinutesOption)));
 
 var tagArgument = new Argument<string>("tag") { Description = "The new tag to add" };
 var imagesOption = new Option<string>("--images") { Description = "Dataset manifest of the newly tagged images", Required = true };
