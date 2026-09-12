@@ -27,10 +27,17 @@ public sealed class OnnxImageEncoder : IImageEncoder, IDisposable
         string spatialOutputName = "spatial_features")
     {
         EmbeddingDim = embeddingDim;
-        _inputSize = inputSize;
         _inputName = inputName;
         _spatialOutputName = spatialOutputName;
         _session = new InferenceSession(modelPath);
+
+        // The exported graph bakes in a fixed square resolution (see
+        // ImageTowerOnnxExporter.Export), which is whatever --input-size the checkpoint
+        // was trained/exported with — not necessarily the 224 default. Trust the graph's
+        // own declared shape over the caller-supplied default so a model exported at a
+        // different resolution just works instead of failing with a shape mismatch.
+        var declaredDim = _session.InputMetadata[_inputName].Dimensions[2];
+        _inputSize = declaredDim > 0 ? declaredDim : inputSize;
     }
 
     public ImageEncoding Encode(string imagePath)
