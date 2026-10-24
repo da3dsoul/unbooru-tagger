@@ -18,6 +18,8 @@ public static class ImageTowerOnnxExporter
 {
     private const string PooledOutputName = "pooled_embedding";
     private const string SpatialOutputName = "spatial_features";
+    /// <summary>Only exported when <see cref="ImageTower.LocalizationFromFusedOnly"/> is set; inference draws heatmaps from it when present.</summary>
+    public const string LocalizationOutputName = "localization_features";
 
     public static void Export(ImageTower tower, string outputPath, int inputSize)
     {
@@ -27,8 +29,11 @@ public static class ImageTowerOnnxExporter
         graph.Input.Add(MakeValueInfo("pixel_values", 1, 3, inputSize, inputSize));
 
         var current = ExportConv2d(graph, tower.Stem, "pixel_values", names);
-        foreach (var layer in tower.Layers)
+        var stageOutputs = new string[tower.StageChannels.Length];
+        var nextStage = 0;
+        for (var i = 0; i < tower.Layers.Count; i++)
         {
+            var layer = tower.Layers[i];
             current = layer switch
             {
                 Conv2d conv => ExportConv2d(graph, conv, current, names),
@@ -36,12 +41,34 @@ public static class ImageTowerOnnxExporter
                 GroupNorm norm => ExportGroupNorm(graph, norm, current, names),
                 _ => throw new NotSupportedException($"No ONNX export defined for layer type {layer.GetType().Name}.")
             };
+            if (nextStage < stageOutputs.Length && i == tower.StageEnd(nextStage))
+                stageOutputs[nextStage++] = current;
         }
 
         // Projection happens BEFORE pooling — see ImageTower's doc comment: this puts
         // both outputs in the same embeddingDim-dimensional space, which the pooled
         // output being a straight GlobalAveragePool+Flatten of it depends on.
         var projectedSpatial = ExportConv2d(graph, tower.Projection, current, names);
+
+        // Multi-scale fusion (ImageTower.FusedStages): nearest 2x upsample + lateral 1x1 conv,
+        // per fused stage. Resize with asymmetric/floor nearest matches torch's nearest mode.
+        // The localization map (ImageTower.ForwardMaps) is the same chain over the laterals alone.
+        string? localization = null;
+        for (var k = 1; k <= tower.FusedStages; k++)
+        {
+            var lateral = ExportConv2d(graph, tower.Laterals[k - 1], stageOutputs[tower.StageChannels.Length - 1 - k], names);
+            projectedSpatial = ExportBinaryOp(graph, "Add", ExportUpsample2x(graph, projectedSpatial, names), lateral, names, "fused");
+            if (tower.LocalizationFromFusedOnly)
+                localization = localization is null
+                    ? lateral
+                    : ExportBinaryOp(graph, "Add", ExportUpsample2x(graph, localization, names), lateral, names, "localization");
+        }
+
+        if (localization is not null)
+        {
+            graph.Node.Add(new NodeProto { OpType = "Identity", Name = names.Next("Identity"), Input = { localization }, Output = { LocalizationOutputName } });
+            graph.Output.Add(MakeValueInfo(LocalizationOutputName));
+        }
 
         graph.Node.Add(new NodeProto
         {
@@ -123,6 +150,25 @@ public static class ImageTowerOnnxExporter
     /// the native "GroupNormalization" op, whose opset-18 definition has known
     /// scale/bias-shape ambiguity across runtimes.
     /// </summary>
+    private static string ExportUpsample2x(GraphProto graph, string input, NameAllocator names)
+    {
+        var scalesName = names.Next("resize_scales");
+        graph.Initializer.Add(new TensorProto
+        {
+            Name = scalesName,
+            DataType = (int)TensorProto.Types.DataType.Float,
+            Dims = { 4 },
+            RawData = ByteString.CopyFrom(new[] { 1f, 1f, 2f, 2f }.SelectMany(BitConverter.GetBytes).ToArray())
+        });
+        var upsampled = names.Next("upsampled");
+        var resize = new NodeProto { OpType = "Resize", Name = names.Next("Resize"), Input = { input, "", scalesName }, Output = { upsampled } };
+        resize.Attribute.Add(new AttributeProto { Name = "mode", Type = AttributeProto.Types.AttributeType.String, S = ByteString.CopyFromUtf8("nearest") });
+        resize.Attribute.Add(new AttributeProto { Name = "coordinate_transformation_mode", Type = AttributeProto.Types.AttributeType.String, S = ByteString.CopyFromUtf8("asymmetric") });
+        resize.Attribute.Add(new AttributeProto { Name = "nearest_mode", Type = AttributeProto.Types.AttributeType.String, S = ByteString.CopyFromUtf8("floor") });
+        graph.Node.Add(resize);
+        return upsampled;
+    }
+
     private static string ExportGroupNorm(GraphProto graph, GroupNorm norm, string inputName, NameAllocator names)
     {
         if (norm.num_groups != 1)

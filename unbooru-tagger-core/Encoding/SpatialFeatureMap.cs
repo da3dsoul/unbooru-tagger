@@ -30,8 +30,9 @@ public sealed class SpatialFeatureMap
 }
 
 /// <summary>
-/// The image tower's output: a pooled global embedding plus the spatial map it was
-/// pooled from, plus where the source image's real content landed inside the
+/// The image tower's output: a pooled global embedding plus the spatial map heatmaps are
+/// drawn from (the map it was pooled from, or the model's separate localization map when
+/// it exports one — see <see cref="OnnxImageEncoder.LocalizationOutputName"/>), plus where the source image's real content landed inside the
 /// (letterboxed) input canvas — <see cref="SpatialFeatures"/> covers the whole canvas,
 /// padding included, so callers mapping grid cells back to the original image's pixel
 /// space need <see cref="Content"/> to exclude the padding bars.

@@ -28,6 +28,12 @@ public sealed record BooruTagCount(string Name, int PostCount, bool Deprecated =
 public sealed record BooruTagAlias(string Antecedent, string Consequent);
 
 /// <summary>
+/// A tag implication: every post tagged <paramref name="Antecedent"/> is also <paramref name="Consequent"/>
+/// (witch_hat → hat). Raw site-local names, like <see cref="BooruTagAlias"/>.
+/// </summary>
+public sealed record BooruTagImplication(string Antecedent, string Consequent);
+
+/// <summary>
 /// One page of posts plus an opaque continuation token for the next page (null once
 /// exhausted). The token's shape is site-specific (a "before this post id" cursor for
 /// Danbooru, a page-index for Gelbooru) — callers should treat it as opaque and just

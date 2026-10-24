@@ -8,7 +8,8 @@ namespace UnbooruTagger.Inference.Commands;
 
 public static class DetectCommandHandler
 {
-    // Cycled by detection index so distinct tags read as distinct colors in the rendered output.
+    // Picked by a stable hash of the tag name, so a tag gets the same color in every render --
+    // which is what lets a gold render and a model render of one image be compared by eye.
     private static readonly SKColor[] Palette =
     [
         SKColors.Red, SKColors.DodgerBlue, SKColors.Lime, SKColors.Gold,
@@ -19,11 +20,13 @@ public static class DetectCommandHandler
     // capped independent of the original image's size so refinement cost stays bounded.
     private const int RefinementSize = 160;
 
-    public static int Run(string modelDir, string imagePath, float threshold, float boxThreshold, float boxPercentile, string? outputPath)
+    public static int Run(
+        string modelDir, string imagePath, float? threshold, float boxThreshold, float boxPercentile, float minHeatmapRange,
+        float minBoxFraction, int maxBoxesPerTag, string? outputPath)
     {
         using var model = ModelBundle.Load(modelDir);
 
-        var detections = Detect(model, imagePath, threshold, boxThreshold, boxPercentile);
+        var detections = Detect(model, imagePath, threshold, boxThreshold, boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag);
 
         Console.WriteLine(JsonSerializer.Serialize(detections, new JsonSerializerOptions { WriteIndented = true }));
 
@@ -43,16 +46,22 @@ public static class DetectCommandHandler
     }
 
     /// <summary>
-    /// Scores every vocabulary tag against the whole image, then, for each tag above
-    /// <paramref name="threshold"/>: builds its heatmap, refines it against the image with
+    /// Scores every vocabulary tag against the whole image, keeps each tag above its
+    /// threshold (<paramref name="threshold"/>, or the tag's calibrated one when null — see
+    /// <see cref="ModelBundle.ThresholdFor"/>), drops the weaker side of any contradictory
+    /// pair (<see cref="ModelBundle.ExclusiveGroups"/>), then for each survivor: builds its heatmap, refines it against the image with
     /// <see cref="HeatmapRefiner.Refine"/> so the boxes snap to real edges instead of the raw
     /// grid's blocky boundary, and thresholds it into boxes via <see cref="TagScorer.DetectBoxes"/>
-    /// using <paramref name="boxThreshold"/> as an absolute floor and <paramref name="boxPercentile"/>
-    /// to additionally cut within that tag's own heatmap range. Boxes are reported in the
-    /// original image's pixel space, not the resized model-input space.
+    /// using <paramref name="boxThreshold"/> as an absolute floor, <paramref name="boxPercentile"/>
+    /// to additionally cut within that tag's own heatmap range, and <paramref name="minHeatmapRange"/>
+    /// to suppress boxes entirely for a tag whose heatmap has no real spatial signal to cut into.
+    /// Regions smaller than <paramref name="minBoxFraction"/> of the grid are dropped as specks,
+    /// and at most <paramref name="maxBoxesPerTag"/> (strongest peak first; 0 = unlimited) are kept.
+    /// Boxes are reported in the original image's pixel space, not the resized model-input space.
     /// </summary>
     public static List<TagDetection> Detect(
-        ModelBundle model, string imagePath, float threshold, float boxThreshold, float boxPercentile)
+        ModelBundle model, string imagePath, float? threshold, float boxThreshold, float boxPercentile, float minHeatmapRange = 0.05f,
+        float minBoxFraction = 0f, int maxBoxesPerTag = 0)
     {
         var encoding = model.ImageEncoder.Encode(imagePath);
 
@@ -61,18 +70,33 @@ public static class DetectCommandHandler
 
         var guide = HeatmapRefiner.BuildGuide(bitmap, RefinementSize, out var refinementContent);
 
-        var detections = new List<TagDetection>();
+        var candidates = new List<(int Row, float Confidence)>();
         for (var row = 0; row < model.Embeddings.RowCount; row++)
         {
-            var tagEmbedding = model.Embeddings.GetRow(row);
-            var confidence = TagScorer.Score(encoding.PooledEmbedding, tagEmbedding);
-            if (confidence < threshold)
-                continue;
+            var confidence = TagScorer.Score(encoding.PooledEmbedding, model.Embeddings.GetRow(row), model.LogitScaling);
+            if (confidence >= model.ThresholdFor(row, threshold))
+                candidates.Add((row, confidence));
+        }
 
-            var heatmap = TagScorer.Heatmap(tagEmbedding, encoding.SpatialFeatures);
+        candidates.Sort((a, b) => b.Confidence.CompareTo(a.Confidence));
+
+        var detections = new List<TagDetection>();
+        foreach (var (row, confidence) in model.ExclusiveGroups.Resolve(candidates, c => c.Row))
+        {
+            var tag = model.Vocabulary.GetByRowIndex(row).Tag;
+            if (!model.Localizability.IsLocalizable(tag))
+            {
+                // Whole-image tag (background, style, framing, ...): reported, never boxed.
+                detections.Add(new TagDetection(tag, confidence, []));
+                continue;
+            }
+
+            var tagEmbedding = model.Embeddings.GetRow(row);
+            var heatmap = TagScorer.Heatmap(tagEmbedding, encoding.SpatialFeatures, model.LogitScaling);
             var refinedHeatmap = HeatmapRefiner.Refine(heatmap, guide);
             var boxes = TagScorer.DetectBoxes(
-                refinedHeatmap, boxThreshold, boxPercentile, refinementContent, RefinementSize, bitmap.Width, bitmap.Height);
+                refinedHeatmap, boxThreshold, boxPercentile, refinementContent, RefinementSize, bitmap.Width, bitmap.Height, minHeatmapRange,
+                minBoxFraction, maxBoxesPerTag);
             detections.Add(new TagDetection(model.Vocabulary.GetByRowIndex(row).Tag, confidence, boxes));
         }
 
@@ -80,8 +104,8 @@ public static class DetectCommandHandler
         return detections;
     }
 
-    /// <summary>Draws one outlined rectangle per box plus a "tag confidence" label above it, cycling a color per tag so overlapping detections stay distinguishable.</summary>
-    private static SKBitmap RenderBoxes(SKBitmap original, IReadOnlyList<TagDetection> detections)
+    /// <summary>Draws one outlined rectangle per box plus a "tag confidence" label above it (just "tag" when <paramref name="showConfidence"/> is false, e.g. for hand-drawn gold boxes), colored per tag.</summary>
+    internal static SKBitmap RenderBoxes(SKBitmap original, IReadOnlyList<TagDetection> detections, bool showConfidence = true)
     {
         var result = new SKBitmap(original.Width, original.Height);
         using var canvas = new SKCanvas(result);
@@ -95,16 +119,24 @@ public static class DetectCommandHandler
         for (var i = 0; i < detections.Count; i++)
         {
             var detection = detections[i];
-            var color = Palette[i % Palette.Length];
+            // Gold renders mark group/ignore boxes with a " [group]" / " [unsure]" suffix: same
+            // color as the plain tag, and unsure ones dashed.
+            var suffixAt = detection.Tag.IndexOf(" [", StringComparison.Ordinal);
+            var color = ColorFor(suffixAt >= 0 ? detection.Tag[..suffixAt] : detection.Tag);
             boxPaint.Color = color;
             labelPaint.Color = color;
+            using var dash = detection.Tag.EndsWith("[unsure]", StringComparison.Ordinal) ? SKPathEffect.CreateDash([6, 4], 0) : null;
+            boxPaint.PathEffect = dash;
 
             foreach (var box in detection.Boxes)
             {
                 var rect = new SKRect(box.X, box.Y, box.X + box.Width, box.Y + box.Height);
                 canvas.DrawRect(rect, boxPaint);
 
-                var label = $"{detection.Tag} {detection.Confidence:F2}";
+                // The box's own peak, not the whole-image confidence -- otherwise every box of
+                // a tag carries the same number and a weak stray region reads as strong as the
+                // real one.
+                var label = showConfidence ? $"{detection.Tag} {box.Confidence:F2}" : detection.Tag;
                 var textWidth = font.MeasureText(label, textPaint);
                 var labelTop = Math.Max(rect.Top - 18, 0);
                 var labelRect = new SKRect(rect.Left, labelTop, rect.Left + textWidth + 6, labelTop + 18);
@@ -115,5 +147,14 @@ public static class DetectCommandHandler
         }
 
         return result;
+    }
+
+    internal static SKColor ColorFor(string tag)
+    {
+        // FNV-1a: string.GetHashCode is randomized per process, which would reshuffle colors every run.
+        var hash = 2166136261u;
+        foreach (var c in tag)
+            hash = (hash ^ c) * 16777619u;
+        return Palette[hash % (uint)Palette.Length];
     }
 }

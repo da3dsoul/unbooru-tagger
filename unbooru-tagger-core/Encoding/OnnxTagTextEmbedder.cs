@@ -38,7 +38,19 @@ public sealed class OnnxTagTextEmbedder : ITagTextEmbedder, IDisposable
         var input = new DenseTensor<long>(tokenIds, [1, tokenIds.Length]);
 
         using var results = _session.Run([NamedOnnxValue.CreateFromTensor(_inputIdsName, input)]);
-        return results.First(r => r.Name == _outputName).AsTensor<float>().ToArray();
+        var embedding = results.First(r => r.Name == _outputName).AsTensor<float>().ToArray();
+
+        // The constructor takes EmbeddingDim as a plain parameter rather than reading it
+        // off the graph (unlike OnnxImageEncoder's InputSize) since a text model's
+        // output dim isn't reliably a static graph dimension the way an image model's
+        // spatial input size is. Catching a mismatch here, right where it's produced,
+        // gives a clear error instead of a cryptic shape-mismatch failure once this
+        // vector is later used as a TagTower row.
+        if (embedding.Length != EmbeddingDim)
+            throw new InvalidDataException(
+                $"'{_outputName}' produced a {embedding.Length}-dim embedding for tag '{tag}', but this embedder was constructed with EmbeddingDim={EmbeddingDim}.");
+
+        return embedding;
     }
 
     public void Dispose() => _session.Dispose();

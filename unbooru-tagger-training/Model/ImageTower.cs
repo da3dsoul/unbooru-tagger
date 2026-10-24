@@ -18,6 +18,13 @@ namespace UnbooruTagger.Training.Model;
 /// to even be dimensionally valid, let alone meaningful. A 1x1 conv commutes with
 /// average pooling (it's a linear map applied per-location), so projecting-then-pooling
 /// gives the exact same pooled result as the old pooling-then-projecting order.
+///
+/// <see cref="FusedStages"/> (0 = off, the original layout) adds a light FPN-style top-down
+/// path for sharper localization: the last stage's projected map is upsampled 2x (nearest)
+/// and added to a 1x1 projection (<see cref="Laterals"/>) of the previous stage's output,
+/// repeated once per fused stage. Fusing 2 stages on a 4-stage stride-32 tower yields a
+/// stride-8 map (64x64 at 512px) in the same embedding space, instead of a coarse 16x16
+/// one — small objects (earrings, hairclips, chokers) span only a cell or two at stride 16+.
 /// </summary>
 public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
 {
@@ -27,15 +34,56 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
     public readonly Conv2d Stem;
     public readonly ModuleList<Module<Tensor, Tensor>> Layers;
     public readonly Conv2d Projection;
+    public readonly ModuleList<Conv2d> Laterals;
 
     public int EmbeddingDim { get; }
+    public int StemChannels { get; }
+    public int[] StageChannels { get; }
+    public int[] BlocksPerStage { get; }
+    public int FusedStages { get; }
 
-    public ImageTower(int embeddingDim, int stemChannels = 64, int[]? stageChannels = null, int[]? blocksPerStage = null, Device? device = null)
+    /// <summary>
+    /// When set (requires <see cref="FusedStages"/> &gt; 0), <see cref="ForwardMaps"/>'s
+    /// localization map is the fused laterals alone, without the upsampled last-stage
+    /// projection. Classification still pools the full map. A last-stage location sees most
+    /// of a 512px image, so on the full map every location can learn "this image has a hat"
+    /// and the heatmap saturates (run 2, epoch 1: gold pointing 27%). The earlier stages'
+    /// laterals have much smaller effective receptive fields, so training localization
+    /// against them alone rewards evidence that is actually local. Not a weight change: it
+    /// can be switched on when resuming.
+    /// </summary>
+    public bool LocalizationFromFusedOnly
+    {
+        get => _localizationFromFusedOnly;
+        set
+        {
+            if (value && FusedStages == 0)
+                throw new InvalidOperationException("A fused-only localization map needs --fused-stages > 0.");
+            _localizationFromFusedOnly = value;
+        }
+    }
+
+    private bool _localizationFromFusedOnly;
+
+    /// <summary>Input pixels per spatial-map cell: the stem's stride, x2 per downsampling stage, /2 per fused stage.</summary>
+    public int OutputStride { get; }
+
+    /// <summary>Index into <see cref="Layers"/> of each stage's last layer — where fusion taps stage outputs.</summary>
+    private readonly int[] _stageEnds;
+
+    public ImageTower(int embeddingDim, int stemChannels = 64, int[]? stageChannels = null, int[]? blocksPerStage = null, Device? device = null, int fusedStages = 0)
         : base(nameof(ImageTower))
     {
         stageChannels ??= [64, 128, 256];
         blocksPerStage ??= [2, 2, 2];
+        if (fusedStages < 0 || fusedStages >= stageChannels.Length)
+            throw new ArgumentException($"fusedStages must be between 0 and {stageChannels.Length - 1} (stages - 1).", nameof(fusedStages));
         EmbeddingDim = embeddingDim;
+        StemChannels = stemChannels;
+        StageChannels = stageChannels;
+        BlocksPerStage = blocksPerStage;
+        FusedStages = fusedStages;
+        var stageEnds = new int[stageChannels.Length];
 
         Stem = Conv2d(3, stemChannels, kernel_size: StemKernel, stride: StemStride, device: device);
 
@@ -47,36 +95,83 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
         // GroupNorm into computing NaN, LayerScale notwithstanding (LayerScale only
         // dampens a block's finite output; it can't recover an already-NaN/Infinity
         // value produced inside the branch).
-        var layers = new List<Module<Tensor, Tensor>> { GroupNorm(1, stemChannels, eps: 1e-3, device: device) };
+        var layers = new List<Module<Tensor, Tensor>> { ConvNeXtBlock.NewGroupNorm(stemChannels, device) };
         long inChannels = stemChannels;
         for (var stage = 0; stage < stageChannels.Length; stage++)
         {
             long outChannels = stageChannels[stage];
             if (outChannels != inChannels)
             {
-                layers.Add(GroupNorm(1, inChannels, eps: 1e-3, device: device));
+                layers.Add(ConvNeXtBlock.NewGroupNorm(inChannels, device));
                 layers.Add(Conv2d(inChannels, outChannels, kernel_size: 2, stride: 2, device: device));
             }
             for (var b = 0; b < blocksPerStage[stage]; b++)
                 layers.Add(new ConvNeXtBlock(outChannels, device));
+            stageEnds[stage] = layers.Count - 1;
             inChannels = outChannels;
         }
 
+        _stageEnds = stageEnds;
+        var stride = (int)StemStride;
+        long previousChannels = stemChannels;
+        foreach (var channels in stageChannels)
+        {
+            if (channels != previousChannels)
+                stride *= 2;
+            previousChannels = channels;
+        }
+        OutputStride = stride >> fusedStages;
         Layers = ModuleList(layers.ToArray());
         Projection = Conv2d(inChannels, embeddingDim, kernel_size: 1, device: device);
+        // Laterals[k] projects stage (last - 1 - k) into the embedding space.
+        Laterals = ModuleList(Enumerable.Range(1, fusedStages)
+            .Select(k => Conv2d(stageChannels[stageChannels.Length - 1 - k], embeddingDim, kernel_size: 1, device: device))
+            .ToArray());
 
         RegisterComponents();
     }
 
+    /// <summary>Index into <see cref="Layers"/> of the last layer of <paramref name="stage"/>.</summary>
+    public int StageEnd(int stage) => _stageEnds[stage];
+
     public override (Tensor Pooled, Tensor Spatial) forward(Tensor input)
     {
-        var x = Stem.forward(input);
-        foreach (var layer in Layers)
-            x = layer.forward(x);
-
-        var spatial = Projection.forward(x);
+        var (spatial, _) = ForwardMaps(input);
         var pooled = functional.adaptive_avg_pool2d(spatial, [1L, 1L]).flatten(1);
         return (pooled, spatial);
+    }
+
+    /// <summary>
+    /// The full spatial map (what classification pools) and the localization map (what
+    /// heatmaps and the localization loss use). They are the same tensor unless
+    /// <see cref="LocalizationFromFusedOnly"/> is set.
+    /// </summary>
+    public (Tensor Spatial, Tensor Localization) ForwardMaps(Tensor input)
+    {
+        var x = Stem.forward(input);
+        var stageOutputs = new Tensor[StageChannels.Length];
+        var nextStage = 0;
+        for (var i = 0; i < Layers.Count; i++)
+        {
+            x = Layers[i].forward(x);
+            if (nextStage < _stageEnds.Length && i == _stageEnds[nextStage])
+                stageOutputs[nextStage++] = x;
+        }
+
+        var spatial = Projection.forward(x);
+        Tensor? localization = null;
+        for (var k = 1; k <= FusedStages; k++)
+        {
+            var lateral = Laterals[k - 1].forward(stageOutputs[StageChannels.Length - 1 - k]);
+            spatial = Upsample(spatial, lateral) + lateral;
+            if (LocalizationFromFusedOnly)
+                localization = localization is null ? lateral : Upsample(localization, lateral) + lateral;
+        }
+
+        return (spatial, localization ?? spatial);
+
+        static Tensor Upsample(Tensor map, Tensor like) =>
+            functional.interpolate(map, size: [like.shape[2], like.shape[3]], mode: InterpolationMode.Nearest);
     }
 
     /// <summary>

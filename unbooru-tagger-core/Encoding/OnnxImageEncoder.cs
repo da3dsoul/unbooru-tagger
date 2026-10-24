@@ -16,6 +16,9 @@ public sealed class OnnxImageEncoder : IImageEncoder, IDisposable
     private readonly string _inputName;
     private readonly string _spatialOutputName;
 
+    /// <summary>Optional output with the map heatmaps should use (see the training project's ImageTower.LocalizationFromFusedOnly).</summary>
+    public const string LocalizationOutputName = "localization_features";
+
     public int EmbeddingDim { get; }
     public int InputSize => _inputSize;
 
@@ -51,7 +54,12 @@ public sealed class OnnxImageEncoder : IImageEncoder, IDisposable
         var spatialFeatures = ToSpatialFeatureMap(spatial);
         var pooled = MaskedPool(spatialFeatures, preprocessed.Content, _inputSize);
 
-        return new ImageEncoding(pooled, spatialFeatures, preprocessed.Content);
+        // A model trained with a separate localization map exports it as its own output;
+        // heatmaps come from it, whole-image scores from the full map pooled above.
+        var localization = results.FirstOrDefault(r => r.Name == LocalizationOutputName);
+        var heatmapFeatures = localization is not null ? ToSpatialFeatureMap(localization.AsTensor<float>()) : spatialFeatures;
+
+        return new ImageEncoding(pooled, heatmapFeatures, preprocessed.Content);
     }
 
     /// <summary>

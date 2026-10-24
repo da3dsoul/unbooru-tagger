@@ -24,11 +24,9 @@ is no Python code in this repo).
   that snaps the heatmap to the source image's own edges. Newest feature,
   least battle-tested.
 - **Open-ended vocabulary** — add a brand-new tag and fine-tune just that
-  row, without touching the rest of the model. The row is meant to
-  warm-start from a frozen text embedding of the tag string (see
-  `ITagTextEmbedder` in `unbooru-tagger-core`), but no CLI flag wires a
-  concrete model into that path yet — new tags currently start from small
-  random noise instead.
+  row, without touching the rest of the model. The row can warm-start from
+  a frozen text embedding of the tag string (`--warm-start-model`/
+  `--warm-start-vocab`, see below) instead of small random noise.
 - **Rare-tag aware training** — oversampling and a minimum-image
   threshold so long-tail tags aren't drowned out by common ones.
 - **Label-free localization & representation training** — an auxiliary
@@ -92,6 +90,7 @@ model/
   image_encoder.onnx
   tag_vocabulary.json
   tag_embeddings.bin
+  logit_scaling.json   # optional -- missing means Scale=1, Bias=0 (an older export)
 ```
 
 Build and run the inference CLI:
@@ -129,11 +128,33 @@ dotnet run --project unbooru-tagger-inference -- detect ./cat.png --model-dir ./
 ```
 
 Prints JSON detections to stdout; `--out` additionally writes an
-annotated PNG with colored boxes and tag/confidence labels.
+annotated PNG with colored boxes and tag/confidence labels. `--min-heatmap-range`
+(default `0.05`) suppresses boxes entirely for a tag whose heatmap is too flat to
+carry real spatial signal, instead of reporting a canvas-spanning or fragmented
+box built from noise. `--min-box-fraction` (default `0.002`) drops regions covering
+less than that fraction of the heatmap grid (isolated specks), and
+`--max-boxes-per-tag` (default `3`, `0` = unlimited) keeps only the strongest. Each
+box is labeled with its own peak confidence, not the tag's whole-image score.
 
-Every command accepts `--model-dir` (default `./model`) and (except
-`detect`, which has its own `--box-threshold`) `--threshold` (default
-`0.5`) for the minimum tag confidence to report.
+**Compare against a gold set by eye:**
+
+```sh
+dotnet run --project unbooru-tagger-inference -- render-gold ./gold/gold.json --out-dir ./gold/renders --model-dir ./model
+```
+
+Writes one PNG per gold image. It shows the hand-checked boxes drawn
+exactly as `detect` draws, with the same per-tag colors, beside that
+model's `detect` output. The model panel shows only the tags the gold set
+boxes on that image (`--all-tags` shows everything). Omit `--model-dir` to
+render the gold boxes alone. Takes the same box options as `detect`.
+
+Every command accepts `--model-dir` (default `./model`). `tag`, `tag-batch`
+and `detect` also accept `--threshold` for the minimum tag confidence to report.
+Omit it to use each tag's calibrated threshold from the bundle's
+`tag_thresholds.json` (see `evaluate` below), with 0.5 for uncalibrated tags or
+bundles without that file. If the bundle has `exclusive_tags.txt`, only the
+stronger tag of any mutually exclusive pair (e.g. `solo` vs `multiple_girls`) is
+reported.
 
 ## Building from source (developers)
 
@@ -469,6 +490,184 @@ checkpointing. Uses CUDA if available, CPU otherwise. Key flags:
 `--validation-fraction` (default 0.1), `--early-stopping-patience`
 (default 3).
 
+**Deliberate batches and targets (default).** The corpus was crawled per
+tag, with positives and co-occurrence-chosen hard negatives for each one,
+and training uses that structure directly:
+
+- `--sampling tag-centric` (default; `rare-tag` is the old random-image
+  sampler) builds each batch around a few *anchor* tags drawn uniformly
+  over the vocabulary: `--positives-per-anchor` (default 2) images with
+  the tag plus `--hard-negatives-per-anchor` (default 2) images with a
+  commonly co-occurring tag but *not* this one (same series, other
+  character; `breasts` without `large_breasts`).
+- `--targets deliberate` (default; `legacy` = every untagged tag is an
+  equally certain negative) weights each (image, tag) pair by how sure the
+  corpus is about it:
+  - **Full-strength pairs:** positives and verified negatives — the anchor's
+    hard negatives, and tags mutually exclusive with one the image carries
+    (`--certain-negative-weight`, default 1).
+  - **Ignored pairs:** a tag usually implied by one the image carries (on ≥
+    `--implied-threshold`, default 0.6, of that tag's images) is treated as
+    a likely-missing label.
+  - **Damped pairs:** all other negatives use the asymmetric loss —
+    anything predicted below `--negative-clip` (default 0.05) costs nothing,
+    and the rest is damped by `p^--negative-gamma` (default 4). This keeps
+    each image's ~40 positives from being drowned out by ~25K unverified
+    negatives.
+- `--exclusive-tags <file>` — mutually exclusive groups, one
+  comma-separated group per line, every pair on a line exclusive (e.g.
+  `solo, multiple_girls`). Defaults to the checkpoint's saved copy, else
+  built-in people-count and rating groups. Saved into the checkpoint and
+  shipped with the exported model, where inference keeps only the stronger
+  tag of any contradictory pair.
+
+**Which tags get localized.** Whole-image tags have no region to point at:
+artist/series/meta/rating tags, backgrounds, mediums, styles, color
+themes, lighting, weather, framing/angle, people counts, and image format.
+The per-location loss never trains on them, and `detect` reports them
+without boxes. The rules live in `localizable_tags.txt`, one per line:
+- `tag` — exact match.
+- `prefix*` or `*suffix` — anchored match. Anchoring keeps `* background`
+  from catching unrelated tags, and avoids substrings: "shadow" would also
+  hit `eyeshadow`.
+- `!rule` — exception (e.g. `!signature`, a small real region).
+
+Underscores and spaces are interchangeable. `--localizable-tags <file>`
+overrides the built-in defaults. The rules are saved into the checkpoint
+and shipped in the exported model bundle.
+
+**Validation measures ranking, not mean loss.** Mean sigmoid loss over
+every (image, tag) pair is dominated ~600:1 by easy negatives. It can sit
+near its floor while positives are ranked badly. Each epoch now scores the
+held-out split per tag: AP of the tag's held-out positives against its
+hard negatives plus random negatives, with likely-missing images left out.
+Early stopping tracks mean AP. Each epoch also writes into the checkpoint:
+- `tag_thresholds.json` — each tag's best-F1 cutoff.
+- `evaluation_report.json` — per-tag AP, hard-negative AP, F1 and
+  threshold, worst first, plus image-level precision/recall at those
+  thresholds and the rate at which mutually exclusive tags fire together.
+
+**Content ratings.** Run the crawler's `export-ratings --output-dir <dataset>`
+once (and again after anything that changes the cache's rows). It writes
+`ratings.bin`, one rating per image, taken as the *strictest* across the
+image's sources so an explicit image is never learned as safe. `train`
+then learns three cumulative labels:
+- `rating:at_least_sensitive`
+- `rating:at_least_questionable`
+- `rating:is_explicit`
+
+These add three vocabulary rows, so a checkpoint from before ratings can
+only be resumed with `--no-ratings`. Validation calibrates each label's
+cutoff for recall (90% / 97% / 97%) rather than F1, since missing explicit
+content is the costly error. It reports a rating confusion matrix with the
+rate of questionable/explicit images called general (`rating_report.json`).
+`tag` prints the derived overall rating first.
+
+**Label corrections from the crawl data.** Three more crawler exports, each
+run once against the dataset directory (`--output-dir <dataset>`); training and
+`evaluate` pick the files up automatically when present:
+- `export-implications` writes `tag_implications.json`, Danbooru's active tag
+  implications (witch_hat → hat). Danbooru applies them to every post but
+  Gelbooru doesn't, so each image's implied tags are filled in when the tags are
+  loaded. On run 2 this added 523,867 missing labels to 507,666 images.
+- `export-image-sites` writes `image_sites.bin` (which sites each image came
+  from) and `export-tag-agreement` writes `tag_agreement.json` (per tag, how
+  often each site lists it on images both sites have). Together they mark the
+  ~950 tags only one site's tag system uses (Gelbooru's `silver_hair`,
+  `black_legwear`; Danbooru's `covered_nipples`). An image from only the other
+  site can never carry those, so its absence isn't trained or evaluated as a
+  negative. The agreement counts aren't a tagging-recall measure: Gelbooru
+  largely copies Danbooru's tags.
+
+**Context negatives.** If tag t is on 60–90% of tag s's images
+(`--implied-threshold` 0.6, `--missing-threshold` 0.9), s is a context source
+for t: a character who usually wears a hat. Images with s but not t are
+trained as unverified negatives and drawn per anchor tag
+(`--context-negatives-per-anchor`, default 1); at 90% and above an absence is
+still treated as a missing label. `evaluate` reports a per-tag context AP.
+
+**Localization options.**
+- `--localization-map fused` trains localization (and draws heatmaps) on the
+  fused high-resolution laterals only, without the last stage. Needs
+  `--fused-stages > 0`; can be switched on when resuming.
+- `--crop-consistency-weight` (default 0): the classifier's answer on a random
+  crop teaches the localization map where a tag is. Gated to tags with held-out
+  AP ≥ `--crop-teacher-min-ap` (0.8), ≥ `--crop-teacher-min-positives` (20) and
+  context AP ≥ 0.8 in the latest epoch evaluation, and to confident answers
+  (`--crop-teacher-confidence` 0.9). Off in run 2 until enough tags qualify.
+- `--localization-background-weight` (default 0): background suppression.
+  Tested; it shrank heatmaps without moving peaks.
+- `--gold <gold.json>` scores the gold set and the crop teacher at every epoch
+  evaluation; every epoch's reports are archived in `history/epoch-N/`.
+- `--max-steps N` stops after N steps and saves (for short comparison runs).
+
+**Status panel.** In a terminal, `train` shows a full-width panel: phase,
+epoch and whole-run progress with time left and finish times, speed, loss
+(this step, a 1,000-step mean and a trend sparkline), learning rate,
+checkpoints, the last evaluation and recent events. With output redirected it
+prints a one-line summary every 5 minutes.
+
+`--validation-max-images` caps how many held-out images that uses
+(default 0 = all). To measure any existing checkpoint the same way, and
+calibrate its thresholds without training:
+
+```sh
+dotnet run --project unbooru-tagger-training -c Release -- evaluate \
+  --checkpoint-dir ./checkpoint --cache-dir ./data/large-cache --max-images 20000
+```
+
+`evaluate` also measures localization (`localization_report.json`).
+Label-free checks on `--localization-samples` (default 300) held-out
+images:
+- **Deletion:** does blanking a tag's top heatmap cells lower its
+  confidence more than blanking random cells?
+- **Two characters:** on images tagged with exactly two characters, do
+  their heatmaps peak in different places?
+- **Crop consistency:** does a crop's heatmap match the same crop of the
+  full heatmap?
+- **Solo counts:** on `solo` images, do once-per-person tags yield exactly
+  one box?
+
+With `--gold <gold.json>`, it also scores against hand-checked boxes:
+pointing accuracy, heatmap energy inside the boxes, and box
+precision/recall/count error. `--embeddings-cache <file>` saves held-out
+embeddings so re-evaluating the same checkpoint skips the slow embedding
+pass.
+
+**Data loading.** With `--cache-dir`, batches are sampled and loaded ahead
+of the training loop on a background thread, so disk reads and decoding
+overlap GPU compute. Each window of `--prefetch-batches` (default 8)
+batches is read in one burst: images are deduplicated, sorted by file
+offset, and read with `--io-parallelism` (default 32) reads in flight,
+then decoded in parallel straight into the batch buffers. A striped
+spinning-disk array only delivers its throughput when every disk has work
+queued. On the 6-disk RAID5 this was measured at ~48 images/s for the old
+one-read-at-a-time path vs. ~450–590 images/s for this loader. Validation
+passes and `evaluate` use the same loader. The status panel reports
+ms/step and how much of it was spent waiting on data. If that wait isn't
+near zero, raise `--io-parallelism` or `--prefetch-batches`.
+
+`--gradient-accumulation-steps` (default `1`, disabled) — accumulates
+gradients over this many `--batch-size` micro-batches before each
+optimizer step, for an effective batch of `batchSize * this` without
+needing enough memory to actually fit that many images at once. Useful
+when memory caps `--batch-size` lower than you'd like: a larger effective
+batch means more positive rows per optimizer step in the sigmoid-
+contrastive label matrix (see the loss weighting note below), which
+matters more the smaller `--batch-size` is forced to be.
+
+`--localization-tag-chunk-size` (default `4096`) — the localization loss
+(below) scores every spatial location against the whole tag vocabulary at
+once by default, which is the single largest memory user at a
+large-vocabulary scale (a `[batch, vocabSize, locations]` tensor). This
+processes the vocabulary in chunks of this size instead, backpropagating
+each chunk immediately so its memory is freed before the next chunk's
+forward pass — exact, not an approximation (each tag's pooling only ever
+depends on its own locations, never other tags, so this is just a
+different order of the same sum). Lower uses less memory, at some
+per-chunk overhead cost from smaller matmuls; raising it toward or above
+the vocabulary size approaches the unchunked memory profile.
+
 Two auxiliary, label-free training objectives are on by default, each
 individually disableable by setting its weight to `0` (the
 self-supervised term additionally skips its extra forward passes
@@ -489,8 +688,8 @@ entirely when disabled):
   labels, just images already in the corpus.
 
 **Add a new tag** without retraining the whole model — creates the new
-tag's embedding row (random-init today, see the Features note above) and
-fine-tunes only that row with the image encoder frozen:
+tag's embedding row and fine-tunes only that row with the image encoder
+frozen:
 
 ```sh
 dotnet run --project unbooru-tagger-training -- add-tag hatsune_miku_nurse_costume \
@@ -498,6 +697,19 @@ dotnet run --project unbooru-tagger-training -- add-tag hatsune_miku_nurse_costu
   --images ./new-tag-manifest.json \
   --steps 300
 ```
+
+By default the new row starts from small random noise. Pass
+`--warm-start-model <path-to-onnx>` and `--warm-start-vocab
+<path-to-vocab.txt>` (a standard BERT-family WordPiece vocab file) to
+instead start it from a frozen text-embedding model's encoding of the
+tag string — underscores are treated as spaces
+(`hatsune_miku_nurse_costume` → `hatsune miku nurse costume`) before
+tokenizing. The model's output dimension must exactly match
+`--embedding-dim`/the checkpoint's own embedding dimension; there's no
+projection step, so a mismatch fails immediately with a clear error
+rather than silently truncating/padding. The same two flags also apply
+to `train`'s fresh-vocabulary path (a brand-new `--checkpoint-dir` with
+no existing checkpoint), for every tag's initial row instead of just one.
 
 The tag is promoted from warm-start-only to fully trained once it has
 seen `--min-image-threshold` images (default 15).
@@ -511,7 +723,11 @@ dotnet run --project unbooru-tagger-training -- export-onnx \
 ```
 
 Produces the `model/` bundle described above, ready for
-`unbooru-tagger-inference`.
+`unbooru-tagger-inference`. If the checkpoint has `exclusive_tags.txt` or
+`tag_thresholds.json` (from `train`/`evaluate`), they're copied into the
+bundle. With them, inference uses each tag's calibrated threshold unless
+`--threshold` is passed explicitly, and drops the weaker of any two
+mutually exclusive tags.
 
 ### Checkpoint directory contents
 
@@ -521,7 +737,12 @@ checkpoint/
   model_config.json
   tag_vocabulary.json
   tag_embeddings.bin
+  logit_scale_bias.dat  # learned logit scale/bias -- missing on an older checkpoint, starts fresh on resume
   training_progress.json (+ optimizer state, for resume)
+  logit_scale_bias_optimizer.dat  # separate optimizer state, so resuming an older checkpoint can't disturb the main one's momentum
+  exclusive_tags.txt     # mutually exclusive tag groups training used (copied into the model bundle)
+  tag_thresholds.json    # per-tag calibrated thresholds from the latest evaluation (copied into the model bundle)
+  evaluation_report.json # latest held-out per-tag report, worst tags first
 ```
 
 ## Model artifacts are not checked into git

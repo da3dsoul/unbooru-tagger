@@ -229,13 +229,27 @@ public static class ImagePreprocessing
     /// </summary>
     public static PreprocessedImage Reconstruct(EncodedImage encoded, int inputSize)
     {
+        var flat = new float[3 * inputSize * inputSize];
+        ReconstructInto(encoded, inputSize, flat);
+        return new PreprocessedImage(flat, encoded.Content);
+    }
+
+    /// <summary>
+    /// <see cref="Reconstruct"/> straight into a caller-owned slice (e.g. one image's slot
+    /// in a whole batch's buffer), skipping a per-image 3·inputSize² float allocation and
+    /// copy. <paramref name="destination"/> must already be zeroed — padding is never written.
+    /// </summary>
+    public static void ReconstructInto(EncodedImage encoded, int inputSize, Span<float> destination)
+    {
         var content = encoded.Content;
         var expectedLength = content.Width * content.Height * 3;
         if (encoded.Pixels.Length != expectedLength)
             throw new ArgumentException($"Expected {expectedLength} bytes for a {content.Width}x{content.Height} content region, got {encoded.Pixels.Length}.");
 
         var channelSize = inputSize * inputSize;
-        var flat = new float[3 * channelSize];
+        if (destination.Length != 3 * channelSize)
+            throw new ArgumentException($"Expected a {3 * channelSize}-float destination, got {destination.Length}.");
+        var flat = destination;
 
         for (var y = 0; y < content.Height; y++)
         {
@@ -251,8 +265,6 @@ public static class ImagePreprocessing
                 flat[(2 * channelSize) + pixelIndex] = (encoded.Pixels[offset + 2] / 255f - Mean[2]) / Std[2];
             }
         }
-
-        return new PreprocessedImage(flat, content);
     }
 
     /// <summary>

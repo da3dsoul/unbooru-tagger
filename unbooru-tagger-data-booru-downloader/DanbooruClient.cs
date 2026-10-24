@@ -94,6 +94,36 @@ public sealed class DanbooruClient(HttpClient http, IRateLimiter rateLimiter, st
         }
     }
 
+    /// <summary>
+    /// Streams every active tag implication (<c>tag_implications.json</c>): hard "A means B"
+    /// rules Danbooru applies when a post is tagged. Gelbooru doesn't apply them, so a
+    /// Gelbooru-only image tagged witch_hat can lack hat — a missing label these rules
+    /// restore for certain (see <c>export-implications</c>).
+    /// </summary>
+    public async IAsyncEnumerable<BooruTagImplication> ListActiveTagImplicationsAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        for (var page = 1; ; page++)
+        {
+            var uri = new Uri($"{_baseUrl}/tag_implications.json?search[status]=active&limit=1000&page={page}{AuthQuery()}");
+            var json = await GetStringAsync(uri, cancellationToken).ConfigureAwait(false);
+            using var doc = JsonDocument.Parse(json);
+
+            var any = false;
+            foreach (var element in doc.RootElement.EnumerateArray())
+            {
+                any = true;
+                if (!element.TryGetProperty("antecedent_name", out var antecedentProp) || antecedentProp.ValueKind != JsonValueKind.String
+                    || !element.TryGetProperty("consequent_name", out var consequentProp) || consequentProp.ValueKind != JsonValueKind.String)
+                    continue;
+
+                yield return new BooruTagImplication(antecedentProp.GetString()!, consequentProp.GetString()!);
+            }
+
+            if (!any)
+                yield break;
+        }
+    }
+
     public async Task<BooruPostPage> ListPostsAsync(string tagQuery, string? cursor, CancellationToken cancellationToken = default)
     {
         var cursorQuery = cursor is null ? "" : $"&page=b{cursor}";

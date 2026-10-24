@@ -31,6 +31,17 @@ for probability mass the way softmax forces them to).
   between stages of `ConvNeXtBlock`s (depthwise 7x7 conv, 4x-expanding
   pointwise MLP, LayerScale). Default config (`ModelConfig.Default`):
   `stemChannels=64, stageChannels=[64,128,256], blocksPerStage=[2,2,2]`.
+- **Configurable size and multi-scale fusion (run 2):** `--stem-channels`,
+  `--stage-channels`, `--blocks-per-stage` set the tower for a fresh run (the
+  checkpoint's `model_config.json` wins on resume; `ModelConfig.From(tower)` saves
+  the real shape — it used to always save `ModelConfig.Default`). `--fused-stages`
+  adds an FPN-style top-down path (`ImageTower.Laterals`): the last stage's projected
+  map is nearest-upsampled 2x and added to a 1x1 projection of the previous stage,
+  once per fused stage, so a 4-stage stride-32 tower with 2 fused stages emits a
+  stride-8 (64x64 at 512px) heatmap. The run-1 gold set showed small objects
+  (earrings, hairclips, chokers) at near-chance pointing on the old 32x32 map. The
+  hand-built ONNX exporter mirrors it with `Resize` (nearest, asymmetric/floor) +
+  `Add`; `ImageTowerOnnxExportTests` checks the fused graph against TorchSharp.
 - The original plan named "ViT or ConvNeXt" as the backbone choice; only
   ConvNeXt is actually built. Swapping in a ViT later would mean a new
   `Module<Tensor, (Tensor Pooled, Tensor Spatial)>` implementation exposing
@@ -45,26 +56,54 @@ for probability mass the way softmax forces them to).
   embeddings — required for the heatmap dot product to be dimensionally
   valid at all.
 
-**Tag tower — implemented, warm-start prior NOT wired in by default**
+**Tag tower — implemented, warm-start prior wired in but optional**
 - `TagTower`: a learned embedding table, one row per tag, trained jointly —
   as planned.
-- The warm-start mechanism itself exists (`ITagTextEmbedder` /
-  `OnnxTagTextEmbedder` in `unbooru-tagger-core`: runs a frozen ONNX
-  text-embedding model to produce a tag's prior vector), **but no CLI flag
-  currently wires a concrete model into it.** Both call sites that could use
-  it — `train`'s fresh-vocabulary path and `add-tag` — pass
-  `warmStartEmbedder: null` today, which falls back to
-  `EmbeddingInit.RandomRow` (small uniform random noise). In the current
-  build, every new tag starts from random noise, not a semantic prior from
-  related tags. Wiring in a real frozen embedding model (and a CLI flag to
-  point at it + a tokenizer) is unfinished work, not a design change.
+- The warm-start mechanism (`ITagTextEmbedder` / `OnnxTagTextEmbedder` in
+  `unbooru-tagger-core`: runs a frozen ONNX text-embedding model to produce
+  a tag's prior vector) is now wired into both call sites that can use it —
+  `train`'s fresh-vocabulary path and `add-tag` — via
+  `--warm-start-model`/`--warm-start-vocab` (`TagWarmStartEmbedderFactory`
+  in `unbooru-tagger-training`). `--warm-start-vocab` is a standard
+  BERT-family "vocab.txt"; tokenization is a from-scratch minimal WordPiece
+  implementation (`WordPieceTokenizer`), since the interface deliberately
+  leaves tokenization to the caller (the right tokenizer depends on which
+  frozen model gets chosen) rather than baking one algorithm in. Booru tags
+  use underscores where the text model expects spaces
+  (`hatsune_miku_nurse_costume` → `hatsune miku nurse costume`) — that
+  normalization lives in the factory, not the generic tokenizer. Both
+  flags are optional and must be given together; omitting them keeps the
+  old `EmbeddingInit.RandomRow` (small uniform random noise) behavior
+  exactly as before. No projection step: the text model's output dim must
+  equal the tag tower's `--embedding-dim`, or `OnnxTagTextEmbedder.Embed`
+  throws immediately with the actual vs. expected size, rather than either
+  silently truncating/padding or failing later with a cryptic tensor-shape
+  error inside `TagTower`.
 
 **Training objective — implemented, plus two label-free auxiliary losses added later**
 - Primary loss: SigLIP-style sigmoid loss between every image embedding and
   every tag embedding in the batch (`SigmoidContrastiveLoss.Compute`) — each
   image-tag pair is an independent binary match/no-match decision, as
-  planned. Confidence for a pair = `sigmoid(dot(pooled image embedding, tag
-  embedding))` (`TagScorer.Score`).
+  planned. Confidence for a pair = `sigmoid(scale * dot(pooled image
+  embedding, tag embedding) + bias)` (`TagScorer.Score`).
+- **Learnable logit scale/bias** (`LogitScaleBias`, `LogitScaling`) —
+  matches the real SigLIP paper's own parametrization, added after the
+  initial implementation shipped without it. With a vocabulary in the tens
+  of thousands and small batches, almost every (image, tag) pair is a
+  negative; a plain unscaled/unbiased sigmoid has no parameter dedicated to
+  representing that imbalance, so it was found pushing rare/mid-frequency
+  tags' own embeddings toward "always predict negative" instead — those
+  tags scored near-zero on images that obviously matched, while common tags
+  stayed well-calibrated. Scale is stored in log-space (can't cross zero);
+  bias starts at -10 so an untrained tag defaults to "no match." Persisted
+  in its own checkpoint/optimizer files, deliberately kept separate from
+  the main image/tag-tower optimizer so resuming an older checkpoint (one
+  written before this existed) can't corrupt that optimizer's already-
+  accumulated momentum — see `TrainingState.SaveLogitScaleBiasOptimizerState`'s
+  doc comment. Exported alongside the rest of the model bundle
+  (`logit_scaling.json`) so inference reproduces the same operating point;
+  a model bundle exported before this existed loads as `LogitScaling.Identity`
+  (`Scale=1, Bias=0`), matching its old unscaled/unbiased behavior exactly.
 - `--localization-weight` / `--localization-temperature` (on by default —
   see README for current defaults): an MIL/log-sum-exp pooled auxiliary
   loss (`SigmoidContrastiveLoss.ComputeLocalized`), scored from every
@@ -75,6 +114,20 @@ for probability mass the way softmax forces them to).
   over an average, so mean-of-per-location-logits == dot(mean-pooled
   embedding, tag)); lower temperature pulls it toward a max over locations,
   concentrating gradient on a tag's best-matching spot.
+- Trained via `SigmoidContrastiveLoss.ComputeLocalizedChunked`
+  (`--localization-tag-chunk-size`, default 4096), not `ComputeLocalized`
+  directly — the `[batch, vocabSize, locations]` tensor `ComputeLocalized`
+  builds is the single largest memory user at this vocabulary's scale, so
+  training processes the vocabulary in chunks instead, backpropagating
+  each one immediately (its own `backward(retain_graph: true)` call, not
+  one combined `loss.backward()`) so a chunk's memory is freed before the
+  next chunk's forward pass. Exact, not an approximation — each tag's
+  pooling only ever depends on its own locations, never other tags, so
+  this is just a different order of the same sum; verified directly by a
+  gradient-equivalence test against `ComputeLocalized`, not just by
+  argument. `ComputeLocalized` itself is unchanged and still used directly
+  by the test suite as the reference implementation that verifies this
+  against.
 - `--self-supervised-weight` (on by default): a SimSiam-style consistency
   loss between two random-crop-augmented views of the same already-loaded
   batch (`RandomCropAugmentation`), predicting each other's pooled
@@ -85,6 +138,113 @@ for probability mass the way softmax forces them to).
   pure restructurings of the existing sigmoid-contrastive setup, added
   after the original plan was written to sharpen localization/
   representation quality without bounding-box labels.
+
+## Deliberate batches, targets and evaluation — added after the first full run
+The first full run (12 epochs, `rare-tag` sampling, every untagged tag a
+uniform -1) early-stopped on mean validation loss while still producing
+noisy boxes, false tags and misses. Mean loss over 25K tags per image is
+~600:1 easy negatives; an all-negative predictor scores ~0.014 and the run
+stopped at ~0.005. Training now uses the per-tag structure the crawler
+built the corpus around:
+- `TagStatistics`: per-tag positive lists, plus two things estimated from a
+  bounded sample of each tag's images rather than an exact corpus-wide pair
+  table (which is too big at this scale): implied tags (P(t|s) ≥ 0.6) and
+  hard-negative sources (the crawler's own `FindHardNegativeSources` definition).
+- `TagCentricBatchSampler` (default): batches are built around anchor tags
+  drawn uniformly over the vocabulary, each with positives AND hard negatives.
+- `PairWeightBuilder` + `SigmoidContrastiveLoss.ComputeWeighted` (default):
+  pairs are weighted by certainty.
+  - Positives and verified negatives (anchor hard negatives,
+    `ExclusiveTagGroups`) use full BCE.
+  - Likely-missing tags get weight 0.
+  - Other negatives use the asymmetric loss (ASL).
+  - Tags no training image carries get weight 0.
+  The same targets drive the localization loss, with `rating:*` excluded.
+- `TagRankingEvaluator`: early stopping tracks held-out mean per-tag AP,
+  scored against each tag's hard negatives. It also calibrates per-tag
+  best-F1 thresholds (`TagThresholds`, shipped in the model bundle). The
+  `evaluate` command runs it on any checkpoint.
+- `--sampling rare-tag --targets legacy` reproduces the original behavior.
+- **Sparse localization loss (default with deliberate targets):**
+  `LocalizationPairSelector` keeps, per image:
+  - localizable positives;
+  - certain negatives;
+  - the `--localization-mined-negatives` (32) highest-scoring wrong tags.
+
+  `SigmoidContrastiveLoss.ComputeLocalizedPairs` scores only those, about 100
+  pairs per image instead of 25K. That cut a step from 1,413ms to 468ms on the
+  old tower; most of the old step time was this loss. Equivalent to the dense loss
+  when every pair is selected (tested).
+- **Localizability rules (`TagLocalizability`, `localizable_tags.txt`):**
+  whole-image tags never reach the localization loss, and `detect` reports them
+  without boxes. Covered: artist/series/meta/rating, backgrounds, mediums,
+  styles, lighting, weather, framing, people counts and format. Rules are anchored
+  (exact / prefix* / *suffix / !exception), because substring rules misfire
+  (`eyeshadow`, `covered navel`).
+- **Content ratings:** the crawler's `export-ratings` writes `ratings.bin`, the
+  strictest rating across each image's sources. Training learns three cumulative
+  labels, with cutoffs calibrated for recall rather than F1 (`RatingEvaluator`).
+  Before this, ratings never reached training at all.
+- **Vocabulary:** a fresh run drops rows no image carries (`VocabularyRemap.Compact`;
+  ~6.5K stale rows such as "long hair" beside "long_hair"). Dataset rows are matched
+  to a checkpoint's vocabulary by tag name, not by row index.
+- **LR schedule:** `--lr-schedule cosine` (default) gives linear warmup
+  (`--warmup-steps`) then cosine decay to 5% across `--epochs`, computed from the
+  global step, so a resume lands on the same rate. Raising `--epochs` mid-run
+  reshapes the remaining decay.
+- **Data loading:** `BatchPrefetcher` + `PreprocessedDatasetCacheReader.ReadEncoded`
+  sample ahead on a background thread, then read each window offset-sorted with
+  32 reads in flight. That gave ~450–590 img/s vs ~48 for the old synchronous path
+  on the 6-disk RAID5; a step now waits ~1ms on data.
+- **Gold set** (`/media/da3dsoul/Golias/unbooru-tagger/gold`, not in git): 289
+  hand-checked validation images (164 clean, 125 messy) with certain, group and
+  ignore boxes (COCO-style crowd/ignore semantics). Scored by `evaluate --gold`,
+  rendered side by side with `render-gold`. Run 1's epoch-12 baseline is in
+  `run1-small-convnext-epoch12-COMPARISON-ONLY/README.txt`.
+- **Separate localization map (`--localization-map fused`, run 2 from epoch 2):** the
+  localization loss, `evaluate`'s gold scoring and inference heatmaps use the fused
+  laterals alone (`ImageTower.ForwardMaps`), without the upsampled last stage, whose
+  locations each see most of the image. Classification still pools the full map. Exported
+  as an extra ONNX output (`localization_features`); older bundles still work. A 3,000-step
+  A/B: gold pointing 27.0% → 29.0% (clean 29.7% → 33.9%), deletion win 75% → 82%.
+- **Context negatives:** `TagStatistics` splits the old "implied" band. P(t|s) ≥
+  `--missing-threshold` (0.9) is still a likely-missing label (weight 0). Between
+  `--implied-threshold` (0.6) and that, s is a *context source* for t: a character who
+  usually wears a hat. Images with s but not t are trained as unverified (focal-damped)
+  negatives and sampled per anchor (`--context-negatives-per-anchor`). Before, a
+  character's hatless images were ignored, so "this character, therefore hat" was free to
+  learn. `evaluate` reports a per-tag context AP (positives vs. those images); hard/random
+  negatives still leave the whole band out, so the early-stopping mAP stays comparable.
+- **Label completion from Danbooru implications:** the crawler's `export-implications`
+  writes `tag_implications.json` (46,895 active rules; 6,625 with both tags in run 2's
+  vocabulary, e.g. witch_hat → hat, red_hat → hat). Danbooru applies them to every post,
+  Gelbooru doesn't, so `TagImplications.Complete` adds each image's implied tags when the
+  tags are loaded (train and `evaluate`). Ground truth, not a statistic.
+- **Site coverage:** `export-image-sites` writes `image_sites.bin` (per cache row:
+  Danbooru-only 1.18M, Gelbooru-only 1.33M, both 2.87M) and `export-tag-agreement` writes
+  `tag_agreement.json` (per tag, over the 2.9M images on both sites: listed by both / one
+  site only). 1,136 vocabulary tags exist on only one site's tag system: 993 Gelbooru-only
+  (silver_hair, black_legwear, *_footwear, female_focus, 10s, gen_N_pokemon) and 130
+  Danbooru-only (covered_nipples, photoshop_(medium)). An image from only the other site
+  can never carry them, so `TagStatistics.IsSiteBlind` pairs get weight 0 in training,
+  are never sampled as negatives, and are left out of evaluation negatives, threshold
+  calibration and image-level precision. The agreement counts are NOT usable as tagging
+  recall: Gelbooru largely copies Danbooru's tags, so agreement is 96-99% for nearly every
+  tag. (`TagStatistics.Build`'s `tagRecall` posterior rule exists but is unused for that
+  reason; the fixed `--missing-threshold` applies.)
+- **Gated crop consistency (`--crop-consistency-weight`):** the classifier's verdict on a
+  random crop teaches the localization map where a tag is
+  (`SigmoidContrastiveLoss.ComputeWindowConsistency`). Ungated, it made localization worse:
+  `evaluate --gold`'s crop-teacher check showed the epoch-1 classifier at chance (51%
+  balanced) on crops, answering from context. `CropTeacherGate` trusts only tags with held-out
+  AP ≥ 0.8, ≥ 20 positives and (if measurable) context AP ≥ 0.8 in the latest epoch
+  evaluation, recomputed each epoch; only confident answers (p > 0.9 / < 0.1) train; only
+  images with a trusted tag are cropped, so its cost tracks how much the teacher is trusted.
+- **Background suppression (`--localization-background-weight`, off):** tested and not used;
+  it shrank heatmaps but didn't move peaks.
+- **Per-epoch gold scoring (`train --gold`):** each epoch evaluation also scores the gold set
+  and the crop teacher (`localization_report.json`); every epoch's reports are archived
+  under `history/epoch-N/`.
 
 ## Localization — implemented: heatmap, and (beyond the original scope) approximate boxes
 - **Heatmap** (`TagScorer.Heatmap`; `unbooru-tagger-inference heatmap`
@@ -147,18 +307,17 @@ for probability mass the way softmax forces them to).
    (percentile thresholding + bilateral refinement), still entirely
    label-free.
 3. ✅ "Add a tag" pipeline (warm-start + row fine-tune) — done as its own
-   `add-tag` command; warm-start currently defaults to random init (see
-   the tag-tower gap above), not the planned text-embedding prior.
+   `add-tag` command; warm-start defaults to random init unless
+   `--warm-start-model`/`--warm-start-vocab` point at a real frozen
+   text-embedding model (see the tag-tower section above).
 4. ✅ Long-tail handling (minimum-image thresholds + oversampling) — done.
 5. ✅ *(beyond original scope)* Two label-free training-time objectives
    added to sharpen localization and representation quality further,
    without any new training data: the MIL/log-sum-exp pooled localization
    loss, and the SimSiam self-supervised consistency loss.
-6. ⬜ Not yet done: wire a real frozen text-embedding model into the
-   tag-tower warm-start path (the interface exists; nothing plugs into it
-   by default, and there's no CLI flag for it yet); a partial /
-   top-layers-only unfreeze mode for periodic fine-tunes (currently
-   all-or-nothing, see the tag-growth section above).
+6. ⬜ Not yet done: a partial / top-layers-only unfreeze mode for periodic
+   fine-tunes (currently all-or-nothing, see the tag-growth section
+   above).
 
 ## Stack — actual, differs from the original plan
 - **Originally planned**: Python/PyTorch training, `timm` for backbones,

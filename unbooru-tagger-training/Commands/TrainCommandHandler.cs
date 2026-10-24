@@ -2,6 +2,7 @@ using Spectre.Console;
 using UnbooruTagger.Core.Dataset;
 using UnbooruTagger.Core.Embedding;
 using UnbooruTagger.Core.Encoding;
+using UnbooruTagger.Core.Scoring;
 using UnbooruTagger.Core.Vocabulary;
 using UnbooruTagger.Training.Checkpoints;
 using UnbooruTagger.Training.Data;
@@ -17,8 +18,14 @@ namespace UnbooruTagger.Training.Commands;
 /// pain. Accepts either a raw <c>DatasetManifest</c> (decoded/normalized on the fly,
 /// every epoch) or a <c>PreprocessedDatasetCache</c> built by unbooru-tagger-data's
 /// large mode (decoded/normalized once, ahead of time — the "maximum speed" path).
-/// Holds out a validation split and stops early once validation loss stops improving,
-/// instead of always running the full <paramref name="epochs"/> count.
+/// Holds out a validation split and stops early once held-out tag ranking quality (mean
+/// per-tag AP, see <see cref="TagRankingEvaluator"/>) stops improving, instead of always
+/// running the full <paramref name="epochs"/> count.
+///
+/// By default batches and targets are built deliberately from the corpus's per-tag
+/// structure (<see cref="TrainingTargetOptions"/>): each batch is anchored on a few tags'
+/// positives and hard negatives (<see cref="TagCentricBatchSampler"/>), and each (image, tag)
+/// pair is weighted by how certain the corpus is about it (<see cref="PairWeightBuilder"/>).
 /// </summary>
 public static class TrainCommandHandler
 {
@@ -36,26 +43,68 @@ public static class TrainCommandHandler
         double localizationWeight = 0.1,
         double localizationTemperature = 0.35,
         double selfSupervisedWeight = 0.1,
-        double checkpointIntervalMinutes = 15.0)
+        double checkpointIntervalMinutes = 15.0,
+        int gradientAccumulationSteps = 1,
+        string? warmStartModelPath = null,
+        string? warmStartVocabPath = null,
+        int localizationTagChunkSize = 4096,
+        TrainingTargetOptions? targetOptions = null,
+        int ioParallelism = 32,
+        int prefetchWindowBatches = 8,
+        TowerOptions? tower = null)
     {
+        tower ??= TowerOptions.Original;
+        targetOptions ??= TrainingTargetOptions.Default;
+
         if ((manifestPath is null) == (cacheDir is null))
             throw new ArgumentException("Provide exactly one of --manifest or --cache-dir.");
 
+        if (gradientAccumulationSteps < 1)
+            throw new ArgumentException("--gradient-accumulation-steps must be at least 1.");
+
+        if (localizationTagChunkSize < 1)
+            throw new ArgumentException("--localization-tag-chunk-size must be at least 1.");
+
         using var cacheReader = cacheDir is not null ? new PreprocessedDatasetCacheReader(cacheDir) : null;
+        ContentRating[]? ratings = null;
+        int[]? ratingRows = null;
 
         TagVocabulary vocabulary;
         List<List<int>> imageTagRows;
         int datasetCount;
         int resolvedInputSize;
         Func<IReadOnlyList<int>, (Tensor Pixels, IReadOnlyList<LetterboxBox> Boxes)> loadBatch;
+        // Cache-backed runs load through BatchPrefetcher (background, offset-sorted, many
+        // reads in flight); manifest runs keep the simple synchronous loadBatch path.
+        Func<IReadOnlyList<int>, EncodedImage[]>? readWindow = null;
 
         if (cacheReader is not null)
         {
             vocabulary = TagVocabulary.Load(Path.Combine(cacheDir!, "tag_vocabulary.json"));
             imageTagRows = cacheReader.ImageTagRows.Select(rows => rows.ToList()).ToList();
             datasetCount = cacheReader.ImageCount;
+
+            // Fill in tags Danbooru's implication rules guarantee (TagImplications); Gelbooru
+            // posts don't get them applied at the source.
+            var implications = TagImplications.Load(Path.Combine(cacheDir!, TagImplications.FileName), vocabulary);
+            if (implications.RuleCount > 0)
+            {
+                imageTagRows = implications.Complete(imageTagRows, out var addedLabels, out var changedImages);
+                AnsiConsole.MarkupLineInterpolated(
+                    $"Tag implications: {implications.RuleCount:N0} rules added {addedLabels:N0} missing labels to {changedImages:N0} images.");
+            }
+
+            // Content ratings (ratings.bin, from the crawler's export-ratings) become three
+            // cumulative labels appended to the vocabulary and each image's tags -- see RatingLabels.
+            ratings = targetOptions.Ratings ? ImageRatings.Load(cacheDir!, cacheReader.ImageCount) : null;
+            if (ratings is not null)
+            {
+                ratingRows = RatingLabels.EnsureRows(vocabulary);
+                imageTagRows = RatingLabels.Apply(imageTagRows, ratings, ratingRows);
+            }
             resolvedInputSize = cacheReader.InputSize;
             loadBatch = indices => LoadCacheBatch(cacheReader, indices, resolvedInputSize);
+            readWindow = indices => cacheReader.ReadEncoded(indices, ioParallelism);
         }
         else
         {
@@ -66,15 +115,20 @@ public static class TrainCommandHandler
             loadBatch = indices => ImageBatchLoader.Load(indices.Select(i => manifest.Entries[i].ImagePath).ToList(), resolvedInputSize);
         }
 
-        var tagFrequencies = ComputeTagFrequencies(imageTagRows);
+        // Saved into the checkpoint so export-onnx can ship it with the model bundle and
+        // inference suppresses exactly the contradictions training was taught.
+        var exclusiveGroups = ExclusiveTagGroups.Load(
+            targetOptions.ExclusiveTagsPath ?? Path.Combine(checkpointDir, ExclusiveTagGroups.FileName), vocabulary, fallBackToDefaults: true);
 
         var device = DeviceSelector.Best();
 
         ImageTower imageTower;
         TagTower tagTower;
+        LogitScaleBias logitScaleBias;
         var startEpoch = 0;
         var resumedProgress = TrainingProgress.Initial;
         var resumingOptimizerState = false;
+        var resumingLogitScaleBias = false;
         if (Checkpoint.Exists(checkpointDir))
         {
             // Resume instead of starting over: re-running `train` against the same
@@ -82,16 +136,28 @@ public static class TrainCommandHandler
             // completed epoch's work (SaveCheckpoint wrote it, but nothing ever read it
             // back), which is the whole point of saving a checkpoint every epoch in the
             // first place.
-            var (loadedImageTower, config, checkpointVocabulary, embeddings) = Checkpoint.Load(checkpointDir, device);
+            var (loadedImageTower, config, checkpointVocabulary, embeddings, loadedLogitScaleBias) = Checkpoint.Load(checkpointDir, device);
+            logitScaleBias = loadedLogitScaleBias;
+            resumingLogitScaleBias = Checkpoint.HasLogitScaleBias(checkpointDir);
+            if (!resumingLogitScaleBias)
+                AnsiConsole.MarkupLine("[yellow]Resuming: checkpoint predates the learned logit scale/bias — starting it fresh (Scale=10, Bias=-10) instead of continuing a previously-learned value.[/]");
 
             // The embedding table's row count is baked into its saved tensor shape, so
             // the vocabulary used from here on must be the exact one that produced it —
             // not a fresh load of the dataset's current vocabulary, which could have
             // grown (e.g. a still-running build-large-cache) since this checkpoint was
             // written.
-            if (checkpointVocabulary.Records.Count != vocabulary.Records.Count)
+            if (ratingRows is not null && RatingLabels.FindRows(checkpointVocabulary) is null)
                 throw new InvalidOperationException(
-                    $"Checkpoint at '{checkpointDir}' has {checkpointVocabulary.Records.Count} tags but the dataset vocabulary has {vocabulary.Records.Count} -- resuming would misalign tag-row indices. Use a fresh --checkpoint-dir, or a dataset that matches the one this checkpoint was trained on.");
+                    $"Checkpoint at '{checkpointDir}' predates content-rating labels (the dataset now has ratings.bin). Train into a fresh --checkpoint-dir to learn ratings, or pass --no-ratings to keep resuming this one without them.");
+
+            // Rows are matched to the checkpoint's vocabulary by tag name (VocabularyRemap),
+            // so a compacted vocabulary, or rows added by add-tag, line up without any
+            // assumption that dataset row N is checkpoint row N.
+            var (remappedRows, unmatched) = VocabularyRemap.Apply(vocabulary, imageTagRows, checkpointVocabulary);
+            imageTagRows = remappedRows;
+            if (unmatched > 0)
+                AnsiConsole.MarkupLineInterpolated($"Resuming: {unmatched} dataset tags aren't in the checkpoint's vocabulary (e.g. zero-image rows it dropped) and are ignored.");
 
             if (config.EmbeddingDim != embeddingDim)
                 AnsiConsole.MarkupLineInterpolated($"[yellow]Resuming: checkpoint embedding dim {config.EmbeddingDim} overrides --embedding-dim {embeddingDim}.[/]");
@@ -124,12 +190,39 @@ public static class TrainCommandHandler
         }
         else
         {
-            var initialRows = Enumerable.Range(0, vocabulary.Records.Count)
-                .Select(_ => EmbeddingInit.RandomRow(embeddingDim))
+            // Fresh run: drop vocabulary rows no image carries (stale crawl rows), so the tag
+            // table and every per-step [batch, vocabulary] tensor only cover learnable tags.
+            if (targetOptions.CompactVocabulary)
+            {
+                var compact = VocabularyRemap.Compact(vocabulary, imageTagRows);
+                AnsiConsole.MarkupLineInterpolated($"Compacting vocabulary: {vocabulary.Records.Count} -> {compact.Records.Count} tags (dropping rows no image carries).");
+                (imageTagRows, _) = VocabularyRemap.Apply(vocabulary, imageTagRows, compact);
+                vocabulary = compact;
+            }
+
+            using var warmStartEmbedder = TagWarmStartEmbedderFactory.Create(warmStartModelPath, warmStartVocabPath, embeddingDim);
+            var initialRows = vocabulary.Records
+                .Select(record => warmStartEmbedder?.Embed(record.Tag) ?? EmbeddingInit.RandomRow(embeddingDim))
                 .ToArray();
-            imageTower = new ImageTower(embeddingDim, device: device);
+            imageTower = new ImageTower(
+                embeddingDim, tower.StemChannels, tower.StageChannels, tower.BlocksPerStage, device, tower.FusedStages);
             tagTower = TagTower.CreateFullyTrainable(initialRows, embeddingDim, device);
+            logitScaleBias = new LogitScaleBias(device: device);
         }
+
+        // Not a weight change, so it applies on resume too; saved in model_config.json.
+        if (targetOptions.LocalizationFromFusedOnly is { } fusedOnly && fusedOnly != imageTower.LocalizationFromFusedOnly)
+        {
+            imageTower.LocalizationFromFusedOnly = fusedOnly;
+            AnsiConsole.MarkupLineInterpolated($"Localization map: {(fusedOnly ? "fused laterals only" : "full spatial map")}.");
+        }
+
+        exclusiveGroups = ExclusiveTagGroups.Parse(exclusiveGroups.SourceText, vocabulary);
+        if (ratingRows is not null)
+            ratingRows = RatingLabels.FindRows(vocabulary);
+        var tagFrequencies = ComputeTagFrequencies(imageTagRows);
+        Directory.CreateDirectory(checkpointDir);
+        exclusiveGroups.Save(Path.Combine(checkpointDir, ExclusiveTagGroups.FileName));
 
         // Not checkpointed/resumed: it only shapes how the image tower trains (see the
         // self-supervised loss below), never reaches the exported model, and is cheap
@@ -140,6 +233,13 @@ public static class TrainCommandHandler
             imageTower.parameters().Concat(tagTower.parameters()).Concat(predictionHead.parameters()).ToArray(), lr: learningRate);
         if (resumingOptimizerState)
             TrainingState.LoadOptimizerState(checkpointDir, optimizer);
+
+        // Deliberately a separate optimizer from the one above, not folded into the same
+        // parameter list — see TrainingState.SaveLogitScaleBiasOptimizerState's doc comment
+        // for why that would corrupt resuming an existing checkpoint's momentum.
+        var logitScaleBiasOptimizer = optim.Adam(logitScaleBias.parameters().ToArray(), lr: learningRate);
+        if (resumingOptimizerState && resumingLogitScaleBias && TrainingState.HasLogitScaleBiasOptimizerState(checkpointDir))
+            TrainingState.LoadLogitScaleBiasOptimizerState(checkpointDir, logitScaleBiasOptimizer);
 
         var allTagIndices = tensor(Enumerable.Range(0, vocabulary.Records.Count).Select(i => (long)i).ToArray(), device: device);
 
@@ -152,9 +252,62 @@ public static class TrainCommandHandler
         var (trainingIndices, validationIndices) = SplitForValidation(datasetCount, validationFraction, validationSplitSeed);
         var trainingTagRows = trainingIndices.Select(i => imageTagRows[i]).ToList();
         var sampler = new RareTagOversamplingBatchSampler(trainingTagRows, tagFrequencies);
+
+        AnsiConsole.MarkupLine("Building per-tag statistics (positives, implied tags, context and hard-negative sources)...");
+        // Site coverage (cross-site agreement + image_sites.bin): a tag only one site's tag
+        // system has is no evidence on an image from the other site alone (TagStatistics.IsSiteBlind).
+        var tagSites = cacheDir is not null ? TagAgreement.LoadSiteCoverage(Path.Combine(cacheDir, TagAgreement.FileName), vocabulary) : null;
+        var imageSites = cacheDir is not null && tagSites is not null ? ImageSites.Load(cacheDir, datasetCount) : null;
+        if (tagSites is not null && imageSites is not null)
+            AnsiConsole.MarkupLineInterpolated(
+                $"Site coverage: {tagSites.Count(s => s != (BooruSites.Danbooru | BooruSites.Gelbooru)):N0} tags are used by only one site; their absence on images from only the other site is ignored.");
+        else
+            (tagSites, imageSites) = (null, null);
+        var statistics = TagStatistics.Build(
+            trainingTagRows, vocabulary.Records.Count, impliedThreshold: targetOptions.ImpliedThreshold, seed: validationSplitSeed,
+            missingThreshold: targetOptions.MissingThreshold,
+            imageSites: imageSites is not null ? trainingIndices.Select(i => imageSites[i]).ToArray() : null, tagSites: tagSites);
+        var anyAnchorTag = statistics.Positives.Any(p => p.Length > 0);
+        if (targetOptions.TagCentricSampling && !anyAnchorTag)
+            AnsiConsole.MarkupLine("[yellow]No training image carries any tag -- falling back to rare-tag sampling.[/]");
+        var tagCentricSampler = targetOptions.TagCentricSampling && anyAnchorTag
+            ? new TagCentricBatchSampler(statistics, targetOptions.PositivesPerAnchor, targetOptions.HardNegativesPerAnchor,
+                contextNegativesPerAnchor: targetOptions.ContextNegativesPerAnchor)
+            : null;
+        AnsiConsole.MarkupLineInterpolated(
+            $"{statistics.ContextSources.Count(c => c.Length > 0)} tags have context sources (P(tag|source) in [[{targetOptions.ImpliedThreshold}, {targetOptions.MissingThreshold})); {targetOptions.ContextNegativesPerAnchor} context negative(s) per anchor.");
+        var pairWeightBuilder = new PairWeightBuilder(statistics, exclusiveGroups, targetOptions.CertainNegativeWeight,
+            exhaustiveRows: ratings is not null ? ratingRows : null);
+        AnsiConsole.MarkupLineInterpolated(
+            $"{statistics.Positives.Count(p => p.Length > 0)} of {vocabulary.Records.Count} tags have training images; {(tagCentricSampler is not null ? $"{tagCentricSampler.AnchorTagCount} anchor tags" : "rare-tag image sampling")}.");
+
+        // Tags with no region to point at (artists, series, meta, ratings, whole-image general
+        // tags like solo/upper_body) are never given to the per-location loss -- it could only
+        // teach their heatmaps noise.
+        // Rules from --localizable-tags, else the checkpoint's saved copy, else the defaults
+        // (TagLocalizability); saved into the checkpoint so export ships them to detect.
+        var localizability = TagLocalizability.Load(targetOptions.LocalizableTagsPath ?? Path.Combine(checkpointDir, TagLocalizability.FileName));
+        localizability.Save(Path.Combine(checkpointDir, TagLocalizability.FileName));
+        var localizable = vocabulary.Records.Select(r => localizability.IsLocalizable(r.Tag)).ToArray();
+
+        // Crop consistency trains only tags the classifier is already good at (CropTeacherGate),
+        // starting from the last epoch's evaluation and refreshed after every epoch.
+        var cropGate = targetOptions.CropConsistencyWeight > 0
+            ? CropTeacherGate.Load(Path.Combine(checkpointDir, EvaluationReportFileName), vocabulary, localizable, targetOptions.CropTeacherMinAveragePrecision, targetOptions.CropTeacherMinPositives)
+            : CropTeacherGate.None(vocabulary.Records.Count);
+        var cropTrusted = tensor(cropGate.Trusted.Select(t => t ? 1f : 0f).ToArray(), device: device);
+        if (targetOptions.CropConsistencyWeight > 0)
+            AnsiConsole.MarkupLineInterpolated(
+                $"Crop consistency: {cropGate.TrustedCount} localizable tags trusted as teachers (held-out AP >= {targetOptions.CropTeacherMinAveragePrecision}, >= {targetOptions.CropTeacherMinPositives} positives){(cropGate.TrustedCount == 0 ? "; off until an epoch evaluation trusts some" : "")}; re-checked after every epoch.");
+
         var earlyStopping = new EarlyStopping(earlyStoppingPatience);
-        if (resumingOptimizerState)
+        // Only resume early-stopping history recorded against the same metric -- a best
+        // value from the old mean-validation-loss metric (~0.005) would read as an
+        // unbeatable 1-mAP and stop the run after `patience` epochs regardless of progress.
+        if (resumingOptimizerState && resumedProgress.EarlyStoppingMetric == EarlyStoppingMetricName)
             earlyStopping.Restore(resumedProgress.EarlyStoppingBestLoss, resumedProgress.EarlyStoppingEvaluationsSinceImprovement);
+        else if (resumingOptimizerState)
+            AnsiConsole.MarkupLine("[yellow]Resuming: early-stopping history was recorded against a different metric -- starting it fresh against held-out mAP.[/]");
 
         var stepsPerEpoch = Math.Max(1, trainingIndices.Count / batchSize);
         var result = 0;
@@ -166,164 +319,523 @@ public static class TrainCommandHandler
         }
 
         // Steps already done in the epoch we're about to resume into (0 for a fresh run,
-        // or for a resume that landed exactly on an epoch boundary). Clamped in case
-        // --batch-size changed across the resume and shifted stepsPerEpoch.
-        var resumedStepsInEpoch = resumingOptimizerState ? Math.Min(resumedProgress.CompletedStepsInEpoch, stepsPerEpoch) : 0;
+        // or for a resume that landed exactly on an epoch boundary). See
+        // ResumeStepResolver's own doc comment for the silent-skip bug this avoids.
+        var resumeStep = ResumeStepResolver.Resolve(resumingOptimizerState, resumedProgress, stepsPerEpoch);
+        var resumedStepsInEpoch = resumeStep.StepsInEpoch;
+        if (resumeStep.StepLayoutChanged)
+        {
+            AnsiConsole.MarkupLineInterpolated(
+                $"[yellow]Resuming: this run's step layout ({stepsPerEpoch} steps/epoch) doesn't match what was saved ({resumedProgress.StepsPerEpoch} steps/epoch, or this checkpoint predates tracking it) -- likely --batch-size or the dataset changed across the resume. Restarting progress within epoch {startEpoch + 1} from step 0 instead of a no-longer-comparable step count.[/]");
+        }
         var checkpointInterval = checkpointIntervalMinutes > 0 ? TimeSpan.FromMinutes(checkpointIntervalMinutes) : TimeSpan.MaxValue;
         var sinceLastCheckpoint = System.Diagnostics.Stopwatch.StartNew();
 
-        AnsiConsole.Progress()
-            .Columns(TrainingProgressColumns.Columns)
-            .Start(ctx =>
+        IEnumerable<BatchRequest> TrainingRequests()
+        {
+            while (true)
             {
-                var reporter = TrainingProgressColumns.AddTasks(ctx, epochs * stepsPerEpoch, startEpoch * stepsPerEpoch + resumedStepsInEpoch);
-                try
+                var sampledBatch = tagCentricSampler?.SampleBatch(batchSize);
+                var local = sampledBatch is not null ? sampledBatch.Select(x => x.Image).ToArray() : sampler.SampleBatch(batchSize);
+                yield return new BatchRequest(local.Select(li => trainingIndices[li]).ToArray(), sampledBatch);
+            }
+        }
+
+        // The samplers are only ever touched from the prefetcher's thread from here on.
+        using var prefetcher = readWindow is not null
+            ? new BatchPrefetcher(TrainingRequests(), readWindow, resolvedInputSize, prefetchWindowBatches, 2 * prefetchWindowBatches)
+            : null;
+
+        var dashboard = new TrainingDashboard(new TrainingRunInfo(
+            $"training · {Path.GetFileName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(checkpointDir)))} · {imageTower.StageChannels[^1]}-channel tower · batch {batchSize}×{gradientAccumulationSteps}",
+            epochs, stepsPerEpoch, startEpoch, resumedStepsInEpoch, batchSize, checkpointInterval));
+        // Interactive terminals get the live panel; redirected output (a log file, tests)
+        // gets a one-line summary every few minutes instead of a panel per refresh.
+        var gold = targetOptions.GoldPath is not null ? LocalizationEvaluator.LoadGold(targetOptions.GoldPath) : null;
+        if (gold is not null)
+            AnsiConsole.MarkupLineInterpolated($"Gold set: {gold.Count} images, scored at every epoch evaluation.");
+        var stepsThisProcess = 0;
+        var cropRandom = new Random();
+        long croppedImages = 0;
+        void TrainingLoop()
+        {
+            for (var epoch = startEpoch; epoch < epochs; epoch++)
+            {
+                var stepStart = epoch == startEpoch ? resumedStepsInEpoch : 0;
+                dashboard.EpochStarted(epoch, stepStart);
+                var epochWaitStart = prefetcher?.ConsumerWait ?? TimeSpan.Zero;
+                var epochClock = System.Diagnostics.Stopwatch.StartNew();
+                for (var step = stepStart; step < stepsPerEpoch; step++)
                 {
-                    for (var epoch = startEpoch; epoch < epochs; epoch++)
+                    // Every tensor allocated in a step (pooled/spatial embeddings, the full
+                    // tagTower forward pass over the whole vocabulary, each `loss +=`
+                    // reassignment's intermediate) is native/CUDA memory that .NET's GC does
+                    // not reclaim promptly. Without this scope those accumulate every step
+                    // until VRAM is exhausted; the scope frees them all once `lossValue` has
+                    // been extracted as a plain float below.
+                    using var stepScope = NewDisposeScope();
+
+                    SampledImage[]? sampled;
+                    IReadOnlyList<int> globalBatchIndices;
+                    Tensor rawPixelBatch;
+                    IReadOnlyList<LetterboxBox> boxes;
+                    if (prefetcher is not null)
                     {
-                        var stepStart = epoch == startEpoch ? resumedStepsInEpoch : 0;
-                        for (var step = stepStart; step < stepsPerEpoch; step++)
-                        {
-                            // Every tensor allocated in a step (pooled/spatial embeddings, the full
-                            // tagTower forward pass over the whole vocabulary, each `loss +=`
-                            // reassignment's intermediate) is native/CUDA memory that .NET's GC does
-                            // not reclaim promptly. Without this scope those accumulate every step
-                            // until VRAM is exhausted; the scope frees them all once `lossValue` has
-                            // been extracted as a plain float below.
-                            using var stepScope = NewDisposeScope();
-
-                            var localBatchIndices = sampler.SampleBatch(batchSize);
-                            var globalBatchIndices = localBatchIndices.Select(li => trainingIndices[li]).ToList();
-
-                            var (rawPixelBatch, boxes) = loadBatch(globalBatchIndices);
-                            using var pixelBatch = rawPixelBatch.to(device);
-                            var (_, spatial) = imageTower.forward(pixelBatch);
-                            var spatialMask = SpatialMask.Build(boxes, resolvedInputSize, spatial.shape[2], spatial.shape[3], device);
-                            var pooled = ImageTower.MaskedPool(spatial, spatialMask);
-                            var tagEmbeddings = tagTower.forward(allTagIndices);
-
-                            var batchTagRows = localBatchIndices.Select(li => trainingTagRows[li]).ToList();
-                            using var labels = BatchLabelBuilder.Build(batchTagRows, vocabulary.Records.Count).to(device);
-                            var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels);
-
-                            if (localizationWeight > 0)
-                                loss += localizationWeight * SigmoidContrastiveLoss.ComputeLocalized(spatial, tagEmbeddings, labels, (float)localizationTemperature, spatialMask);
-
-                            if (selfSupervisedWeight > 0)
-                            {
-                                // Two independent crop+flip views of the same already-loaded batch --
-                                // no extra image I/O, just extra forward passes through imageTower.
-                                using var viewA = RandomCropAugmentation.Apply(pixelBatch);
-                                using var viewB = RandomCropAugmentation.Apply(pixelBatch);
-                                var (pooledA, _) = imageTower.forward(viewA);
-                                var (pooledB, _) = imageTower.forward(viewB);
-                                var predictionA = predictionHead.forward(pooledA);
-                                var predictionB = predictionHead.forward(pooledB);
-                                loss += selfSupervisedWeight * SelfSupervisedConsistencyLoss.Compute(pooledA, predictionA, pooledB, predictionB);
-                            }
-
-                            optimizer.zero_grad();
-                            loss.backward();
-                            optimizer.step();
-
-                            var lossValue = loss.item<float>();
-                            if (float.IsNaN(lossValue))
-                            {
-                                AnsiConsole.MarkupLineInterpolated($"[red]epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch}: {NaNGuard.Message}[/]");
-                                result = 1;
-                                return;
-                            }
-
-                            reporter.ReportStepComplete();
-                            // G4 (not F4): a diverging-but-not-yet-NaN loss can be enormous, and
-                            // F4's full decimal expansion of a huge float is long enough to wrap
-                            // the terminal line and corrupt Spectre's live-region redraw. Tracks
-                            // a real fraction of *this epoch* (not the whole run), so a run with
-                            // a huge total step count doesn't sit looking stuck near 0% for the
-                            // entire first epoch -- the Overall row above already covers that.
-                            reporter.ReportPhaseProgress($"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch} loss {lossValue:G4}", step + 1, stepsPerEpoch);
-
-                            // Mid-epoch safety net: an epoch can take multiple days, so waiting
-                            // for the epoch-boundary save below to be the only recovery point
-                            // would mean a crash loses up to a full epoch of work. Same two
-                            // artifacts as the epoch-boundary save, just with CompletedEpochs
-                            // still at the *previous* completed count and CompletedStepsInEpoch
-                            // recording how far into this epoch we got.
-                            if (sinceLastCheckpoint.Elapsed >= checkpointInterval)
-                            {
-                                reporter.ReportPhase($"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch}: saving checkpoint...");
-                                SaveCheckpoint(checkpointDir, imageTower, tagTower, embeddingDim, resolvedInputSize, vocabulary);
-                                TrainingState.Save(
-                                    checkpointDir,
-                                    new TrainingProgress(epoch, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, step + 1, validationSplitSeed),
-                                    optimizer);
-                                sinceLastCheckpoint.Restart();
-                            }
-                        }
-
-                        // Save after every epoch, not just at the end: a long run (especially on
-                        // GPU) can be killed, crash, or lose its SSH session partway through, and
-                        // without this, all completed work would be unrecoverable.
-                        reporter.ReportPhase($"epoch {epoch + 1}/{epochs}: saving checkpoint...");
-                        SaveCheckpoint(checkpointDir, imageTower, tagTower, embeddingDim, resolvedInputSize, vocabulary);
-                        sinceLastCheckpoint.Restart();
-
-                        var stopEarly = false;
-                        if (validationIndices.Count == 0)
-                        {
-                            AnsiConsole.MarkupLine("Not enough images for a validation split — running the full epoch count without early stopping.");
-                        }
-                        else
-                        {
-                            var validationBatchCount = Math.Max(1, (int)Math.Ceiling(validationIndices.Count / (double)batchSize));
-                            var validationLoss = Evaluate(
-                                imageTower, tagTower, loadBatch, imageTagRows, validationIndices, allTagIndices, vocabulary.Records.Count, device, batchSize, resolvedInputSize,
-                                onBatchComplete: batchesDone =>
-                                    reporter.ReportPhaseProgress($"epoch {epoch + 1}/{epochs}: validating batch {batchesDone}/{validationBatchCount}", batchesDone, validationBatchCount));
-                            AnsiConsole.MarkupLineInterpolated($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:G4}");
-
-                            if (earlyStopping.ShouldStop(validationLoss))
-                            {
-                                AnsiConsole.MarkupLineInterpolated($"[yellow]Early stopping: validation loss stopped improving after epoch {epoch + 1}.[/]");
-                                stopEarly = true;
-                            }
-                        }
-
-                        // Saved once per epoch regardless of which branch ran above, so a
-                        // resumed run always picks up this epoch's completed count and
-                        // EarlyStopping's latest history (unchanged if there was no
-                        // validation split to evaluate against).
-                        reporter.ReportPhase($"epoch {epoch + 1}/{epochs}: saving training state...");
-                        TrainingState.Save(checkpointDir, new TrainingProgress(epoch + 1, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, CompletedStepsInEpoch: 0, validationSplitSeed), optimizer);
-
-                        if (stopEarly)
-                            break;
+                        if (!prefetcher.TryTake(out var loaded))
+                            throw new InvalidOperationException("The training batch stream ended unexpectedly.");
+                        sampled = loaded.Request.Sampled;
+                        globalBatchIndices = loaded.Request.Images;
+                        rawPixelBatch = tensor(loaded.Pixels, [loaded.Boxes.Length, 3, resolvedInputSize, resolvedInputSize]);
+                        boxes = loaded.Boxes;
+                    }
+                    else
+                    {
+                        sampled = tagCentricSampler?.SampleBatch(batchSize);
+                        var localBatchIndices = sampled is not null ? sampled.Select(x => x.Image).ToArray() : sampler.SampleBatch(batchSize);
+                        globalBatchIndices = localBatchIndices.Select(li => trainingIndices[li]).ToList();
+                        (rawPixelBatch, boxes) = loadBatch(globalBatchIndices);
                     }
 
-                    reporter.StopPhase();
+                    using var pixelBatch = rawPixelBatch.to(device);
+
+                    // Crop consistency's extra forward runs first, without gradients, keeping only
+                    // the crops' pooled embeddings ([B, D]). Run after the main forward, its
+                    // activations sat on top of the ones held for backward() and ran out of memory.
+                    // Only images carrying a trusted tag are cropped (the rest would train
+                    // nothing), so the pass costs in proportion to how much the teacher is trusted.
+                    CellWindow[]? cropWindows = null;
+                    Tensor? cropPooled = null;
+                    var cropGrid = resolvedInputSize / imageTower.OutputStride;
+                    var cropImages = targetOptions.CropConsistencyWeight > 0 && cropGate.TrustedCount > 0 && localizationWeight > 0 && targetOptions.DeliberateTargets
+                        ? globalBatchIndices.Select((g, b) => (g, b)).Where(x => imageTagRows[x.g].Any(r => (uint)r < (uint)cropGate.Trusted.Length && cropGate.Trusted[r])).Select(x => (long)x.b).ToArray()
+                        : [];
+                    croppedImages += cropImages.Length;
+                    if (cropImages.Length > 0)
+                    {
+                        cropWindows = CropConsistency.SampleWindows(boxes, resolvedInputSize, cropGrid, cropGrid, cropRandom);
+                        using (no_grad())
+                        using (var cropScope = NewDisposeScope())
+                        {
+                            var selected = tensor(cropImages, device: device);
+                            var crops = CropConsistency.CropPixels(pixelBatch.index_select(0, selected), cropImages.Select(b => cropWindows[b]).ToArray(), cropGrid);
+                            var pooledCrops = imageTower.forward(crops).Pooled;
+                            cropPooled = zeros([pixelBatch.shape[0], pooledCrops.shape[1]], device: device)
+                                .index_copy(0, selected, pooledCrops).MoveToOuterDisposeScope();
+                        }
+                    }
+
+                    // Classification pools the full map; the localization losses below use
+                    // the localization map (the same tensor unless LocalizationFromFusedOnly).
+                    var (spatial, localizationMap) = imageTower.ForwardMaps(pixelBatch);
+                    var spatialMask = SpatialMask.Build(boxes, resolvedInputSize, spatial.shape[2], spatial.shape[3], device);
+                    var pooled = ImageTower.MaskedPool(spatial, spatialMask);
+                    var tagEmbeddings = tagTower.forward(allTagIndices);
+
+                    var batchTagRows = globalBatchIndices.Select(g => imageTagRows[g]).ToList();
+                    using var labels = BatchLabelBuilder.Build(batchTagRows, vocabulary.Records.Count).to(device);
+                    using var cpuTargets = targetOptions.DeliberateTargets
+                        ? pairWeightBuilder.Build(batchTagRows, sampled, imageSites is not null ? globalBatchIndices.Select(g => imageSites[g]).ToArray() : null)
+                        : null;
+                    using var targets = cpuTargets?.To(device);
+
+                    // Gradient accumulation: with gradientAccumulationSteps == 1 this is
+                    // exactly the old zero_grad/backward/step-every-micro-batch behavior
+                    // (GradientAccumulatorTests.NoAccumulation_... pins that). With it > 1,
+                    // zero_grad only happens at a cycle's first micro-batch, and step only
+                    // at a cycle's last (or a trailing partial cycle's flush at the epoch's
+                    // final micro-batch) -- TorchSharp's own backward() already accumulates
+                    // into .grad across calls, so the only extra work is not clearing it
+                    // and not stepping on every micro-batch. Must happen before EVERY
+                    // backward() call below, including ComputeLocalizedChunked's internal
+                    // ones, not just the final one.
+                    if (GradientAccumulator.ShouldZeroGrad(step, gradientAccumulationSteps))
+                    {
+                        optimizer.zero_grad();
+                        logitScaleBiasOptimizer.zero_grad();
+                    }
+
+                    // Computed and backpropagated FIRST, via its own internal chunked
+                    // backward(retain_graph: true) calls -- see ComputeLocalizedChunked's own
+                    // doc comment. It must run before the primary/self-supervised loss below:
+                    // retain_graph: true keeps the shared image/tag-tower graph alive for what
+                    // follows, and only the LAST backward() call of the step (the
+                    // primary+self-supervised one below) is allowed to finally release it
+                    // (retain_graph: false, the default).
+                    var localizedLossValue = 0f;
+                    if (localizationWeight > 0 && targets is null)
+                    {
+                        // Folds in --gradient-accumulation-steps' scale here since this
+                        // bypasses the normal "build one loss tensor, divide by
+                        // gradientAccumulationSteps, backward once" path below.
+                        var localizedGradientScale = (float)(localizationWeight / gradientAccumulationSteps);
+                        localizedLossValue = SigmoidContrastiveLoss.ComputeLocalizedChunked(
+                            localizationMap, tagEmbeddings, labels, (float)localizationTemperature,
+                            localizationTagChunkSize, localizedGradientScale, spatialMask, logitScaleBias);
+                    }
+
+                    var loss = targets is not null
+                        ? SigmoidContrastiveLoss.ComputeWeighted(pooled, tagEmbeddings, targets, logitScaleBias, targetOptions.NegativeGamma, targetOptions.NegativeClip)
+                        : SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels, logitScaleBias);
+                    // The whole-image tag term alone, for the dashboard's loss breakdown.
+                    var tagLoss = loss;
+                    Tensor? sparseLocalized = null;
+                    Tensor? cropTerm = null;
+
+                    // Deliberate targets: the per-location loss only on pairs where "where is
+                    // it?" has an answer (LocalizationPairSelector) -- ~100 pairs per image
+                    // instead of the whole vocabulary, so it rides in the same backward pass.
+                    if (localizationWeight > 0 && cpuTargets is not null)
+                    {
+                        float[] wholeImageLogits;
+                        using (no_grad())
+                            wholeImageLogits = pooled.matmul(tagEmbeddings.t()).cpu().data<float>().ToArray();
+                        using var pairs = LocalizationPairSelector.Select(cpuTargets, wholeImageLogits, localizable, targetOptions.LocalizationMinedNegatives);
+                        using var devicePairs = pairs.To(device);
+                        var localized = SigmoidContrastiveLoss.ComputeLocalizedPairs(
+                            localizationMap, tagEmbeddings, devicePairs, (float)localizationTemperature, spatialMask, logitScaleBias,
+                            targetOptions.NegativeGamma, targetOptions.NegativeClip,
+                            targetOptions.LocalizationBackgroundWeight, targetOptions.LocalizationBackgroundFraction);
+                        loss += localizationWeight * localized;
+                        sparseLocalized = localized;
+
+                        // Crop consistency: the classifier, shown a crop without gradients, says
+                        // whether each positive tag is inside that window; the localization map
+                        // pooled over the window learns to agree (ComputeWindowConsistency).
+                        if (cropWindows is not null && cropPooled is not null)
+                        {
+                            Tensor teacher;
+                            using (no_grad())
+                            {
+                                var pairEmbeddings = tagEmbeddings.detach().index_select(0, devicePairs.TagRows.flatten())
+                                    .reshape([devicePairs.TagRows.shape[0], devicePairs.TagRows.shape[1], imageTower.EmbeddingDim]);
+                                teacher = logitScaleBias.forward(pairEmbeddings.bmm(cropPooled.unsqueeze(2)).squeeze(2));
+                            }
+
+                            if (localizationMap.shape[2] != cropGrid)
+                                throw new InvalidOperationException($"Crop windows assume a {cropGrid}-cell map but the localization map has {localizationMap.shape[2]}.");
+                            using var windowMask = CropConsistency.WindowMask(cropWindows, cropGrid, cropGrid, device);
+                            using var pairTrusted = cropTrusted.index_select(0, devicePairs.TagRows.flatten()).reshape(devicePairs.TagRows.shape);
+                            cropTerm = SigmoidContrastiveLoss.ComputeWindowConsistency(
+                                localizationMap, tagEmbeddings, devicePairs, windowMask, teacher, (float)localizationTemperature, logitScaleBias,
+                                pairTrusted, targetOptions.CropTeacherConfidence);
+                            loss += targetOptions.CropConsistencyWeight * cropTerm;
+                        }
+                    }
+
+                    if (selfSupervisedWeight > 0)
+                    {
+                        // Two independent crop+flip views of the same already-loaded batch --
+                        // no extra image I/O, just extra forward passes through imageTower.
+                        using var viewA = RandomCropAugmentation.Apply(pixelBatch);
+                        using var viewB = RandomCropAugmentation.Apply(pixelBatch);
+                        var (pooledA, _) = imageTower.forward(viewA);
+                        var (pooledB, _) = imageTower.forward(viewB);
+                        var predictionA = predictionHead.forward(pooledA);
+                        var predictionB = predictionHead.forward(pooledB);
+                        loss += selfSupervisedWeight * SelfSupervisedConsistencyLoss.Compute(pooledA, predictionA, pooledB, predictionB);
+                    }
+
+                    // The step's final backward() call -- retain_graph defaults to false here,
+                    // finally releasing the graph ComputeLocalizedChunked's calls above kept
+                    // alive. Dividing by gradientAccumulationSteps before backward() keeps the
+                    // accumulated gradient's scale equivalent to one mean-reduced loss over the
+                    // full effective batch (batchSize * gradientAccumulationSteps) instead of
+                    // summing gradientAccumulationSteps independently-normalized micro-batch
+                    // gradients, which would be gradientAccumulationSteps times too large.
+                    (loss / gradientAccumulationSteps).backward();
+
+                    if (GradientAccumulator.ShouldStep(step, gradientAccumulationSteps, stepsPerEpoch))
+                    {
+                        if (targetOptions.CosineSchedule)
+                        {
+                            var rate = LearningRateSchedule.At(
+                                (long)epoch * stepsPerEpoch + step, (long)epochs * stepsPerEpoch, learningRate, targetOptions.WarmupSteps);
+                            foreach (var group in optimizer.ParamGroups)
+                                group.LearningRate = rate;
+                            foreach (var group in logitScaleBiasOptimizer.ParamGroups)
+                                group.LearningRate = rate;
+                        }
+
+                        optimizer.step();
+                        logitScaleBiasOptimizer.step();
+                    }
+
+                    // Unscaled -- reports the real loss magnitude every micro-batch (matching
+                    // pre-accumulation logs) rather than the backward()-only scaled-down value.
+                    // Reconstructs the same combined total the old single summed `loss` tensor
+                    // used to report, now that the localization term is computed (and already
+                    // backpropagated) separately from `loss`.
+                    var lossValue = loss.item<float>() + (float)(localizationWeight * localizedLossValue);
+                    if (float.IsNaN(lossValue))
+                    {
+                        dashboard.Log("[red]" + Markup.Escape($"epoch {epoch + 1}/{epochs} step {step + 1}/{stepsPerEpoch}: {NaNGuard.Message}") + "[/]");
+                        result = 1;
+                        dashboard.Finished("stopped: loss diverged to NaN");
+                        return;
+                    }
+
+                    // How much of each step went to waiting on data vs. everything else
+                    // (GPU compute, target building) -- the number that says whether
+                    // loading or compute is the bottleneck.
+                    var stepsThisEpoch = step + 1 - stepStart;
+                    var waitMs = ((prefetcher?.ConsumerWait ?? TimeSpan.Zero) - epochWaitStart).TotalMilliseconds / stepsThisEpoch;
+                    var stepMs = epochClock.Elapsed.TotalMilliseconds / stepsThisEpoch;
+                    var localizationShown = sparseLocalized is not null
+                        ? (float)(localizationWeight * sparseLocalized.item<float>())
+                        : (float)(localizationWeight * localizedLossValue);
+                    if (cropTerm is not null)
+                        localizationShown += (float)(targetOptions.CropConsistencyWeight * cropTerm.item<float>());
+                    var currentRate = targetOptions.CosineSchedule
+                        ? LearningRateSchedule.At((long)epoch * stepsPerEpoch + step, (long)epochs * stepsPerEpoch, learningRate, targetOptions.WarmupSteps)
+                        : learningRate;
+                    dashboard.StepCompleted(step + 1, lossValue, tagLoss.item<float>(), localizationShown, currentRate, stepMs - waitMs, waitMs);
+                    if (targetOptions.CropConsistencyWeight > 0)
+                        dashboard.CropTeacher(cropGate.TrustedCount, croppedImages / (double)((stepsThisProcess + 1L) * batchSize));
+
+                    // Mid-epoch safety net: an epoch can take multiple days, so waiting
+                    // for the epoch-boundary save below to be the only recovery point
+                    // would mean a crash loses up to a full epoch of work. Same two
+                    // artifacts as the epoch-boundary save, just with CompletedEpochs
+                    // still at the *previous* completed count and CompletedStepsInEpoch
+                    // recording how far into this epoch we got.
+                    stepsThisProcess++;
+                    var reachedMaxSteps = targetOptions.MaxSteps > 0 && stepsThisProcess >= targetOptions.MaxSteps;
+                    if (sinceLastCheckpoint.Elapsed >= checkpointInterval || reachedMaxSteps)
+                    {
+                        dashboard.Phase("saving checkpoint");
+                        SaveCheckpoint(checkpointDir, imageTower, tagTower, logitScaleBias, embeddingDim, resolvedInputSize, vocabulary);
+                        TrainingState.Save(
+                            checkpointDir,
+                            new TrainingProgress(epoch, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, step + 1, validationSplitSeed, stepsPerEpoch, EarlyStoppingMetricName),
+                            optimizer);
+                        TrainingState.SaveLogitScaleBiasOptimizerState(checkpointDir, logitScaleBiasOptimizer);
+                        sinceLastCheckpoint.Restart();
+                        dashboard.CheckpointSaved();
+                    }
+
+                    if (reachedMaxSteps)
+                    {
+                        dashboard.Finished($"stopped after --max-steps {targetOptions.MaxSteps}");
+                        return;
+                    }
                 }
-                finally
+
+                // Save after every epoch, not just at the end: a long run (especially on
+                // GPU) can be killed, crash, or lose its SSH session partway through, and
+                // without this, all completed work would be unrecoverable.
+                dashboard.Phase($"end of epoch {epoch + 1}: saving checkpoint");
+                SaveCheckpoint(checkpointDir, imageTower, tagTower, logitScaleBias, embeddingDim, resolvedInputSize, vocabulary);
+                sinceLastCheckpoint.Restart();
+                dashboard.CheckpointSaved();
+
+                var stopEarly = false;
+                if (validationIndices.Count == 0)
                 {
-                    reporter.Dispose();
+                    dashboard.Log("Not enough images for a validation split — running the full epoch count without early stopping.");
                 }
-            });
+                else
+                {
+                    var heldOut = targetOptions.ValidationMaxImages > 0 && validationIndices.Count > targetOptions.ValidationMaxImages
+                        ? validationIndices.Take(targetOptions.ValidationMaxImages).ToList()
+                        : validationIndices;
+                    var validationBatchCount = Math.Max(1, (int)Math.Ceiling(heldOut.Count / (double)batchSize));
+                    dashboard.EvaluationStarted();
+                    var (validationLoss, heldOutPooled) = Evaluate(
+                        imageTower, tagTower, logitScaleBias, loadBatch, imageTagRows, heldOut, allTagIndices, vocabulary.Records.Count, device, batchSize, resolvedInputSize,
+                        readWindow: readWindow,
+                        onBatchComplete: batchesDone =>
+                            dashboard.PhaseProgress($"end of epoch {epoch + 1}: embedding held-out images (batches)", batchesDone, validationBatchCount));
+
+                    dashboard.Phase($"end of epoch {epoch + 1}: scoring held-out tag rankings and ratings");
+                    var report = EvaluateRankings(
+                        heldOutPooled, heldOut.Select(i => imageTagRows[i]).ToList(), tagTower, allTagIndices, logitScaleBias,
+                        vocabulary, statistics, exclusiveGroups, device, validationSplitSeed,
+                        imageSites is not null ? heldOut.Select(i => imageSites[i]).ToArray() : null);
+                    var ratingReport = ratings is not null && ratingRows is not null
+                        ? EvaluateRatings(heldOutPooled, heldOut.Select(i => ratings[i]).ToList(), tagTower, allTagIndices, logitScaleBias, ratingRows, imageTower.EmbeddingDim)
+                        : null;
+                    WriteEvaluationArtifacts(checkpointDir, report, ratingReport);
+                    ArchiveEpochReports(checkpointDir, epoch + 1);
+                    // Diagnostic only: a failure here is logged, never allowed to stop training.
+                    if (gold is { Count: > 0 } && readWindow is not null)
+                    try
+                    {
+                        dashboard.Phase($"end of epoch {epoch + 1}: scoring gold-set localization and the crop teacher");
+                        float[] tagEmbeddingArray;
+                        using (no_grad())
+                        using (var embeddingsNow = tagTower.forward(allTagIndices))
+                            tagEmbeddingArray = embeddingsNow.cpu().data<float>().ToArray();
+                        var localization = new LocalizationEvaluator(
+                                imageTower, tagEmbeddingArray, imageTower.EmbeddingDim, logitScaleBias.ToLogitScaling(), readWindow, resolvedInputSize, device)
+                            .Evaluate(vocabulary, imageTagRows, heldOut, gold, localizability, seed: validationSplitSeed, labelFreeChecks: false);
+                        EvaluateCommandHandler.WriteLocalizationReport(checkpointDir, localization);
+                        ArchiveEpochReports(checkpointDir, epoch + 1);
+                        foreach (var g in localization.Gold.Where(g => g.Name == "all"))
+                            dashboard.Log(EvaluateCommandHandler.DescribeGold(g));
+                        foreach (var t in (localization.Teacher ?? []).Where(t => t.Name == "all"))
+                            dashboard.Log(EvaluateCommandHandler.DescribeTeacher(t));
+                    }
+                    catch (Exception e)
+                    {
+                        dashboard.Log("[red]" + Markup.Escape($"gold-set scoring failed (training continues): {e.GetType().Name}: {e.Message}") + "[/]");
+                    }
+                    if (targetOptions.CropConsistencyWeight > 0)
+                    {
+                        cropGate = CropTeacherGate.From(report, vocabulary, localizable, targetOptions.CropTeacherMinAveragePrecision, targetOptions.CropTeacherMinPositives);
+                        cropTrusted.Dispose();
+                        cropTrusted = tensor(cropGate.Trusted.Select(t => t ? 1f : 0f).ToArray(), device: device);
+                        dashboard.Log(Markup.Escape($"crop consistency: {cropGate.TrustedCount} tags now trusted as teachers (held-out AP >= {targetOptions.CropTeacherMinAveragePrecision})"));
+                    }
+                    dashboard.EvaluationFinished(epoch, report, ratingReport);
+                    dashboard.Log(Markup.Escape($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:G4}"));
+                    dashboard.Log(DescribeReport(report));
+                    if (ratingReport is not null)
+                        dashboard.Log(DescribeRatings(ratingReport));
+
+                    if (earlyStopping.ShouldStop(report.EarlyStoppingValue))
+                    {
+                        dashboard.Log("[yellow]" + Markup.Escape($"Early stopping: held-out mAP stopped improving after epoch {epoch + 1}.") + "[/]");
+                        stopEarly = true;
+                    }
+                }
+
+                // Saved once per epoch regardless of which branch ran above, so a
+                // resumed run always picks up this epoch's completed count and
+                // EarlyStopping's latest history (unchanged if there was no
+                // validation split to evaluate against).
+                dashboard.Phase($"end of epoch {epoch + 1}: saving training state");
+                TrainingState.Save(checkpointDir, new TrainingProgress(epoch + 1, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, CompletedStepsInEpoch: 0, validationSplitSeed, stepsPerEpoch, EarlyStoppingMetricName), optimizer);
+                TrainingState.SaveLogitScaleBiasOptimizerState(checkpointDir, logitScaleBiasOptimizer);
+
+                if (stopEarly)
+                    break;
+            }
+
+            dashboard.Finished("finished");
+        }
+
+        if (AnsiConsole.Profile.Capabilities.Interactive)
+        {
+            AnsiConsole.Live(dashboard.Render())
+                .AutoClear(false)
+                .Overflow(VerticalOverflow.Ellipsis)
+                .Start(ctx =>
+                {
+                    using (dashboard.Attach(ctx))
+                        TrainingLoop();
+                    ctx.UpdateTarget(dashboard.Render());
+                    ctx.Refresh();
+                });
+
+            // The panel shows only recent events; scrollback gets all of them once it stops.
+            foreach (var line in dashboard.Events)
+                AnsiConsole.MarkupLine(line);
+        }
+        else
+        {
+            using (dashboard.AttachLog(TimeSpan.FromMinutes(5)))
+                TrainingLoop();
+            AnsiConsole.MarkupLine(dashboard.Summary());
+        }
 
         return result;
     }
 
-    private static void SaveCheckpoint(string checkpointDir, ImageTower imageTower, TagTower tagTower, int embeddingDim, int inputSize, TagVocabulary vocabulary)
+    private static void SaveCheckpoint(string checkpointDir, ImageTower imageTower, TagTower tagTower, LogitScaleBias logitScaleBias, int embeddingDim, int inputSize, TagVocabulary vocabulary)
     {
         var embeddings = TagEmbeddingStore.CreateEmpty(embeddingDim);
         foreach (var row in tagTower.ExtractRows())
             embeddings.AppendRow(row);
 
-        var config = ModelConfig.Default(embeddingDim, inputSize);
-        Checkpoint.Save(checkpointDir, imageTower, config, vocabulary, embeddings);
+        var config = ModelConfig.From(imageTower, inputSize);
+        Checkpoint.Save(checkpointDir, imageTower, config, vocabulary, embeddings, logitScaleBias);
     }
 
-    private static double Evaluate(
+    internal const string EarlyStoppingMetricName = "1-mAP";
+
+    internal static EvaluationReport EvaluateRankings(
+        float[] heldOutPooled, IReadOnlyList<IReadOnlyList<int>> heldOutTags, TagTower tagTower, Tensor allTagIndices, LogitScaleBias logitScaleBias,
+        TagVocabulary vocabulary, TagStatistics statistics, ExclusiveTagGroups exclusiveGroups, Device device, int seed,
+        IReadOnlyList<BooruSites>? heldOutSites = null)
+    {
+        float[] tagEmbeddings;
+        using (no_grad())
+        using (var embeddings = tagTower.forward(allTagIndices))
+            tagEmbeddings = embeddings.cpu().data<float>().ToArray();
+
+        return TagRankingEvaluator.Evaluate(
+            heldOutPooled, heldOutTags, tagEmbeddings, (int)(tagEmbeddings.Length / vocabulary.Records.Count), logitScaleBias.ToLogitScaling(),
+            vocabulary, statistics, exclusiveGroups, device, seed: seed, imageSites: heldOutSites);
+    }
+
+    internal const string EvaluationReportFileName = "evaluation_report.json";
+
+
+    /// <summary>Copies this epoch's reports into history/epoch-N/ (the top-level copies are overwritten every epoch).</summary>
+    private static void ArchiveEpochReports(string checkpointDir, int epoch)
+    {
+        var target = Path.Combine(checkpointDir, "history", $"epoch-{epoch}");
+        Directory.CreateDirectory(target);
+        foreach (var name in new[] { EvaluationReportFileName, RatingReportFileName, EvaluateCommandHandler.LocalizationReportFileName, TagThresholds.FileName })
+        {
+            var source = Path.Combine(checkpointDir, name);
+            if (File.Exists(source))
+                File.Copy(source, Path.Combine(target, name), overwrite: true);
+        }
+    }
+
+    /// <summary>Recall each cumulative rating label's cutoff must reach: ≥sensitive, ≥questionable, explicit. Missing questionable/explicit content is the costly error.</summary>
+    internal static readonly double[] RatingTargetRecall = [0.90, 0.97, 0.97];
+
+    internal static RatingReport EvaluateRatings(
+        float[] heldOutPooled, IReadOnlyList<ContentRating> heldOutRatings, TagTower tagTower, Tensor allTagIndices, LogitScaleBias logitScaleBias,
+        int[] ratingRows, int dim)
+    {
+        float[] tagEmbeddings;
+        using (no_grad())
+        using (var embeddings = tagTower.forward(allTagIndices))
+            tagEmbeddings = embeddings.cpu().data<float>().ToArray();
+        return RatingEvaluator.Evaluate(heldOutPooled, dim, heldOutRatings, tagEmbeddings, ratingRows, logitScaleBias.ToLogitScaling(), RatingTargetRecall);
+    }
+
+    internal const string RatingReportFileName = "rating_report.json";
+
+    internal static string DescribeRatings(RatingReport r) =>
+        Markup.Escape(
+            $"ratings ({r.Images} held-out images): accuracy {r.Accuracy:P1} | questionable/explicit called general {r.ExplicitOrQuestionableCalledGeneral:P2} | general called questionable/explicit {r.GeneralCalledExplicitOrQuestionable:P2} | " +
+            $"cutoffs {string.Join(", ", r.Thresholds.Select(t => t.ToString("F3")))} at recall {string.Join(", ", r.Recall.Select(x => x.ToString("P1")))}, precision {string.Join(", ", r.Precision.Select(x => x.ToString("P1")))}");
+
+    /// <summary>Writes the calibrated per-tag thresholds (picked up by export-onnx) and the full per-tag report, worst tags first. Rating labels use their recall-targeted cutoffs instead of best-F1 ones.</summary>
+    internal static void WriteEvaluationArtifacts(string directory, EvaluationReport report, RatingReport? ratingReport = null)
+    {
+        var thresholds = new Dictionary<string, float>(TagRankingEvaluator.ToThresholds(report).ByTag);
+        if (ratingReport is not null)
+        {
+            for (var k = 0; k < ImageRatings.CumulativeTags.Length; k++)
+                thresholds[ImageRatings.CumulativeTags[k]] = ratingReport.Thresholds[k];
+            File.WriteAllText(Path.Combine(directory, RatingReportFileName),
+                System.Text.Json.JsonSerializer.Serialize(ratingReport, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+        }
+
+        new TagThresholds(thresholds).Save(Path.Combine(directory, TagThresholds.FileName));
+        File.WriteAllText(
+            Path.Combine(directory, EvaluationReportFileName),
+            System.Text.Json.JsonSerializer.Serialize(report, new System.Text.Json.JsonSerializerOptions
+            {
+                WriteIndented = true,
+                NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals
+            }));
+    }
+
+    internal static string DescribeReport(EvaluationReport report) =>
+        Markup.Escape(
+            $"held-out: {report.Images} images, {report.EvaluatedTags} tags | mAP {report.MeanAveragePrecision:F4}, hard-negative mAP {report.MeanHardAveragePrecision:F4}, context mAP {report.MeanContextAveragePrecision:F4}, mean best-F1 {report.MeanBestF1:F4}, mean held-out F1 at calibrated thresholds {report.MeanHeldOutF1:F4} | " +
+            $"image-level at calibrated thresholds: precision {report.MicroPrecision:F4}, recall {report.MicroRecall:F4}, F1 {report.MicroF1:F4}, R-precision {report.RPrecision:F4}, exclusive-tag violations {report.ExclusiveViolationRate:P2}");
+
+    internal static (double Loss, float[] Pooled) Evaluate(
         ImageTower imageTower,
         TagTower tagTower,
+        LogitScaleBias logitScaleBias,
         Func<IReadOnlyList<int>, (Tensor Pixels, IReadOnlyList<LetterboxBox> Boxes)> loadBatch,
         IReadOnlyList<IReadOnlyList<int>> imageTagRows,
         IReadOnlyList<int> validationIndices,
@@ -332,14 +844,26 @@ public static class TrainCommandHandler
         Device device,
         int batchSize,
         int inputSize,
-        Action<int>? onBatchComplete = null)
+        Action<int>? onBatchComplete = null,
+        Func<IReadOnlyList<int>, EncodedImage[]>? readWindow = null)
     {
         using var _ = no_grad();
+
+        // Same background, offset-sorted loading as training when the data comes from a
+        // cache. Validation order doesn't matter (embeddings are written back by position),
+        // so a bigger window buys more read locality.
+        using var prefetcher = readWindow is not null
+            ? new BatchPrefetcher(
+                Enumerable.Range(0, (validationIndices.Count + batchSize - 1) / batchSize)
+                    .Select(b => new BatchRequest(validationIndices.Skip(b * batchSize).Take(batchSize).ToArray())),
+                readWindow, inputSize, windowBatches: 16, capacityBatches: 32)
+            : null;
 
         using var tagEmbeddings = tagTower.forward(allTagIndices);
 
         double totalLoss = 0;
         var totalCount = 0;
+        var pooledAll = new float[validationIndices.Count * imageTower.EmbeddingDim];
         var batchesDone = 0;
         for (var offset = 0; offset < validationIndices.Count; offset += batchSize)
         {
@@ -351,7 +875,20 @@ public static class TrainCommandHandler
 
             var chunk = validationIndices.Skip(offset).Take(batchSize).ToList();
 
-            var (rawPixelBatch, boxes) = loadBatch(chunk);
+            Tensor rawPixelBatch;
+            IReadOnlyList<LetterboxBox> boxes;
+            if (prefetcher is not null)
+            {
+                if (!prefetcher.TryTake(out var loaded))
+                    throw new InvalidOperationException("The validation batch stream ended early.");
+                rawPixelBatch = tensor(loaded.Pixels, [loaded.Boxes.Length, 3, inputSize, inputSize]);
+                boxes = loaded.Boxes;
+            }
+            else
+            {
+                (rawPixelBatch, boxes) = loadBatch(chunk);
+            }
+
             using var pixelBatch = rawPixelBatch.to(device);
             var (_, spatial) = imageTower.forward(pixelBatch);
             using var _spatial = spatial;
@@ -360,7 +897,8 @@ public static class TrainCommandHandler
 
             var batchTagRows = chunk.Select(i => imageTagRows[i]).ToList();
             using var labels = BatchLabelBuilder.Build(batchTagRows, vocabularySize).to(device);
-            using var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels);
+            using var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels, logitScaleBias);
+            pooled.cpu().data<float>().ToArray().CopyTo(pooledAll, offset * imageTower.EmbeddingDim);
 
             totalLoss += loss.item<float>() * chunk.Count;
             totalCount += chunk.Count;
@@ -369,10 +907,10 @@ public static class TrainCommandHandler
             onBatchComplete?.Invoke(batchesDone);
         }
 
-        return totalLoss / totalCount;
+        return (totalLoss / totalCount, pooledAll);
     }
 
-    private static (Tensor Pixels, IReadOnlyList<LetterboxBox> Boxes) LoadCacheBatch(PreprocessedDatasetCacheReader cache, IReadOnlyList<int> indices, int inputSize)
+    internal static (Tensor Pixels, IReadOnlyList<LetterboxBox> Boxes) LoadCacheBatch(PreprocessedDatasetCacheReader cache, IReadOnlyList<int> indices, int inputSize)
     {
         var imageSize = 3 * inputSize * inputSize;
         var flat = new float[indices.Count * imageSize];
@@ -393,7 +931,7 @@ public static class TrainCommandHandler
     /// <see cref="Random.Shared"/>) and the seed is persisted in <see cref="TrainingProgress"/>
     /// so a resumed run reconstructs the identical split instead of re-shuffling.
     /// </summary>
-    private static (List<int> Training, List<int> Validation) SplitForValidation(int datasetCount, double validationFraction, int seed)
+    internal static (List<int> Training, List<int> Validation) SplitForValidation(int datasetCount, double validationFraction, int seed)
     {
         var indices = Enumerable.Range(0, datasetCount).ToList();
         var random = new Random(seed);

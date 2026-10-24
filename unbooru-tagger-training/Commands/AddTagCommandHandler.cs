@@ -1,6 +1,7 @@
 using Spectre.Console;
 using UnbooruTagger.Core.Dataset;
 using UnbooruTagger.Core.Encoding;
+using UnbooruTagger.Core.Vocabulary;
 using UnbooruTagger.Training.Checkpoints;
 using UnbooruTagger.Training.Data;
 using UnbooruTagger.Training.Model;
@@ -16,6 +17,17 @@ namespace UnbooruTagger.Training.Commands;
 /// retrain is needed). Uses the same "train a bit, check its work" early stopping as
 /// `train`, but only when there are enough images for a meaningful validation split —
 /// add-tag datasets can be as small as CLAUDE.md's ~10-20 image minimum threshold.
+///
+/// With <c>--cache-dir</c>, the new row also trains against hard negatives drawn from the
+/// existing corpus: images carrying the tags that commonly accompany the new one in its
+/// manifest (the base character for a new costume, the series for a new character) but
+/// not the new tag itself — plus some random corpus images. Without negatives, a manifest
+/// of only positives teaches the row nothing but "always yes", and it fires on everything
+/// that looks remotely similar: adding a tag would cost precision instead of being free.
+///
+/// Since the image encoder is frozen, every image is embedded exactly once up front and
+/// the row trains on those cached embeddings — no per-step forward passes, and no need to
+/// fit the whole image set on the GPU at once.
 /// </summary>
 public static class AddTagCommandHandler
 {
@@ -29,13 +41,24 @@ public static class AddTagCommandHandler
         double learningRate,
         int minImageThreshold,
         int earlyStoppingPatience = 5,
-        ITagTextEmbedder? warmStartEmbedder = null)
+        string? warmStartModelPath = null,
+        string? warmStartVocabPath = null,
+        string? negativesCacheDir = null,
+        int negativesPerPositive = 4)
     {
         var device = DeviceSelector.Best();
-        var (imageTower, config, vocabulary, embeddings) = Checkpoint.Load(checkpointDir, device);
+        var (imageTower, config, vocabulary, embeddings, logitScaleBias) = Checkpoint.Load(checkpointDir, device);
+
+        // Frozen, like the image encoder above: the corpus-wide operating point a single
+        // new tag's handful of images shouldn't be allowed to shift.
+        foreach (var parameter in logitScaleBias.parameters())
+            parameter.requires_grad = false;
 
         if (!vocabulary.TryGet(tag, out var record))
         {
+            // Built here, not passed in, since it needs embeddings.EmbeddingDim -- only
+            // known once the checkpoint above is loaded.
+            using var warmStartEmbedder = TagWarmStartEmbedderFactory.Create(warmStartModelPath, warmStartVocabPath, embeddings.EmbeddingDim);
             var warmStart = warmStartEmbedder?.Embed(tag) ?? EmbeddingInit.RandomRow(embeddings.EmbeddingDim);
             record = vocabulary.AddTag(tag);
             embeddings.AppendRow(warmStart);
@@ -65,43 +88,49 @@ public static class AddTagCommandHandler
         var (trainingIndices, validationIndices) = SplitForValidation(manifest.Entries.Count);
         var useEarlyStopping = validationIndices.Count > 0;
 
-        var (rawTrainingPixelBatch, trainingBoxes) = ImageBatchLoader.Load(trainingIndices.Select(i => imagePaths[i]).ToList(), config.InputSize);
-        using var trainingPixelBatch = rawTrainingPixelBatch.to(device);
-        using var trainingLabels = BatchLabelBuilder.Build(trainingIndices.Select(i => imageTagRows[i]).ToList(), vocabulary.Records.Count).to(device);
+        var trainingPooled = EmbedPooled(imageTower, ids => ImageBatchLoader.Load(ids.Select(i => imagePaths[i]).ToList(), config.InputSize), trainingIndices, config.InputSize, device);
+        var trainingTagRows = trainingIndices.Select(i => (IReadOnlyList<int>)imageTagRows[i]).ToList();
+        Tensor? validationPooled = useEarlyStopping
+            ? EmbedPooled(imageTower, ids => ImageBatchLoader.Load(ids.Select(i => imagePaths[i]).ToList(), config.InputSize), validationIndices, config.InputSize, device)
+            : null;
+        var validationTagRows = validationIndices.Select(i => (IReadOnlyList<int>)imageTagRows[i]).ToList();
 
-        Tensor? validationPixelBatch = null;
-        Tensor? validationLabels = null;
-        IReadOnlyList<LetterboxBox>? validationBoxes = null;
-        if (useEarlyStopping)
+        if (!useEarlyStopping)
+            AnsiConsole.MarkupLineInterpolated($"Only {manifest.Entries.Count} images — too few for a validation split, running the full {steps}-step count without early stopping.");
+
+        if (negativesCacheDir is not null)
         {
-            (var rawValidationPixelBatch, validationBoxes) = ImageBatchLoader.Load(validationIndices.Select(i => imagePaths[i]).ToList(), config.InputSize);
-            validationPixelBatch = rawValidationPixelBatch.to(device);
-            validationLabels = BatchLabelBuilder.Build(validationIndices.Select(i => imageTagRows[i]).ToList(), vocabulary.Records.Count).to(device);
+            using var cacheReader = new PreprocessedDatasetCacheReader(negativesCacheDir);
+            var cacheVocabularyCount = TagVocabulary.Load(Path.Combine(negativesCacheDir, "tag_vocabulary.json")).Records.Count;
+            if (cacheVocabularyCount > vocabulary.Records.Count)
+                throw new InvalidOperationException(
+                    $"--cache-dir has {cacheVocabularyCount} tags but the checkpoint only {vocabulary.Records.Count} -- it isn't the corpus this checkpoint was trained on.");
+
+            var negatives = SelectNegatives(
+                cacheReader.ImageTagRows, imageTagRows, record.RowIndex, negativesPerPositive * manifest.Entries.Count, vocabulary);
+            var validationNegativeCount = useEarlyStopping ? negatives.Count * validationIndices.Count / manifest.Entries.Count : 0;
+            var validationNegatives = negatives.Take(validationNegativeCount).ToList();
+            var trainingNegatives = negatives.Skip(validationNegativeCount).ToList();
+
+            AnsiConsole.MarkupLineInterpolated($"Embedding {negatives.Count} corpus negatives for '{tag}'...");
+            Func<IReadOnlyList<int>, (Tensor, IReadOnlyList<LetterboxBox>)> loadNegatives =
+                ids => TrainCommandHandler.LoadCacheBatch(cacheReader, ids, cacheReader.InputSize);
+
+            trainingPooled = cat([trainingPooled, EmbedPooled(imageTower, loadNegatives, trainingNegatives, config.InputSize, device)], 0);
+            trainingTagRows.AddRange(trainingNegatives.Select(i => cacheReader.ImageTagRows[i]));
+            if (validationPooled is not null && validationNegatives.Count > 0)
+            {
+                validationPooled = cat([validationPooled, EmbedPooled(imageTower, loadNegatives, validationNegatives, config.InputSize, device)], 0);
+                validationTagRows.AddRange(validationNegatives.Select(i => cacheReader.ImageTagRows[i]));
+            }
         }
         else
         {
-            AnsiConsole.MarkupLineInterpolated($"Only {manifest.Entries.Count} images — too few for a validation split, running the full {steps}-step count without early stopping.");
+            AnsiConsole.MarkupLine("[yellow]No --cache-dir: the new tag only sees the manifest's own images as negatives. If they all carry the tag, it learns no negatives at all and will over-fire.[/]");
         }
 
-        // The image encoder is frozen for the whole run and these batches never change,
-        // so the mask (which locations are real content vs. letterbox padding) is the
-        // same every step -- computed once here from a throwaway forward pass instead of
-        // rebuilt every step.
-        Tensor trainingMask;
-        Tensor? validationMask = null;
-        using (no_grad())
-        {
-            var (_, warmupSpatial) = imageTower.forward(trainingPixelBatch);
-            using var _warmupSpatial = warmupSpatial;
-            trainingMask = SpatialMask.Build(trainingBoxes, config.InputSize, warmupSpatial.shape[2], warmupSpatial.shape[3], device);
-
-            if (useEarlyStopping)
-            {
-                var (_, warmupValidationSpatial) = imageTower.forward(validationPixelBatch!);
-                using var _warmupValidationSpatial = warmupValidationSpatial;
-                validationMask = SpatialMask.Build(validationBoxes!, config.InputSize, warmupValidationSpatial.shape[2], warmupValidationSpatial.shape[3], device);
-            }
-        }
+        using var trainingLabels = BatchLabelBuilder.Build(trainingTagRows, vocabulary.Records.Count).to(device);
+        using var validationLabels = useEarlyStopping ? BatchLabelBuilder.Build(validationTagRows, vocabulary.Records.Count).to(device) : null;
 
         var earlyStopping = new EarlyStopping(earlyStoppingPatience);
 
@@ -113,7 +142,7 @@ public static class AddTagCommandHandler
             var updatedRows = tagTower.ExtractRows();
             for (var i = 0; i < updatedRows.Length; i++)
                 embeddings.SetRow(i, updatedRows[i]);
-            Checkpoint.Save(checkpointDir, imageTower, config, vocabulary, embeddings);
+            Checkpoint.Save(checkpointDir, imageTower, config, vocabulary, embeddings, logitScaleBias);
         }
 
         var result = 0;
@@ -134,10 +163,8 @@ public static class AddTagCommandHandler
                     // training) runs out of memory.
                     using var stepScope = NewDisposeScope();
 
-                    var (_, spatial) = imageTower.forward(trainingPixelBatch);
-                    var pooled = ImageTower.MaskedPool(spatial, trainingMask);
                     var tagEmbeddings = tagTower.forward(allTagIndices);
-                    var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, trainingLabels);
+                    var loss = SigmoidContrastiveLoss.Compute(trainingPooled, tagEmbeddings, trainingLabels, logitScaleBias);
 
                     optimizer.zero_grad();
                     loss.backward();
@@ -164,10 +191,8 @@ public static class AddTagCommandHandler
                         continue;
 
                     using var _ = no_grad();
-                    var (_, valSpatial) = imageTower.forward(validationPixelBatch!);
-                    var valPooled = ImageTower.MaskedPool(valSpatial, validationMask!);
                     var valTagEmbeddings = tagTower.forward(allTagIndices);
-                    var validationLoss = SigmoidContrastiveLoss.Compute(valPooled, valTagEmbeddings, validationLabels!).item<float>();
+                    var validationLoss = SigmoidContrastiveLoss.Compute(validationPooled!, valTagEmbeddings, validationLabels!, logitScaleBias).item<float>();
 
                     if (earlyStopping.ShouldStop(validationLoss))
                     {
@@ -177,8 +202,8 @@ public static class AddTagCommandHandler
                 }
             });
 
-        validationPixelBatch?.Dispose();
-        validationLabels?.Dispose();
+        trainingPooled.Dispose();
+        validationPooled?.Dispose();
 
         if (result != 0)
             return result;
@@ -187,6 +212,70 @@ public static class AddTagCommandHandler
         SaveProgress();
 
         return 0;
+    }
+
+    /// <summary>Pooled embeddings of <paramref name="ids"/> through the frozen tower, a few images at a time, with no autograd graph.</summary>
+    private static Tensor EmbedPooled(
+        ImageTower imageTower, Func<IReadOnlyList<int>, (Tensor Pixels, IReadOnlyList<LetterboxBox> Boxes)> load,
+        IReadOnlyList<int> ids, int inputSize, Device device, int chunkSize = 16)
+    {
+        using var _ = no_grad();
+        var parts = new List<Tensor>();
+        for (var start = 0; start < ids.Count; start += chunkSize)
+        {
+            using var scope = NewDisposeScope();
+            var (pixels, boxes) = load(ids.Skip(start).Take(chunkSize).ToList());
+            var (_, spatial) = imageTower.forward(pixels.to(device));
+            var mask = SpatialMask.Build(boxes, inputSize, spatial.shape[2], spatial.shape[3], device);
+            parts.Add(ImageTower.MaskedPool(spatial, mask).MoveToOuterDisposeScope());
+        }
+
+        if (parts.Count == 0)
+            return zeros([0, imageTower.EmbeddingDim], device: device);
+        var result = cat(parts, 0);
+        foreach (var part in parts)
+            part.Dispose();
+        return result;
+    }
+
+    /// <summary>
+    /// Corpus images to train the new tag against: half hard negatives (images carrying a
+    /// tag that appears on at least 30% of the manifest's images — the base character,
+    /// the series — up to the 8 strongest such tags), half random corpus images. The new
+    /// tag is brand new to the corpus, so no corpus image carries it; the risk is a corpus
+    /// image that SHOULD have carried it, which is why hard negatives are capped at half.
+    /// </summary>
+    private static List<int> SelectNegatives(
+        IReadOnlyList<IReadOnlyList<int>> corpusTagRows, IReadOnlyList<List<int>> manifestTagRows, int newTagRow, int count,
+        TagVocabulary vocabulary)
+    {
+        var random = new Random(newTagRow);
+        var sources = manifestTagRows
+            .SelectMany(rows => rows.Where(r => r != newTagRow).Distinct())
+            .GroupBy(r => r)
+            .Where(g => g.Count() >= 0.3 * manifestTagRows.Count)
+            .OrderByDescending(g => g.Count())
+            .Take(8)
+            .Select(g => g.Key)
+            .ToHashSet();
+
+        if (sources.Count > 0)
+            AnsiConsole.MarkupLineInterpolated($"Hard-negative sources: {string.Join(", ", sources.Select(r => vocabulary.GetByRowIndex(r).Tag))}");
+
+        var hardCandidates = new List<int>();
+        if (sources.Count > 0)
+            for (var i = 0; i < corpusTagRows.Count; i++)
+                if (corpusTagRows[i].Any(sources.Contains))
+                    hardCandidates.Add(i);
+
+        var chosen = new HashSet<int>();
+        var hardTarget = Math.Min(count / 2, hardCandidates.Count);
+        while (chosen.Count < hardTarget)
+            chosen.Add(hardCandidates[random.Next(hardCandidates.Count)]);
+        for (var attempt = 0; chosen.Count < count && attempt < count * 4; attempt++)
+            chosen.Add(random.Next(corpusTagRows.Count));
+
+        return chosen.OrderBy(_ => random.Next()).ToList();
     }
 
     /// <summary>Below <see cref="MinImagesForValidationSplit"/>, every image goes to training and no split is made — too little data for a meaningful held-out signal.</summary>

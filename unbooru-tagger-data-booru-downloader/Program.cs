@@ -1114,6 +1114,161 @@ recoverCorruptedImagesCommand.SetAction(async (parseResult, cancellationToken) =
     return 0;
 });
 
+var exportRatingsCommand = new Command(
+    "export-ratings",
+    "Write ratings.bin beside images.bin: one content rating per cache row (the strictest across that image's sources -- an explicit image must never be learned as safe), read from crawl.sqlite. Training turns it into cumulative rating labels. Re-run after anything that changes the cache's rows (crawl, prune, recover).");
+exportRatingsCommand.Options.Add(outputDirOption);
+exportRatingsCommand.SetAction(async (parseResult, cancellationToken) =>
+{
+    var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
+
+    int imageCount;
+    await using (var pixelStream = File.OpenRead(Path.Combine(outputDirectory, "images.bin")))
+    {
+        using var reader = new BinaryReader(pixelStream);
+        reader.ReadInt32(); // format magic
+        imageCount = reader.ReadInt32();
+    }
+
+    using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
+    Console.WriteLine("Reading ratings from crawl.sqlite...");
+    var byRow = await db.GetRatingsByCacheRowAsync(cancellationToken);
+
+    var ratings = new ContentRating[imageCount];
+    for (var row = 0; row < imageCount; row++)
+        ratings[row] = byRow.TryGetValue(row, out var sources)
+            ? ImageRatings.Strictest(sources.Select(ImageRatings.Parse))
+            : ContentRating.Unknown;
+    ImageRatings.Save(outputDirectory, ratings);
+
+    var table = new Table().Border(TableBorder.Rounded).AddColumns("Rating", "Images");
+    foreach (var group in ratings.GroupBy(r => r).OrderBy(g => g.Key))
+        table.AddRow(group.Key.ToString(), group.Count().ToString("N0"));
+    AnsiConsole.Write(table);
+    return 0;
+});
+
+var exportImplicationsCommand = new Command(
+    "export-implications",
+    "Write tag_implications.json beside images.bin: Danbooru's active tag implications (witch_hat -> hat), raw tag names. Training fills in the implied tags (Gelbooru doesn't apply implications, so its posts can lack them).");
+exportImplicationsCommand.Options.Add(outputDirOption);
+exportImplicationsCommand.SetAction(async (parseResult, cancellationToken) =>
+{
+    var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
+    var client = new DanbooruClient(httpClient, new FixedIntervalRateLimiter(1.0));
+    var implications = new List<BooruTagImplication>();
+    await foreach (var implication in client.ListActiveTagImplicationsAsync(cancellationToken))
+    {
+        implications.Add(implication);
+        if (implications.Count % 5000 == 0)
+            Console.WriteLine($"{implications.Count:N0} implications...");
+    }
+
+    var path = Path.Combine(outputDirectory, "tag_implications.json");
+    File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(implications, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    Console.WriteLine($"Wrote {implications.Count:N0} active Danbooru implications to '{path}'.");
+    return 0;
+});
+
+var exportTagAgreementCommand = new Command(
+    "export-tag-agreement",
+    "Write tag_agreement.json beside images.bin: for images that exist on both Danbooru and Gelbooru, how often each tag is listed by both sites vs. only one -- a per-tag measure of how often an absent tag is just a missing label. Read-only scan of crawl.sqlite.");
+exportTagAgreementCommand.Options.Add(outputDirOption);
+exportTagAgreementCommand.SetAction(async (parseResult, cancellationToken) =>
+{
+    var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
+    using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
+
+    // tag -> [listed by both, Danbooru only, Gelbooru only], over images on both sites. One
+    // sequential pass: each image's first-seen source waits in memory (tags as interned ids)
+    // until its other site's row shows up.
+    var tagIds = new Dictionary<string, int>(StringComparer.Ordinal);
+    var tagNames = new List<string>();
+    var counts = new List<int[]>();
+    int Id(string tag)
+    {
+        if (!tagIds.TryGetValue(tag, out var id))
+        {
+            tagIds[tag] = id = tagNames.Count;
+            tagNames.Add(tag);
+            counts.Add(new int[3]);
+        }
+        return id;
+    }
+
+    var pending = new Dictionary<UInt128, (bool Danbooru, int[] Tags)>();
+    long rows = 0, overlapping = 0;
+    await db.ScanSourcesAsync((md5, site, tags) =>
+    {
+        if (++rows % 1_000_000 == 0)
+            Console.WriteLine($"{rows:N0} source rows, {overlapping:N0} images on both sites so far...");
+        if (tags is null || (site != "danbooru" && site != "gelbooru"))
+            return;
+        var key = System.Buffers.Binary.BinaryPrimitives.ReadUInt128BigEndian(Convert.FromHexString(md5));
+        var ids = tags.Select(Id).Distinct().ToArray();
+        var isDanbooru = site == "danbooru";
+        if (!pending.Remove(key, out var other) || other.Danbooru == isDanbooru)
+        {
+            pending[key] = (isDanbooru, ids);
+            return;
+        }
+
+        overlapping++;
+        var d = (isDanbooru ? ids : other.Tags).ToHashSet();
+        var g = (isDanbooru ? other.Tags : ids).ToHashSet();
+        foreach (var tag in d.Union(g))
+            counts[tag][d.Contains(tag) ? g.Contains(tag) ? 0 : 1 : 2]++;
+    }, cancellationToken);
+    var images = pending.Count + overlapping;
+    var tagCounts = Enumerable.Range(0, tagNames.Count).Where(i => counts[i].Sum() > 0).ToDictionary(i => tagNames[i], i => counts[i]);
+
+    var path = Path.Combine(outputDirectory, "tag_agreement.json");
+    File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(new
+    {
+        Description = "Per tag, over images present on both Danbooru and Gelbooru: [listed by both, Danbooru only, Gelbooru only].",
+        Images = images,
+        OverlappingImages = overlapping,
+        Tags = tagCounts.OrderByDescending(kv => kv.Value.Sum()).ToDictionary(kv => kv.Key, kv => kv.Value)
+    }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    Console.WriteLine($"{images:N0} images, {overlapping:N0} on both sites; wrote '{path}'.");
+    return 0;
+});
+
+var exportImageSitesCommand = new Command(
+    "export-image-sites",
+    "Write image_sites.bin beside images.bin: which sites (Danbooru, Gelbooru) each cache row came from. Training uses it so a tag that only one site's tag system has isn't learned as absent from images that came only from the other site. Re-run after anything that changes the cache's rows.");
+exportImageSitesCommand.Options.Add(outputDirOption);
+exportImageSitesCommand.SetAction(async (parseResult, cancellationToken) =>
+{
+    var outputDirectory = parseResult.GetRequiredValue(outputDirOption);
+    int imageCount;
+    await using (var pixelStream = File.OpenRead(Path.Combine(outputDirectory, "images.bin")))
+    {
+        using var reader = new BinaryReader(pixelStream);
+        reader.ReadInt32(); // format magic
+        imageCount = reader.ReadInt32();
+    }
+
+    using var db = await CrawlDatabase.OpenOrCreateAsync(outputDirectory, cancellationToken);
+    // Two sequential scans joined in memory -- a SQL join walks the Md5 index with random reads.
+    var rowByMd5 = new Dictionary<UInt128, int>();
+    await db.ScanImagesAsync((md5, row) =>
+        rowByMd5[System.Buffers.Binary.BinaryPrimitives.ReadUInt128BigEndian(Convert.FromHexString(md5))] = row, cancellationToken);
+    var sites = new BooruSites[imageCount];
+    await db.ScanSourceSitesAsync((md5, site) =>
+    {
+        if (rowByMd5.TryGetValue(System.Buffers.Binary.BinaryPrimitives.ReadUInt128BigEndian(Convert.FromHexString(md5)), out var row) && (uint)row < (uint)imageCount)
+            sites[row] |= ImageSites.Parse(site);
+    }, cancellationToken);
+    ImageSites.Save(outputDirectory, sites);
+
+    var table = new Table().Border(TableBorder.Rounded).AddColumns("Sites", "Images");
+    foreach (var group in sites.GroupBy(s => s).OrderBy(g => g.Key))
+        table.AddRow(group.Key.ToString(), group.Count().ToString("N0"));
+    AnsiConsole.Write(table);
+    return 0;
+});
+
 var rootCommand = new RootCommand("unbooru-tagger booru crawler (downloads Danbooru/Gelbooru images+tags directly into a trainable dataset directory)")
 {
     surveyCommand,
@@ -1124,7 +1279,11 @@ var rootCommand = new RootCommand("unbooru-tagger booru crawler (downloads Danbo
     detectDeprecatedRedirectsCommand,
     rebuildVocabularyCommand,
     pruneUnsupportedMediaCommand,
-    recoverCorruptedImagesCommand
+    recoverCorruptedImagesCommand,
+    exportRatingsCommand,
+    exportImplicationsCommand,
+    exportTagAgreementCommand,
+    exportImageSitesCommand
 };
 
 return await rootCommand.Parse(args).InvokeAsync();

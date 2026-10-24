@@ -18,7 +18,7 @@ public static class HeatmapCommandHandler
         }
 
         var encoding = model.ImageEncoder.Encode(imagePath);
-        var heatmap = TagScorer.Heatmap(model.Embeddings.GetRow(record.RowIndex), encoding.SpatialFeatures);
+        var heatmap = TagScorer.Heatmap(model.Embeddings.GetRow(record.RowIndex), encoding.SpatialFeatures, model.LogitScaling);
 
         using var original = SKBitmap.Decode(imagePath)
             ?? throw new InvalidDataException($"Could not decode image at '{imagePath}'.");

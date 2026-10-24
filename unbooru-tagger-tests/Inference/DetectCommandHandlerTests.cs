@@ -27,20 +27,23 @@ public class DetectCommandHandlerTests
             ImageTowerOnnxExporter.Export(tower, Path.Combine(modelDir, ModelBundle.ImageEncoderFileName), inputSize);
 
             var vocabulary = TagVocabulary.CreateEmpty();
-            vocabulary.AddTag("solo");
-            vocabulary.AddTag("1girl");
+            vocabulary.AddTag("hat");
+            vocabulary.AddTag("necktie");
+            vocabulary.AddTag("white_background"); // whole-image tag: reported, never boxed
             vocabulary.Save(Path.Combine(modelDir, ModelBundle.VocabularyFileName));
 
             var embeddings = TagEmbeddingStore.CreateEmpty(embeddingDim);
             embeddings.AppendRow(new float[embeddingDim]);
             embeddings.AppendRow(new float[embeddingDim]);
+            embeddings.AppendRow(new float[embeddingDim]);
             embeddings.Save(Path.Combine(modelDir, ModelBundle.EmbeddingsFileName));
 
             using var model = ModelBundle.Load(modelDir, inputSize);
-            var detections = DetectCommandHandler.Detect(model, imagePath, threshold: -10f, boxThreshold: -10f, boxPercentile: 0f);
+            var detections = DetectCommandHandler.Detect(model, imagePath, threshold: -10f, boxThreshold: -10f, boxPercentile: 0f, minHeatmapRange: 0f);
 
-            Assert.Equal(2, detections.Count);
-            foreach (var detection in detections)
+            Assert.Equal(3, detections.Count);
+            Assert.Empty(detections.Single(d => d.Tag == "white_background").Boxes);
+            foreach (var detection in detections.Where(d => d.Tag != "white_background"))
             {
                 Assert.NotEmpty(detection.Boxes);
                 foreach (var box in detection.Boxes)
@@ -83,7 +86,7 @@ public class DetectCommandHandlerTests
             embeddings.AppendRow(new float[embeddingDim]);
             embeddings.Save(Path.Combine(modelDir, ModelBundle.EmbeddingsFileName));
 
-            var exitCode = DetectCommandHandler.Run(modelDir, imagePath, threshold: -10f, boxThreshold: -10f, boxPercentile: 0f, outputPath);
+            var exitCode = DetectCommandHandler.Run(modelDir, imagePath, threshold: -10f, boxThreshold: -10f, boxPercentile: 0f, minHeatmapRange: 0f, minBoxFraction: 0f, maxBoxesPerTag: 0, outputPath);
 
             Assert.Equal(0, exitCode);
             Assert.True(File.Exists(outputPath));

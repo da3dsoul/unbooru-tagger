@@ -70,4 +70,32 @@ public class TagScorerTests
 
         Assert.Empty(boxes);
     }
+
+    [Fact]
+    public void DetectBoxes_NearFlatHeatmapProducesNoBoxesRegardlessOfThresholdOrPercentile()
+    {
+        // Every cell clears both the absolute floor and the percentile cut, but the
+        // heatmap's own max-min spread (0.02) is too small to carry real spatial signal —
+        // an under-discriminated tag scores near-uniformly, not because it genuinely
+        // applies everywhere.
+        var heatmap = new float[,] { { 0.51f, 0.50f }, { 0.52f, 0.49f } };
+
+        var boxes = TagScorer.DetectBoxes(
+            heatmap, threshold: -10f, relativePercentile: 0f, new LetterboxBox(0, 0, 2, 2),
+            canvasSize: 2, imageWidth: 2, imageHeight: 2, minRange: 0.05f);
+
+        Assert.Empty(boxes);
+    }
+
+    [Fact]
+    public void DetectBoxes_HeatmapRangeAboveMinRangeIsUnaffectedByTheGate()
+    {
+        var heatmap = new float[,] { { 1.0f, 0.8f }, { 0.2f, 0.1f } };
+
+        var boxes = TagScorer.DetectBoxes(
+            heatmap, threshold: -10f, relativePercentile: 0f, new LetterboxBox(0, 0, 2, 2),
+            canvasSize: 2, imageWidth: 2, imageHeight: 2, minRange: 0.05f);
+
+        Assert.NotEmpty(boxes);
+    }
 }

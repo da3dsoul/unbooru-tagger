@@ -8,7 +8,7 @@ public static class TagBatchCommandHandler
 {
     private static readonly string[] SupportedExtensions = [".png", ".jpg", ".jpeg", ".webp", ".bmp"];
 
-    public static int Run(string modelDir, string directory, float threshold)
+    public static int Run(string modelDir, string directory, float? threshold)
     {
         using var model = ModelBundle.Load(modelDir);
 

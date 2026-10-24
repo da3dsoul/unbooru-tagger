@@ -1,3 +1,4 @@
+using Microsoft.Win32.SafeHandles;
 using UnbooruTagger.Core.Encoding;
 
 namespace UnbooruTagger.Core.Dataset;
@@ -449,6 +450,8 @@ public sealed class PreprocessedDatasetCacheWriter : IDisposable
 public sealed class PreprocessedDatasetCacheReader : IDisposable
 {
     private readonly FileStream _pixelStream;
+    private readonly SafeFileHandle _randomAccessHandle;
+    private readonly long _pixelFileLength;
     private readonly long[] _offsets;
     private readonly TagRowStore _tagRowStore;
 
@@ -476,6 +479,13 @@ public sealed class PreprocessedDatasetCacheReader : IDisposable
         // doc comment for why this is cached on disk rather than rebuilt from the box
         // headers on every open.
         _offsets = PreprocessedImageIndex.LoadOrBuildOffsets(directory, _pixelStream, ImageCount);
+
+        // A second, positional-read-only handle for ReadEncoded: RandomAccess.Read carries
+        // its own offset, so any number of threads can read through it at once, unlike
+        // _pixelStream's shared Position.
+        _randomAccessHandle = File.OpenHandle(
+            Path.Combine(directory, PreprocessedDatasetCache.PixelsFileName), FileMode.Open, FileAccess.Read, FileShare.ReadWrite, FileOptions.RandomAccess);
+        _pixelFileLength = RandomAccess.GetLength(_randomAccessHandle);
 
         // Migrates an existing tag_rows.jsonl automatically on first open, same as the
         // writer — training can open a cache directly that no writer in this process
@@ -509,9 +519,73 @@ public sealed class PreprocessedDatasetCacheReader : IDisposable
         return ImagePreprocessing.Reconstruct(new EncodedImage(pixelBytes, content), InputSize);
     }
 
+    /// <summary>
+    /// Reads many records at once the way the storage is fastest at: deduplicated, sorted
+    /// by file offset, with up to <paramref name="maxParallelism"/> positional reads in
+    /// flight. On the 6-disk RAID5 this cache lives on, one-at-a-time random reads managed
+    /// ~85 images/s while 32-64 concurrent, offset-sorted reads reached ~700-940 images/s:
+    /// a striped array only delivers its throughput when every spindle has work queued.
+    /// Returns raw (still uint8, content-only) records in <paramref name="indices"/>' order —
+    /// decoding to floats is left to the caller so it can go straight into a batch buffer
+    /// (<see cref="ImagePreprocessing.ReconstructInto"/>). Thread-safe.
+    /// </summary>
+    public EncodedImage[] ReadEncoded(IReadOnlyList<int> indices, int maxParallelism = 32)
+    {
+        var unique = indices.Distinct().OrderBy(i => _offsets[i]).ToArray();
+        var records = new Dictionary<int, EncodedImage>(unique.Length);
+        var gate = new object();
+
+        Parallel.ForEach(
+            System.Collections.Concurrent.Partitioner.Create(unique, loadBalance: true),
+            new ParallelOptions { MaxDegreeOfParallelism = maxParallelism },
+            index =>
+            {
+                var encoded = ReadRecord(index);
+                lock (gate)
+                    records[index] = encoded;
+            });
+
+        var result = new EncodedImage[indices.Count];
+        for (var i = 0; i < indices.Count; i++)
+            result[i] = records[indices[i]];
+        return result;
+    }
+
+    private EncodedImage ReadRecord(int index)
+    {
+        var offset = _offsets[index];
+        var end = index + 1 < _offsets.Length ? _offsets[index + 1] : _pixelFileLength;
+        var buffer = new byte[end - offset];
+        var read = 0;
+        while (read < buffer.Length)
+        {
+            var n = RandomAccess.Read(_randomAccessHandle, buffer.AsSpan(read), offset + read);
+            if (n == 0)
+                throw new EndOfStreamException($"Image {index}: expected {buffer.Length} bytes at offset {offset}, got {read}.");
+            read += n;
+        }
+
+        var box = buffer.AsSpan(0, PreprocessedDatasetCache.BoxBytes);
+        var content = new LetterboxBox(
+            BitConverter.ToInt32(box[..4]),
+            BitConverter.ToInt32(box[4..8]),
+            BitConverter.ToInt32(box[8..12]),
+            BitConverter.ToInt32(box[12..16]));
+
+        var pixelLength = PreprocessedDatasetCache.ContentByteLength(content.Width, content.Height);
+        if (PreprocessedDatasetCache.BoxBytes + pixelLength > buffer.Length)
+            throw new InvalidDataException($"Image {index}: box {content.Width}x{content.Height} needs {pixelLength} pixel bytes but the record is only {buffer.Length} bytes.");
+
+        // Records are contiguous, so the span to the next offset is exactly this record —
+        // except the last one, which may run to a partially-written tail; slice to the
+        // box-derived length either way.
+        return new EncodedImage(buffer.AsSpan(PreprocessedDatasetCache.BoxBytes, (int)pixelLength).ToArray(), content);
+    }
+
     public void Dispose()
     {
         _pixelStream.Dispose();
+        _randomAccessHandle.Dispose();
         _tagRowStore.Dispose();
     }
 }

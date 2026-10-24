@@ -8,21 +8,22 @@ namespace UnbooruTagger.Core.Scoring;
 /// </summary>
 public static class TagScorer
 {
-    /// <summary>Confidence that <paramref name="tagEmbedding"/> applies to the whole image.</summary>
-    public static float Score(ReadOnlySpan<float> imageEmbedding, ReadOnlySpan<float> tagEmbedding) =>
-        Sigmoid(Dot(imageEmbedding, tagEmbedding));
+    /// <summary>Confidence that <paramref name="tagEmbedding"/> applies to the whole image. <paramref name="scaling"/> defaults to <see cref="LogitScaling.Identity"/> (plain <c>sigmoid(dot)</c>) for a model bundle exported before <see cref="LogitScaling"/> existed.</summary>
+    public static float Score(ReadOnlySpan<float> imageEmbedding, ReadOnlySpan<float> tagEmbedding, LogitScaling? scaling = null) =>
+        Sigmoid((scaling ?? LogitScaling.Identity).Apply(Dot(imageEmbedding, tagEmbedding)));
 
     /// <summary>
-    /// A rough localization heatmap for one tag: sigmoid(dot(tag, spatial location)) at
+    /// A rough localization heatmap for one tag: sigmoid(scale * dot(tag, spatial location) + bias) at
     /// every position in the pre-pool feature map. No CAM/Grad-CAM step needed — this
     /// falls directly out of the dual-encoder design (MaskCLIP-style).
     /// </summary>
-    public static float[,] Heatmap(ReadOnlySpan<float> tagEmbedding, SpatialFeatureMap spatialFeatures)
+    public static float[,] Heatmap(ReadOnlySpan<float> tagEmbedding, SpatialFeatureMap spatialFeatures, LogitScaling? scaling = null)
     {
+        var resolvedScaling = scaling ?? LogitScaling.Identity;
         var heatmap = new float[spatialFeatures.Height, spatialFeatures.Width];
         for (var y = 0; y < spatialFeatures.Height; y++)
         for (var x = 0; x < spatialFeatures.Width; x++)
-            heatmap[y, x] = Sigmoid(Dot(tagEmbedding, spatialFeatures[y, x]));
+            heatmap[y, x] = Sigmoid(resolvedScaling.Apply(Dot(tagEmbedding, spatialFeatures[y, x])));
 
         return heatmap;
     }
@@ -46,9 +47,25 @@ public static class TagScorer
     /// </param>
     /// <param name="content">Where the original image's real content sits within the letterboxed canvas, in canvas pixel space (0..<paramref name="canvasSize"/>).</param>
     /// <param name="canvasSize">The side length of the square letterboxed canvas <paramref name="heatmap"/>'s grid covers.</param>
+    /// <param name="minRange">
+    /// A tag whose heatmap's own max-min spread sits below this is treated as carrying no
+    /// usable spatial signal (an under-discriminated tag scores near-uniformly everywhere,
+    /// not because it genuinely applies everywhere) and gets no boxes at all, regardless of
+    /// <paramref name="threshold"/>/<paramref name="relativePercentile"/>. Without this, a
+    /// flat heatmap either clears <paramref name="threshold"/> almost everywhere (one
+    /// box spanning most of the canvas) or, after <see cref="HeatmapRefiner.Refine"/>'s
+    /// upsample+bilateral-filter, fragments into small islands of interpolation/filter
+    /// noise near the (meaningless) percentile cutoff — both worse than reporting nothing.
+    /// Trade-off: a tag that genuinely, legitimately covers almost the whole image (e.g. a
+    /// background tag on a mostly-background composition) can also have a small range and
+    /// gets suppressed the same way — hence a small default rather than an aggressive one.
+    /// </param>
+    /// <param name="minComponentFraction">Drops connected regions covering fewer than this fraction of the grid's cells — isolated specks, not localization. 0 keeps every region.</param>
+    /// <param name="maxBoxes">Keeps only this many boxes, highest peak confidence first. 0 keeps every box.</param>
     public static List<BoundingBox> DetectBoxes(
         float[,] heatmap, float threshold, float relativePercentile,
-        LetterboxBox content, int canvasSize, int imageWidth, int imageHeight)
+        LetterboxBox content, int canvasSize, int imageWidth, int imageHeight, float minRange = 0.05f,
+        float minComponentFraction = 0f, int maxBoxes = 0)
     {
         var height = heatmap.GetLength(0);
         var width = heatmap.GetLength(1);
@@ -60,6 +77,9 @@ public static class TagScorer
             min = Math.Min(min, value);
             max = Math.Max(max, value);
         }
+
+        if (max - min < minRange)
+            return [];
 
         var effectiveThreshold = Math.Max(threshold, min + relativePercentile * (max - min));
 
@@ -74,6 +94,8 @@ public static class TagScorer
         var canvasToImageX = imageWidth / (float)content.Width;
         var canvasToImageY = imageHeight / (float)content.Height;
 
+        var minCells = (int)Math.Ceiling(minComponentFraction * width * height);
+
         var boxes = new List<BoundingBox>();
         for (var y = 0; y < height; y++)
         for (var x = 0; x < width; x++)
@@ -81,16 +103,21 @@ public static class TagScorer
             if (visited[y, x] || heatmap[y, x] < effectiveThreshold)
                 continue;
 
-            boxes.Add(FloodFillComponent(
+            var (box, cellCount) = FloodFillComponent(
                 heatmap, visited, x, y, effectiveThreshold,
-                gridToCanvasX, gridToCanvasY, canvasToImageX, canvasToImageY, content, imageWidth, imageHeight));
+                gridToCanvasX, gridToCanvasY, canvasToImageX, canvasToImageY, content, imageWidth, imageHeight);
+            if (cellCount >= minCells)
+                boxes.Add(box);
         }
+
+        if (maxBoxes > 0 && boxes.Count > maxBoxes)
+            boxes = boxes.OrderByDescending(b => b.Confidence).Take(maxBoxes).ToList();
 
         return boxes;
     }
 
-    /// <summary>BFS over 4-connected above-threshold grid cells starting at (startX, startY), returning their pixel-space bounding box.</summary>
-    private static BoundingBox FloodFillComponent(
+    /// <summary>BFS over 4-connected above-threshold grid cells starting at (startX, startY), returning their pixel-space bounding box and how many grid cells the region covers.</summary>
+    private static (BoundingBox Box, int CellCount) FloodFillComponent(
         float[,] heatmap, bool[,] visited, int startX, int startY, float threshold,
         float gridToCanvasX, float gridToCanvasY, float canvasToImageX, float canvasToImageY,
         LetterboxBox content, int imageWidth, int imageHeight)
@@ -104,9 +131,11 @@ public static class TagScorer
 
         int minX = startX, maxX = startX, minY = startY, maxY = startY;
         var peakConfidence = heatmap[startY, startX];
+        var cellCount = 0;
 
         while (queue.TryDequeue(out var cell))
         {
+            cellCount++;
             var (x, y) = cell;
             minX = Math.Min(minX, x);
             maxX = Math.Max(maxX, x);
@@ -136,7 +165,7 @@ public static class TagScorer
         var pixelRight = (int)Math.Clamp(MathF.Ceiling((canvasRight - content.X) * canvasToImageX), 0, imageWidth);
         var pixelBottom = (int)Math.Clamp(MathF.Ceiling((canvasBottom - content.Y) * canvasToImageY), 0, imageHeight);
 
-        return new BoundingBox(pixelX, pixelY, pixelRight - pixelX, pixelBottom - pixelY, peakConfidence);
+        return (new BoundingBox(pixelX, pixelY, pixelRight - pixelX, pixelBottom - pixelY, peakConfidence), cellCount);
     }
 
     private static float Dot(ReadOnlySpan<float> a, ReadOnlySpan<float> b)

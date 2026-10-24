@@ -43,6 +43,43 @@ public class PreprocessedDatasetCacheTests
     }
 
     [Fact]
+    public void ReadEncoded_MatchesReadImage_InRequestedOrder_WithDuplicatesAndTheLastRecord()
+    {
+        const int inputSize = 4;
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            // Variable-size records (different content boxes), so offsets aren't a fixed stride.
+            var images = new[]
+            {
+                MakeImage(4, 4, 0),
+                new EncodedImage(Enumerable.Range(0, 4 * 2 * 3).Select(i => (byte)(i * 3)).ToArray(), new LetterboxBox(0, 1, 4, 2)),
+                MakeImage(4, 4, 50),
+                new EncodedImage(Enumerable.Range(0, 2 * 4 * 3).Select(i => (byte)(i * 7)).ToArray(), new LetterboxBox(1, 0, 2, 4)),
+            };
+            using (var writer = new PreprocessedDatasetCacheWriter(directory, inputSize))
+                foreach (var image in images)
+                    writer.Append(image, [0]);
+
+            using var reader = new PreprocessedDatasetCacheReader(directory);
+            int[] requested = [3, 0, 3, 1, 2];
+            var encoded = reader.ReadEncoded(requested, maxParallelism: 4);
+
+            Assert.Equal(requested.Length, encoded.Length);
+            for (var i = 0; i < requested.Length; i++)
+            {
+                var expected = reader.ReadImage(requested[i]);
+                Assert.Equal(expected.Content, encoded[i].Content);
+                Assert.Equal(expected.Pixels, ImagePreprocessing.Reconstruct(encoded[i], inputSize).Pixels);
+            }
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
     public void WriteAndRead_PadsAroundContentSmallerThanCanvas()
     {
         // A 1x2 content region letterboxed into a 4x4 canvas: everything outside the

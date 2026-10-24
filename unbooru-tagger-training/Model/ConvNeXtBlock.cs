@@ -28,7 +28,7 @@ public sealed class ConvNeXtBlock : Module<Tensor, Tensor>
         // internally before LayerScale ever gets a chance to scale it down — Infinity/NaN
         // survive multiplication by any finite scale. A bigger eps keeps the denominator
         // bounded away from zero in the first place.
-        Norm = GroupNorm(1, channels, eps: 1e-3, device: device);
+        Norm = NewGroupNorm(channels, device);
         PointwiseExpand = Conv2d(channels, channels * 4, kernel_size: 1, device: device);
         PointwiseProject = Conv2d(channels * 4, channels, kernel_size: 1, device: device);
 
@@ -40,6 +40,23 @@ public sealed class ConvNeXtBlock : Module<Tensor, Tensor>
         LayerScale = new Parameter(ones([1, channels, 1, 1], device: device) * 1e-6);
 
         RegisterComponents();
+    }
+
+    /// <summary>
+    /// <c>GroupNorm(1, channels, eps: 1e-3)</c> with its affine parameters explicitly set to
+    /// weight 1 / bias 0. TorchSharp 0.107's GroupNorm leaves them as uninitialized memory:
+    /// on CPU that is sometimes NaN (every forward pass NaN from step 1), on CUDA usually
+    /// zeros (a norm that outputs nothing until gradients grow its weight).
+    /// </summary>
+    internal static GroupNorm NewGroupNorm(long channels, Device? device)
+    {
+        var norm = GroupNorm(1, channels, eps: 1e-3, device: device);
+        using (no_grad())
+        {
+            norm.weight!.fill_(1);
+            norm.bias!.fill_(0);
+        }
+        return norm;
     }
 
     public override Tensor forward(Tensor input)

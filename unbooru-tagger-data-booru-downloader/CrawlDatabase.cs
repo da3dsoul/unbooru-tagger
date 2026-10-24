@@ -478,6 +478,22 @@ public sealed class CrawlDatabase : IDisposable
     /// "never captured" (see <see cref="ImageSourceSnapshot"/>'s own doc comment) —
     /// callers must not treat that the same as a confirmed-empty tag list.
     /// </summary>
+    /// <summary>
+    /// Streams every <c>ImageSources</c> row as (Md5, Site, Tags) in table order: one
+    /// sequential pass. Ordering by Md5 through its index turned the scan into random reads
+    /// (about 0.6 MB/s on the RAID array), so callers that need an image's sources together
+    /// buffer them instead. Read-only.
+    /// </summary>
+    public Task ScanSourcesAsync(Action<string, string, IReadOnlyList<string>?> onRow, CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = "SELECT Md5, Site, Tags FROM ImageSources;";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                onRow(reader.GetString(0), reader.GetString(1), reader.IsDBNull(2) ? null : JsonSerializer.Deserialize<List<string>>(reader.GetString(2)));
+        }, cancellationToken);
+
     public Task<IReadOnlyList<(string Md5, IReadOnlyList<string>? Tags)>> GetAllImageSourceTagsAsync(CancellationToken cancellationToken = default, Action<int>? onProgress = null) =>
         WithLockAsync(async () =>
         {
@@ -640,6 +656,47 @@ public sealed class CrawlDatabase : IDisposable
     /// query — cheaper at a multi-million-row corpus, and the whole point of this query
     /// is a single index-space diff the caller does once anyway.
     /// </summary>
+    /// <summary>Every (Md5, CacheRowIndex) row of <c>Images</c>, one sequential pass. Read-only.</summary>
+    public Task ScanImagesAsync(Action<string, int> onRow, CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = "SELECT Md5, CacheRowIndex FROM Images;";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                onRow(reader.GetString(0), reader.GetInt32(1));
+        }, cancellationToken);
+
+    /// <summary>Every (Md5, Site) row of <c>ImageSources</c>, one sequential pass. Read-only.</summary>
+    public Task ScanSourceSitesAsync(Action<string, string> onRow, CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = "SELECT Md5, Site FROM ImageSources;";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                onRow(reader.GetString(0), reader.GetString(1));
+        }, cancellationToken);
+
+    /// <summary>Every site rating recorded for each cache row (one entry per source), for <c>export-ratings</c>.</summary>
+    public Task<IReadOnlyDictionary<int, List<string>>> GetRatingsByCacheRowAsync(CancellationToken cancellationToken = default) =>
+        WithLockAsync(async () =>
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = "SELECT i.CacheRowIndex, s.Rating FROM Images i JOIN ImageSources s ON s.Md5 = i.Md5;";
+            var results = new Dictionary<int, List<string>>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var row = reader.GetInt32(0);
+                if (!results.TryGetValue(row, out var list))
+                    results[row] = list = [];
+                list.Add(reader.GetString(1));
+            }
+
+            return (IReadOnlyDictionary<int, List<string>>)results;
+        }, cancellationToken);
+
     public Task<IReadOnlySet<int>> GetAllCacheRowIndicesAsync(CancellationToken cancellationToken = default) =>
         WithLockAsync(async () =>
         {

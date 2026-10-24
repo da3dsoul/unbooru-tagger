@@ -15,12 +15,23 @@ namespace UnbooruTagger.Tests.Training;
 public class ImageTowerOnnxExportTests
 {
     [Fact]
-    public void ExportedGraph_ProducesSameOutputsAsTorchSharpForward()
-    {
-        const int embeddingDim = 8;
-        const int inputSize = 32;
+    public void ExportedGraph_ProducesSameOutputsAsTorchSharpForward() =>
+        AssertExportMatches(new ImageTower(8, stemChannels: 8, stageChannels: [8, 16], blocksPerStage: [1, 1]), 32, expectedSpatialSize: 4);
 
-        var tower = new ImageTower(embeddingDim, stemChannels: 8, stageChannels: [8, 16], blocksPerStage: [1, 1]);
+    [Fact]
+    public void ExportedGraph_WithMultiScaleFusion_ProducesSameOutputsAsTorchSharpForward() =>
+        // Stem /4 -> 16x16 (stage 0), /8 -> 8x8 (stage 1), /16 -> 4x4 (stage 2); fusing 2
+        // stages brings the spatial output back up to stage 0's 16x16.
+        AssertExportMatches(new ImageTower(8, stemChannels: 8, stageChannels: [8, 12, 16], blocksPerStage: [1, 1, 1], fusedStages: 2), 64, expectedSpatialSize: 16);
+
+    [Fact]
+    public void ExportedGraph_WithFusedOnlyLocalizationMap_ExportsItAsAThirdOutput() =>
+        AssertExportMatches(
+            new ImageTower(8, stemChannels: 8, stageChannels: [8, 12, 16], blocksPerStage: [1, 1, 1], fusedStages: 2) { LocalizationFromFusedOnly = true },
+            64, expectedSpatialSize: 16);
+
+    private static void AssertExportMatches(ImageTower tower, int inputSize, int expectedSpatialSize)
+    {
         tower.eval();
 
         // Deliberately NOT random: this was originally seeded random init, but for some
@@ -44,6 +55,7 @@ public class ImageTowerOnnxExportTests
             Enumerable.Range(0, 3 * inputSize * inputSize).Select(i => 0.01f * ((i % 11) - 5)).ToArray(),
             [1, 3, inputSize, inputSize]);
         var (expectedPooled, expectedSpatial) = tower.forward(input);
+        Assert.Equal(expectedSpatialSize, expectedSpatial.shape[2]);
 
         var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.onnx");
         try
@@ -67,6 +79,19 @@ public class ImageTowerOnnxExportTests
             Assert.Equal(expectedSpatialArray.Length, actualSpatial.Length);
             for (var i = 0; i < expectedSpatialArray.Length; i++)
                 Assert.Equal(expectedSpatialArray[i], actualSpatial[i], 3);
+
+            var actualLocalization = results.FirstOrDefault(r => r.Name == ImageTowerOnnxExporter.LocalizationOutputName);
+            if (!tower.LocalizationFromFusedOnly)
+            {
+                Assert.Null(actualLocalization);
+                return;
+            }
+
+            var expectedLocalization = tower.ForwardMaps(input).Localization.data<float>().ToArray();
+            var actualLocalizationArray = actualLocalization!.AsTensor<float>().ToArray();
+            Assert.Equal(expectedLocalization.Length, actualLocalizationArray.Length);
+            for (var i = 0; i < expectedLocalization.Length; i++)
+                Assert.Equal(expectedLocalization[i], actualLocalizationArray[i], 3);
         }
         finally
         {

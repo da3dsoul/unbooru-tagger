@@ -7,10 +7,9 @@ var modelDirOption = new Option<string>("--model-dir")
     DefaultValueFactory = _ => "./model"
 };
 
-var thresholdOption = new Option<float>("--threshold")
+var thresholdOption = new Option<float?>("--threshold")
 {
-    Description = "Minimum confidence required to report a tag",
-    DefaultValueFactory = _ => 0.5f
+    Description = "Minimum confidence required to report a tag. Omit to use each tag's calibrated threshold from the model bundle's tag_thresholds.json (written by the training CLI's evaluate command), falling back to 0.5 for uncalibrated tags or bundles without that file."
 };
 
 var imageArgument = new Argument<string>("image") { Description = "Path to the image to tag" };
@@ -34,6 +33,24 @@ var boxPercentileOption = new Option<float>("--box-percentile")
     DefaultValueFactory = _ => 0.6f
 };
 
+var minHeatmapRangeOption = new Option<float>("--min-heatmap-range")
+{
+    Description = "Suppress all boxes for a tag whose heatmap's own max-min spread sits below this — a near-flat heatmap has no real spatial signal to cut into, so a box built from it is noise, not localization",
+    DefaultValueFactory = _ => 0.05f
+};
+
+var minBoxFractionOption = new Option<float>("--min-box-fraction")
+{
+    Description = "Drop any box whose connected region covers less than this fraction of the heatmap grid -- isolated specks are noise, not localization",
+    DefaultValueFactory = _ => 0.002f
+};
+
+var maxBoxesPerTagOption = new Option<int>("--max-boxes-per-tag")
+{
+    Description = "Keep at most this many boxes per tag, strongest peak first. 0 keeps every box",
+    DefaultValueFactory = _ => 3
+};
+
 var detectOutputOption = new Option<string?>("--out")
 {
     Description = "If set, also render the detected boxes onto the image and write it as a PNG here"
@@ -46,7 +63,7 @@ tagCommand.Options.Add(thresholdOption);
 tagCommand.SetAction(parseResult => TagCommandHandler.Run(
     parseResult.GetRequiredValue(modelDirOption),
     parseResult.GetRequiredValue(imageArgument),
-    parseResult.GetRequiredValue(thresholdOption)));
+    parseResult.GetValue(thresholdOption)));
 
 var tagBatchCommand = new Command("tag-batch", "Score every image in a directory against the tag vocabulary");
 tagBatchCommand.Arguments.Add(directoryArgument);
@@ -55,7 +72,7 @@ tagBatchCommand.Options.Add(thresholdOption);
 tagBatchCommand.SetAction(parseResult => TagBatchCommandHandler.Run(
     parseResult.GetRequiredValue(modelDirOption),
     parseResult.GetRequiredValue(directoryArgument),
-    parseResult.GetRequiredValue(thresholdOption)));
+    parseResult.GetValue(thresholdOption)));
 
 var heatmapCommand = new Command("heatmap", "Render a rough localization heatmap for one tag on one image");
 heatmapCommand.Arguments.Add(imageArgument);
@@ -74,21 +91,59 @@ detectCommand.Options.Add(modelDirOption);
 detectCommand.Options.Add(thresholdOption);
 detectCommand.Options.Add(boxThresholdOption);
 detectCommand.Options.Add(boxPercentileOption);
+detectCommand.Options.Add(minHeatmapRangeOption);
+detectCommand.Options.Add(minBoxFractionOption);
+detectCommand.Options.Add(maxBoxesPerTagOption);
 detectCommand.Options.Add(detectOutputOption);
 detectCommand.SetAction(parseResult => DetectCommandHandler.Run(
     parseResult.GetRequiredValue(modelDirOption),
     parseResult.GetRequiredValue(imageArgument),
-    parseResult.GetRequiredValue(thresholdOption),
+    parseResult.GetValue(thresholdOption),
     parseResult.GetRequiredValue(boxThresholdOption),
     parseResult.GetRequiredValue(boxPercentileOption),
+    parseResult.GetRequiredValue(minHeatmapRangeOption),
+    parseResult.GetRequiredValue(minBoxFractionOption),
+    parseResult.GetRequiredValue(maxBoxesPerTagOption),
     parseResult.GetValue(detectOutputOption)));
+
+var goldArgument = new Argument<string>("gold") { Description = "Gold set file (gold.json); its images are resolved relative to it" };
+var renderOutDirOption = new Option<string>("--out-dir") { Description = "Directory to write one PNG per gold image", Required = true };
+var optionalModelDirOption = new Option<string?>("--model-dir")
+{
+    Description = "If set, also run detect with this model on each image and render it beside the gold boxes"
+};
+
+var allTagsOption = new Option<bool>("--all-tags") { Description = "Show every tag the model detects, not just the ones the gold set boxes on that image" };
+var renderGoldCommand = new Command("render-gold", "Render a gold set's hand-checked boxes the way detect renders, optionally side by side with a model's detect output, for manual comparison");
+renderGoldCommand.Arguments.Add(goldArgument);
+renderGoldCommand.Options.Add(renderOutDirOption);
+renderGoldCommand.Options.Add(optionalModelDirOption);
+renderGoldCommand.Options.Add(thresholdOption);
+renderGoldCommand.Options.Add(boxThresholdOption);
+renderGoldCommand.Options.Add(boxPercentileOption);
+renderGoldCommand.Options.Add(minHeatmapRangeOption);
+renderGoldCommand.Options.Add(minBoxFractionOption);
+renderGoldCommand.Options.Add(maxBoxesPerTagOption);
+renderGoldCommand.Options.Add(allTagsOption);
+renderGoldCommand.SetAction(parseResult => RenderGoldCommandHandler.Run(
+    parseResult.GetRequiredValue(goldArgument),
+    parseResult.GetRequiredValue(renderOutDirOption),
+    parseResult.GetValue(optionalModelDirOption),
+    parseResult.GetValue(thresholdOption),
+    parseResult.GetRequiredValue(boxThresholdOption),
+    parseResult.GetRequiredValue(boxPercentileOption),
+    parseResult.GetRequiredValue(minHeatmapRangeOption),
+    parseResult.GetRequiredValue(minBoxFractionOption),
+    parseResult.GetRequiredValue(maxBoxesPerTagOption),
+    parseResult.GetValue(allTagsOption)));
 
 var rootCommand = new RootCommand("unbooru-tagger inference CLI")
 {
     tagCommand,
     tagBatchCommand,
     heatmapCommand,
-    detectCommand
+    detectCommand,
+    renderGoldCommand
 };
 
 return rootCommand.Parse(args).Invoke();
