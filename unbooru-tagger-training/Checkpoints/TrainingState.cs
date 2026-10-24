@@ -83,6 +83,16 @@ public static class TrainingState
         optimizer.save_state_dict(Path.Combine(directory, OptimizerFileName));
     }
 
+    /// <summary>Whether <paramref name="directory"/> has training_progress.json, with or without an optimizer (an offloaded-evaluation snapshot has none).</summary>
+    public static bool HasProgress(string directory) => File.Exists(Path.Combine(directory, ProgressFileName));
+
+    /// <summary>Writes training_progress.json alone: enough for <c>evaluate</c> to reconstruct the run's validation split.</summary>
+    public static void SaveProgress(string directory, TrainingProgress progress)
+    {
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(Path.Combine(directory, ProgressFileName), JsonSerializer.Serialize(progress, JsonOptions));
+    }
+
     public static TrainingProgress LoadProgress(string directory) =>
         JsonSerializer.Deserialize<TrainingProgress>(File.ReadAllText(Path.Combine(directory, ProgressFileName)), JsonOptions)
         ?? throw new InvalidDataException($"'{directory}' does not contain valid training progress.");

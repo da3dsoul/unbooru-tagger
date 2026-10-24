@@ -151,6 +151,10 @@ var maxStepsOption = new Option<int>("--max-steps")
     Description = "Stop after this many training steps in this process and save a checkpoint (for short comparison runs). 0 = no limit.",
     DefaultValueFactory = _ => 0
 };
+var evaluationCommandOption = new Option<string?>("--evaluation-command")
+{
+    Description = "Executable that runs each epoch's evaluation in the background, called as <command> <snapshot dir> <report dir> (e.g. a script running `evaluate` on another GPU). Training continues meanwhile; results are applied as they come back. Unset = evaluate inline."
+};
 var localizableTagsOption = new Option<string?>("--localizable-tags")
 {
     Description = "Rules file for which tags have no region to localize (backgrounds, mediums, styles, lighting, framing, people counts, artist:/series:/...). One rule per line: 'tag', 'prefix*', '*suffix', '!' prefix for exceptions. Omit to reuse the checkpoint's saved copy, or the built-in defaults."
@@ -227,6 +231,7 @@ trainCommand.Options.Add(localizationMinedNegativesOption);
 trainCommand.Options.Add(localizationBackgroundWeightOption);
 trainCommand.Options.Add(localizationBackgroundFractionOption);
 trainCommand.Options.Add(maxStepsOption);
+trainCommand.Options.Add(evaluationCommandOption);
 trainCommand.Options.Add(trainGoldOption);
 trainCommand.Options.Add(cropConsistencyWeightOption);
 trainCommand.Options.Add(cropTeacherMinApOption);
@@ -281,7 +286,8 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         LocalizableTagsPath: parseResult.GetValue(localizableTagsOption),
         CompactVocabulary: !parseResult.GetValue(keepVocabularyOption),
         CosineSchedule: parseResult.GetRequiredValue(lrScheduleOption) == "cosine",
-        WarmupSteps: parseResult.GetRequiredValue(warmupStepsOption)),
+        WarmupSteps: parseResult.GetRequiredValue(warmupStepsOption),
+        EvaluationCommand: parseResult.GetValue(evaluationCommandOption)),
     parseResult.GetRequiredValue(ioParallelismOption),
     parseResult.GetRequiredValue(prefetchBatchesOption),
     new TowerOptions(

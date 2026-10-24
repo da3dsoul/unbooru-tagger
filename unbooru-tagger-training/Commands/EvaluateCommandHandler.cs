@@ -46,7 +46,7 @@ public static class EvaluateCommandHandler
             AnsiConsole.MarkupLineInterpolated($"{unmatched} dataset tags aren't in the checkpoint's vocabulary and are ignored.");
 
         var seed = 0;
-        if (TrainingState.Exists(checkpointDir))
+        if (TrainingState.HasProgress(checkpointDir))
             seed = TrainingState.LoadProgress(checkpointDir).ValidationSplitSeed;
         else
             AnsiConsole.MarkupLine("[yellow]No training_progress.json -- can't reconstruct this run's validation split; using seed 0, which may overlap its training images.[/]");

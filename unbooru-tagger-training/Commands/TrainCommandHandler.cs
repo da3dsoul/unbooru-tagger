@@ -354,6 +354,54 @@ public static class TrainCommandHandler
         var gold = targetOptions.GoldPath is not null ? LocalizationEvaluator.LoadGold(targetOptions.GoldPath) : null;
         if (gold is not null)
             AnsiConsole.MarkupLineInterpolated($"Gold set: {gold.Count} images, scored at every epoch evaluation.");
+        // --evaluation-command: epoch evaluations run in another process (e.g. `evaluate` on a
+        // second GPU) while training continues; their results are applied as they come back.
+        using var offloaded = targetOptions.EvaluationCommand is not null && validationIndices.Count > 0
+            ? new OffloadedEvaluations(checkpointDir, targetOptions.EvaluationCommand)
+            : null;
+        if (offloaded is not null)
+            foreach (var pending in offloaded.ResumePending(startEpoch))
+                AnsiConsole.MarkupLineInterpolated($"Re-running the offloaded evaluation of epoch {pending}: it never finished before the last stop.");
+
+        // Applies offloaded evaluations that have come back, in epoch order. Returns the epochs
+        // applied (to mark once the state reflecting them is saved) and whether early stopping fired.
+        (List<int> Applied, bool StopEarly) ApplyOffloaded()
+        {
+            var applied = new List<int>();
+            var stop = false;
+            foreach (var result in offloaded!.TakeFinished())
+            {
+                applied.Add(result.Epoch);
+                if (result.Report is null)
+                {
+                    dashboard.Log("[red]" + Markup.Escape($"offloaded evaluation of epoch {result.Epoch} failed ({result.Failure}; see {Path.Combine(result.Directory, "evaluation.log")}): it doesn't count toward early stopping") + "[/]");
+                    continue;
+                }
+                // The top-level copies are what export-onnx and CropTeacherGate.Load read.
+                foreach (var name in new[] { EvaluationReportFileName, RatingReportFileName, EvaluateCommandHandler.LocalizationReportFileName, TagThresholds.FileName })
+                    if (File.Exists(Path.Combine(result.Directory, name)))
+                        File.Copy(Path.Combine(result.Directory, name), Path.Combine(checkpointDir, name), overwrite: true);
+                if (targetOptions.CropConsistencyWeight > 0)
+                {
+                    cropGate = CropTeacherGate.From(result.Report, vocabulary, localizable, targetOptions.CropTeacherMinAveragePrecision, targetOptions.CropTeacherMinPositives);
+                    cropTrusted.Dispose();
+                    cropTrusted = tensor(cropGate.Trusted.Select(t => t ? 1f : 0f).ToArray(), device: device);
+                    dashboard.Log(Markup.Escape($"crop consistency: {cropGate.TrustedCount} tags now trusted as teachers (held-out AP >= {targetOptions.CropTeacherMinAveragePrecision})"));
+                }
+                dashboard.EvaluationFinished(result.Epoch - 1, result.Report, result.Ratings);
+                dashboard.Log(Markup.Escape($"epoch {result.Epoch}/{epochs} (offloaded evaluation)"));
+                dashboard.Log(DescribeReport(result.Report));
+                if (result.Ratings is not null)
+                    dashboard.Log(DescribeRatings(result.Ratings));
+                if (!stop && earlyStopping.ShouldStop(result.Report.EarlyStoppingValue))
+                {
+                    dashboard.Log("[yellow]" + Markup.Escape($"Early stopping: held-out mAP stopped improving after epoch {result.Epoch}. Its weights are kept in {offloaded.SnapshotDirectory(result.Epoch - earlyStopping.EvaluationsSinceImprovement)}.") + "[/]");
+                    stop = true;
+                }
+            }
+            return (applied, stop);
+        }
+
         var stepsThisProcess = 0;
         var cropRandom = new Random();
         long croppedImages = 0;
@@ -602,6 +650,7 @@ public static class TrainCommandHandler
                     var reachedMaxSteps = targetOptions.MaxSteps > 0 && stepsThisProcess >= targetOptions.MaxSteps;
                     if (sinceLastCheckpoint.Elapsed >= checkpointInterval || reachedMaxSteps)
                     {
+                        var (appliedOffloaded, offloadedStop) = offloaded is not null ? ApplyOffloaded() : ([], false);
                         dashboard.Phase("saving checkpoint");
                         SaveCheckpoint(checkpointDir, imageTower, tagTower, logitScaleBias, embeddingDim, resolvedInputSize, vocabulary);
                         TrainingState.Save(
@@ -611,6 +660,13 @@ public static class TrainCommandHandler
                         TrainingState.SaveLogitScaleBiasOptimizerState(checkpointDir, logitScaleBiasOptimizer);
                         sinceLastCheckpoint.Restart();
                         dashboard.CheckpointSaved();
+                        foreach (var e in appliedOffloaded)
+                            offloaded!.MarkApplied(e);
+                        if (offloadedStop)
+                        {
+                            dashboard.Finished("early stopping (offloaded evaluation)");
+                            return;
+                        }
                     }
 
                     if (reachedMaxSteps)
@@ -629,9 +685,33 @@ public static class TrainCommandHandler
                 dashboard.CheckpointSaved();
 
                 var stopEarly = false;
+                List<int> appliedAtEpochEnd = [];
                 if (validationIndices.Count == 0)
                 {
                     dashboard.Log("Not enough images for a validation split — running the full epoch count without early stopping.");
+                }
+                else if (offloaded is not null)
+                {
+                    var completedEpoch = epoch + 1;
+                    dashboard.Phase($"end of epoch {completedEpoch}: snapshotting for the offloaded evaluation");
+                    offloaded.Launch(completedEpoch, snapshot =>
+                    {
+                        SaveCheckpoint(snapshot, imageTower, tagTower, logitScaleBias, embeddingDim, resolvedInputSize, vocabulary);
+                        foreach (var name in new[] { ExclusiveTagGroups.FileName, TagLocalizability.FileName })
+                            if (File.Exists(Path.Combine(checkpointDir, name)))
+                                File.Copy(Path.Combine(checkpointDir, name), Path.Combine(snapshot, name), overwrite: true);
+                        // evaluate reconstructs the held-out split from this.
+                        TrainingState.SaveProgress(snapshot, new TrainingProgress(completedEpoch, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, CompletedStepsInEpoch: 0, validationSplitSeed, stepsPerEpoch, EarlyStoppingMetricName));
+                    });
+                    dashboard.Log(Markup.Escape($"epoch {completedEpoch}: evaluation started in the background ({targetOptions.EvaluationCommand}); training continues"));
+
+                    // The last epoch has nothing left to overlap with: wait, so the run ends with its reports.
+                    if (epoch == epochs - 1)
+                    {
+                        dashboard.Phase($"end of epoch {completedEpoch}: waiting for the offloaded evaluations");
+                        offloaded.WaitAll();
+                    }
+                    (appliedAtEpochEnd, stopEarly) = ApplyOffloaded();
                 }
                 else
                 {
@@ -706,6 +786,8 @@ public static class TrainCommandHandler
                 dashboard.Phase($"end of epoch {epoch + 1}: saving training state");
                 TrainingState.Save(checkpointDir, new TrainingProgress(epoch + 1, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, CompletedStepsInEpoch: 0, validationSplitSeed, stepsPerEpoch, EarlyStoppingMetricName), optimizer);
                 TrainingState.SaveLogitScaleBiasOptimizerState(checkpointDir, logitScaleBiasOptimizer);
+                foreach (var e in appliedAtEpochEnd)
+                    offloaded!.MarkApplied(e);
 
                 if (stopEarly)
                     break;

@@ -77,6 +77,8 @@ is no Python code in this repo).
   12.8 runtime, just needs a compatible driver) only on Linux. On Windows
   (and any other non-Linux OS) it falls back to `TorchSharp-cpu`, so
   training on Windows is CPU-only.
+- Or **an Intel Arc GPU** (XPU, tested on an Arc Pro B70): build with
+  `-p:TorchBackend=xpu` (see [Training on an Intel GPU](#training-on-an-intel-gpu-xpu)).
 
 ## Getting started (end users — tagging images)
 
@@ -728,6 +730,54 @@ Produces the `model/` bundle described above, ready for
 bundle. With them, inference uses each tag's calibrated threshold unless
 `--threshold` is passed explicitly, and drops the weaker of any two
 mutually exclusive tags.
+
+### Training on an Intel GPU (XPU)
+
+The stock `TorchSharp` package runs on Intel Arc GPUs against the libtorch shipped in PyTorch's
+`torch==2.10.0+xpu` pip wheel. 2.10.0 is the libtorch TorchSharp 0.107.0 is built against, and
+the C++ ABI matches, so no native rebuild is needed.
+
+1. Download that wheel and its Intel runtime dependencies from
+   `https://download.pytorch.org/whl/xpu`, unzip them, and copy every
+   `torch/lib/*.so*` and `*.data/data/lib/*.so*` into one folder. No oneAPI install is needed;
+   the system needs the `xe` driver, `libze-intel-gpu1` and `libze1`.
+2. Build with `dotnet build unbooru-tagger-training -c Release -p:TorchBackend=xpu`. This
+   references `TorchSharp` alone, with no bundled libtorch.
+3. Run with that folder on `LD_LIBRARY_PATH`, and with these variables set, so the Intel
+   runtime can't silently migrate allocations that don't fit in VRAM into host RAM. Without
+   them, over-allocating thrashes over PCIe instead of failing:
+   ```sh
+   export NEOReadDebugKeys=1 EnableSharedSystemUsmSupport=0 EnableImplicitMigrationOnFaultableHardware=0
+   ```
+
+`DeviceSelector` picks CUDA, then XPU, then CPU. On XPU it enables oneDNN's TF32 mode for
+convolutions (`OneDnnPrecision`), matching cuDNN's default on CUDA. That took the ConvNeXt-T
+tower from 203 to 138 ms/step. An XPU out-of-memory aborts the process rather than throwing a
+.NET exception, so you resume from the last checkpoint.
+
+### Offloading epoch evaluation (`--evaluation-command`)
+
+`train --evaluation-command <exe>` runs each epoch's evaluation in another process instead
+of inline, so training keeps going. A typical use is `evaluate` on a second GPU; it has to be
+a separate process because a CUDA and an XPU libtorch can't share one. At each epoch end the
+trainer writes a model-only snapshot to `history/epoch-N/checkpoint/` and starts
+`<exe> <snapshot dir> <history/epoch-N>`. The command must write the reports there and exit 0:
+
+```sh
+#!/usr/bin/env bash
+exec dotnet unbooru-tagger-training.dll evaluate --checkpoint-dir "$1" --out-dir "$2" \
+  --cache-dir ./dataset --max-images 20000 --localization-samples 0 --gold gold.json
+```
+
+`--max-images` and `--validation-fraction` must match the training run's
+`--validation-max-images`/`--validation-fraction`.
+
+Results are applied in epoch order at the next checkpoint save: early stopping, plus the
+top-level `evaluation_report.json`/`tag_thresholds.json` copies that `export-onnx` reads. That
+makes early stopping lag by up to an epoch. The best epoch's weights stay in its snapshot.
+The final epoch waits for its evaluation. Each `history/epoch-N/` also keeps
+`evaluation.log` and `evaluation.done`/`.failed`/`.applied` markers. A restarted trainer
+applies a finished evaluation it hadn't applied yet, and reruns one that never finished.
 
 ### Checkpoint directory contents
 

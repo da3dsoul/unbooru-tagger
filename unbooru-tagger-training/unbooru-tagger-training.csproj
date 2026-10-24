@@ -18,10 +18,15 @@
     changes). TorchSharp-cuda-linux bundles its own CUDA 12.8 runtime, so no separate
     CUDA Toolkit install is required on the training machine, just a compatible driver.
   -->
-  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+  <!--
+    -p:TorchBackend=xpu builds against no bundled libtorch at all: the Intel GPU (XPU) libtorch
+    2.10.0 comes from the torch 2.10.0+xpu pip wheel, found via LD_LIBRARY_PATH at run time
+    (see ../torchsharp-xpu).
+  -->
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux')) And '$(TorchBackend)' != 'xpu'">
     <PackageReference Include="TorchSharp-cuda-linux" Version="0.107.0" />
   </ItemGroup>
-  <ItemGroup Condition="!$([MSBuild]::IsOSPlatform('Linux'))">
+  <ItemGroup Condition="!$([MSBuild]::IsOSPlatform('Linux')) And '$(TorchBackend)' != 'xpu'">
     <PackageReference Include="TorchSharp-cpu" Version="0.107.0" />
   </ItemGroup>
 

@@ -242,6 +242,17 @@ built the corpus around:
   images with a trusted tag are cropped, so its cost tracks how much the teacher is trusted.
 - **Background suppression (`--localization-background-weight`, off):** tested and not used;
   it shrank heatmaps but didn't move peaks.
+- **Intel GPU / XPU training (run 3):** `-p:TorchBackend=xpu` builds against the `torch 2.10.0+xpu`
+  wheel's libtorch with stock TorchSharp. The device is `(DeviceType)12`, since TorchSharp's enum has no XPU.
+  `OneDnnPrecision` turns on oneDNN TF32 by calling libtorch's exported `at::Context` members, because
+  TorchSharp only exposes the CUDA switches. Only the legacy `allowTF32OneDNN` flag reaches XPU convs.
+  Measured on an Arc Pro B70: 158 ms/step for run 2's config vs. 278 on the A4000. It also needs the
+  NEO anti-migration env vars (README) so VRAM overflow fails instead of spilling to host RAM.
+- **Offloaded evaluation (`--evaluation-command`, `OffloadedEvaluations`):** each epoch's evaluation
+  runs as a separate process on a model snapshot (`history/epoch-N/checkpoint/`) while training
+  continues. Results are applied in epoch order at the next checkpoint save, and marker files make
+  that survive restarts. `evaluate` now reads the validation seed from a progress-only snapshot
+  (`TrainingState.HasProgress`); it used to need `optimizer.dat` too and fall back to seed 0.
 - **Per-epoch gold scoring (`train --gold`):** each epoch evaluation also scores the gold set
   and the crop teacher (`localization_report.json`); every epoch's reports are archived
   under `history/epoch-N/`.

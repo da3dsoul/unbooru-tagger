@@ -30,6 +30,7 @@ namespace UnbooruTagger.Training.Commands;
 /// <param name="CompactVocabulary">Fresh runs only: drop vocabulary rows no image carries.</param>
 /// <param name="CosineSchedule">Linear warmup over <paramref name="WarmupSteps"/>, then cosine decay of the learning rate across the run (see LearningRateSchedule). Off = constant rate.</param>
 /// <param name="Ratings">Learn content ratings from the dataset's ratings.bin, if present, as three cumulative labels.</param>
+/// <param name="EvaluationCommand">Run each epoch's evaluation as <c>&lt;command&gt; &lt;snapshot dir&gt; &lt;report dir&gt;</c> in the background instead of inline, e.g. `evaluate` on another GPU (see OffloadedEvaluations). Null = inline.</param>
 /// <param name="ValidationMaxImages">Cap on held-out images evaluated per epoch (a fixed prefix of the split, so it's the same images every epoch). 0 = the whole split.</param>
 /// <summary>Image tower shape for a fresh run (ignored on resume, where the checkpoint's config wins).</summary>
 /// <param name="FusedStages">Earlier stages fused into the spatial map (ImageTower.FusedStages): each one halves the heatmap stride.</param>
@@ -66,7 +67,8 @@ public sealed record TrainingTargetOptions(
     string? LocalizableTagsPath = null,
     bool CompactVocabulary = true,
     bool CosineSchedule = false,
-    int WarmupSteps = 0)
+    int WarmupSteps = 0,
+    string? EvaluationCommand = null)
 {
     public static TrainingTargetOptions Default { get; } = new();
 
