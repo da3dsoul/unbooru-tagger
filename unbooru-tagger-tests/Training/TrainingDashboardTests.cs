@@ -90,4 +90,33 @@ public class TrainingDashboardTests
         Assert.Contains("epoch 1: mAP 0.8100", writer.ToString());
         Assert.Contains("incl. 10m 00s evaluation per epoch", writer.ToString());
     }
+
+    [Fact]
+    public void OffloadedEvaluation_IsShownWhileRunningAndReplacedByItsResult()
+    {
+        var now = new DateTime(2026, 10, 25, 0, 17, 0);
+        var dashboard = new TrainingDashboard(Info with { StartEpoch = 1, StartStepInEpoch = 0, EvaluationsOffloaded = true }, () => now);
+        dashboard.EvaluationOffloaded(1);
+        now = now.AddMinutes(12);
+
+        var running = Render(dashboard);
+        Assert.Contains("epoch 1 in another process since 00:17, running 12m 00s", running);
+        Assert.Contains("none applied yet", running);
+        Assert.Contains("run in another process alongside training", running);
+        Assert.DoesNotContain("none yet: runs at the end of epoch", running);
+
+        dashboard.EvaluationFinished(0, new EvaluationReport(100, 50, 0.81, 0.85, 0.5, 0.45, 0.4, 0.42, 0.41, 0.5, 0.01, []), null);
+        var applied = Render(dashboard);
+        Assert.DoesNotContain("in another process since", applied);
+        Assert.Contains("epoch 1: mAP 0.8100", applied);
+    }
+
+    private static string Render(TrainingDashboard dashboard)
+    {
+        var writer = new StringWriter();
+        var console = AnsiConsole.Create(new AnsiConsoleSettings { Ansi = AnsiSupport.No, Out = new AnsiConsoleOutput(writer) });
+        console.Profile.Width = 237;
+        console.Write(dashboard.Render());
+        return writer.ToString();
+    }
 }

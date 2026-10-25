@@ -348,7 +348,8 @@ public static class TrainCommandHandler
 
         var dashboard = new TrainingDashboard(new TrainingRunInfo(
             $"training · {Path.GetFileName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(checkpointDir)))} · {imageTower.StageChannels[^1]}-channel tower · batch {batchSize}×{gradientAccumulationSteps}",
-            epochs, stepsPerEpoch, startEpoch, resumedStepsInEpoch, batchSize, checkpointInterval));
+            epochs, stepsPerEpoch, startEpoch, resumedStepsInEpoch, batchSize, checkpointInterval,
+            EvaluationsOffloaded: targetOptions.EvaluationCommand is not null && validationIndices.Count > 0));
         // Interactive terminals get the live panel; redirected output (a log file, tests)
         // gets a one-line summary every few minutes instead of a panel per refresh.
         var gold = targetOptions.GoldPath is not null ? LocalizationEvaluator.LoadGold(targetOptions.GoldPath) : null;
@@ -361,7 +362,10 @@ public static class TrainCommandHandler
             : null;
         if (offloaded is not null)
             foreach (var pending in offloaded.ResumePending(startEpoch))
+            {
                 AnsiConsole.MarkupLineInterpolated($"Re-running the offloaded evaluation of epoch {pending}: it never finished before the last stop.");
+                dashboard.EvaluationOffloaded(pending);
+            }
 
         // Applies offloaded evaluations that have come back, in epoch order. Returns the epochs
         // applied (to mark once the state reflecting them is saved) and whether early stopping fired.
@@ -374,6 +378,7 @@ public static class TrainCommandHandler
                 applied.Add(result.Epoch);
                 if (result.Report is null)
                 {
+                    dashboard.OffloadedEvaluationFailed(result.Epoch);
                     dashboard.Log("[red]" + Markup.Escape($"offloaded evaluation of epoch {result.Epoch} failed ({result.Failure}; see {Path.Combine(result.Directory, "evaluation.log")}): it doesn't count toward early stopping") + "[/]");
                     continue;
                 }
@@ -703,6 +708,7 @@ public static class TrainCommandHandler
                         // evaluate reconstructs the held-out split from this.
                         TrainingState.SaveProgress(snapshot, new TrainingProgress(completedEpoch, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, CompletedStepsInEpoch: 0, validationSplitSeed, stepsPerEpoch, EarlyStoppingMetricName));
                     });
+                    dashboard.EvaluationOffloaded(completedEpoch);
                     dashboard.Log(Markup.Escape($"epoch {completedEpoch}: evaluation started in the background ({targetOptions.EvaluationCommand}); training continues"));
 
                     // The last epoch has nothing left to overlap with: wait, so the run ends with its reports.

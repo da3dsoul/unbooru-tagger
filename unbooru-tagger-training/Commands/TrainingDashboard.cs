@@ -14,7 +14,8 @@ public sealed record TrainingRunInfo(
     int StartEpoch,
     int StartStepInEpoch,
     int ImagesPerStep,
-    TimeSpan CheckpointInterval);
+    TimeSpan CheckpointInterval,
+    bool EvaluationsOffloaded = false);
 
 /// <summary>
 /// Live full-width status panel for <see cref="TrainCommandHandler"/>, replacing two
@@ -65,6 +66,8 @@ public sealed class TrainingDashboard
     private DateTime? _evaluationStartedAt;
     private TimeSpan? _evaluationDuration;
     private string? _lastEvaluation;
+    // --evaluation-command: completed epochs whose evaluation runs in another process, and since when.
+    private readonly SortedDictionary<int, DateTime> _offloadedEvaluations = new();
     private bool _finished;
     private bool _printEvents;
     private (int TrustedTags, double CroppedFraction)? _cropTeacher;
@@ -234,10 +237,25 @@ public sealed class TrainingDashboard
             _evaluationStartedAt = _now();
     }
 
+    /// <summary>Epoch <paramref name="completedEpoch"/> (1-based) is being evaluated by another process.</summary>
+    public void EvaluationOffloaded(int completedEpoch)
+    {
+        lock (_lock)
+            _offloadedEvaluations[completedEpoch] = _now();
+    }
+
+    /// <summary>An offloaded evaluation came back without a report; it's logged separately.</summary>
+    public void OffloadedEvaluationFailed(int completedEpoch)
+    {
+        lock (_lock)
+            _offloadedEvaluations.Remove(completedEpoch);
+    }
+
     public void EvaluationFinished(int epoch, EvaluationReport report, RatingReport? ratings)
     {
         lock (_lock)
         {
+            _offloadedEvaluations.Remove(epoch + 1);
             if (_evaluationStartedAt is { } started)
                 _evaluationDuration = _now() - started;
             _evaluationStartedAt = null;
@@ -298,9 +316,11 @@ public sealed class TrainingDashboard
                 if (_evaluationDuration is { } evaluation)
                     runLeft += evaluation * (_info.Epochs - _epoch);
             }
-            var evaluationNote = _evaluationDuration is { } d
-                ? $" [grey](incl. {Duration(d)} evaluation per epoch; early stopping can end it sooner)[/]"
-                : " [grey](plus an evaluation per epoch; early stopping can end it sooner)[/]";
+            var evaluationNote = _info.EvaluationsOffloaded
+                ? " [grey](epoch evaluations run in another process alongside training; early stopping can end it sooner)[/]"
+                : _evaluationDuration is { } d
+                    ? $" [grey](incl. {Duration(d)} evaluation per epoch; early stopping can end it sooner)[/]"
+                    : " [grey](plus an evaluation per epoch; early stopping can end it sooner)[/]";
             Row($"run",
                 $"{Bar(_globalStep, TotalSteps)} {Percent(_globalStep, TotalSteps)}  " +
                 $"step {_globalStep:N0} / {TotalSteps:N0}{Remaining(runLeft, now, "finishes")}{evaluationNote}");
@@ -322,9 +342,15 @@ public sealed class TrainingDashboard
                 (_lastCheckpoint is { } saved ? $"saved {saved:HH:mm} ({Duration(now - saved)} ago)" : "none saved by this process yet") +
                 (_info.CheckpointInterval < TimeSpan.FromDays(365) && !_finished ? $" · next ≈ {nextCheckpoint:HH:mm}" : ""));
 
+            if (_offloadedEvaluations.Count > 0)
+                Row("evaluating", string.Join(" · ", _offloadedEvaluations.Select(p =>
+                        $"epoch {p.Key} in another process since {p.Value:HH:mm}, running {Duration(now - p.Value)}")) +
+                    " [grey](applied at the first checkpoint save after it finishes)[/]");
             Row("last evaluation", _lastEvaluation is not null
                 ? Markup.Escape(_lastEvaluation)
-                : $"[grey]none yet: runs at the end of epoch {_epoch + 1}{(epochLeft is { } e ? $" (≈ {Clock(now + e, now)})" : "")}[/]");
+                : _offloadedEvaluations.Count > 0
+                    ? "[grey]none applied yet[/]"
+                    : $"[grey]none yet: runs at the end of epoch {_epoch + 1}{(epochLeft is { } e ? $" (≈ {Clock(now + e, now)})" : "")}[/]");
 
             if (_events.Count > 0)
             {
