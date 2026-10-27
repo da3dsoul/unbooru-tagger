@@ -492,6 +492,14 @@ checkpointing. Uses CUDA if available, CPU otherwise. Key flags:
 `--validation-fraction` (default 0.1), `--early-stopping-patience`
 (default 3).
 
+**Tower size (fresh runs only; a resume uses the checkpoint's
+`model_config.json`).** `--stem-channels` (default 64), `--stage-channels`
+(default `64,128,256`; each width change downsamples 2x) and
+`--blocks-per-stage` (default `2,2,2`) set the ConvNeXt tower.
+`--fused-stages` (default 0) adds a top-down path that fuses earlier stages
+into the spatial map, each one halving the heatmap stride: 4 stages + 2 fused
+is stride 8, a 64x64 map at 512px.
+
 **Deliberate batches and targets (default).** The corpus was crawled per
 tag, with positives and co-occurrence-chosen hard negatives for each one,
 and training uses that structure directly:
@@ -588,10 +596,26 @@ trained as unverified negatives and drawn per anchor tag
 (`--context-negatives-per-anchor`, default 1); at 90% and above an absence is
 still treated as a missing label. `evaluate` reports a per-tag context AP.
 
+`--context-negative-weight` (default 0 = off) trains every such pair in a batch,
+not just the sampled ones, as a full-strength negative with this weight instead
+of a damped one, so "this character, therefore gloves" is no longer nearly free.
+It applies to localizable tags only: whole-image tags like `1girl` are often just
+untagged.
+
 **Localization options.**
 - `--localization-map fused` trains localization (and draws heatmaps) on the
   fused high-resolution laterals only, without the last stage. Needs
-  `--fused-stages > 0`; can be switched on when resuming.
+  `--fused-stages > 0`; can be switched on when resuming. `local` also leaves
+  out the coarsest (stride-16) lateral, so each location sees about 100px
+  (needs `--fused-stages >= 2`); `full` is the whole map classification pools.
+  Omitted, a resume keeps the checkpoint's setting (a fresh run uses `full`).
+- `--mosaics-per-step` (default 0 = off): each step, this many canvases of four
+  of the batch's images, each shrunk 2x into one tile of a 2x2 grid. Every tile
+  keeps all its tags, and its tags are negatives in the other tiles, so the
+  localization loss learns each tag in its own tile. Costs a forward/backward
+  pass per mosaic (2 mosaics: about +28% step time). Needs deliberate targets,
+  `--localization-weight > 0` and at least 4 images per batch.
+  `--mosaic-weight` (default 1) scales it relative to `--localization-weight`.
 - `--crop-consistency-weight` (default 0): the classifier's answer on a random
   crop teaches the localization map where a tag is. Gated to tags with held-out
   AP ≥ `--crop-teacher-min-ap` (0.8), ≥ `--crop-teacher-min-positives` (20) and
@@ -605,9 +629,14 @@ still treated as a missing label. `evaluate` reports a per-tag context AP.
 
 **Status panel.** In a terminal, `train` shows a full-width panel: phase,
 epoch and whole-run progress with time left and finish times, speed, loss
-(this step, a 1,000-step mean and a trend sparkline), learning rate,
-checkpoints, the last evaluation and recent events. With output redirected it
-prints a one-line summary every 5 minutes.
+(this step and a 1,000-step mean), learning rate, checkpoints, the last
+evaluation and recent events. Below that are line charts: the loss over the
+whole run (2,000-step means, saved to `loss_history.json` with each checkpoint
+so a resume keeps it), and, once evaluations exist, held-out mAP, gold
+pointing, "blanked object still called", the two context gaps and
+exclusive-tag violations at every epoch and snapshot evaluation (see
+`--snapshot-evaluation-steps` below), each with its latest change. With output
+redirected it prints a one-line summary every 5 minutes.
 
 `--validation-max-images` caps how many held-out images that uses
 (default 0 = all). To measure any existing checkpoint the same way, and
@@ -632,7 +661,18 @@ images:
 
 With `--gold <gold.json>`, it also scores against hand-checked boxes:
 pointing accuracy, heatmap energy inside the boxes, and box
-precision/recall/count error. `--embeddings-cache <file>` saves held-out
+precision/recall/count error. It also runs an **occlusion** check: blank a
+found tag's gold boxes and see whether the classifier still calls it,
+against a control that blanks the same sizes elsewhere.
+
+Two more checks of whether tags are found from the object or from context
+go into `evaluation_report.json` and are printed by `evaluate`:
+- **Context reliance:** each held-out image's prior for a tag is the highest
+  P(tag | its character/artist/series) in training. Recall and
+  false-positive rate are compared across prior bands; gaps near 0 mean the
+  object is what's seen.
+- **Exclusive violations:** which mutually exclusive pairs fired together,
+  and which side the image actually carries. `--embeddings-cache <file>` saves held-out
 embeddings so re-evaluating the same checkpoint skips the slow embedding
 pass.
 
@@ -779,6 +819,13 @@ The final epoch waits for its evaluation. Each `history/epoch-N/` also keeps
 `evaluation.log` and `evaluation.done`/`.failed`/`.applied` markers. A restarted trainer
 applies a finished evaluation it hadn't applied yet, and reruns one that never finished.
 
+`--snapshot-evaluation-steps N` (default 0 = epoch ends only; needs `--evaluation-command`)
+also snapshots the model every N global steps and runs the same command on it in the
+background, for the status panel's trend charts. Reports go to `snapshots/step-N/`, and the
+snapshot's weights are deleted once it's evaluated. They never affect early stopping. On a
+resume, finished ones are reloaded onto the charts, unfinished ones restart, and ones past
+the resumed step are deleted.
+
 ### Checkpoint directory contents
 
 ```
@@ -793,6 +840,9 @@ checkpoint/
   exclusive_tags.txt     # mutually exclusive tag groups training used (copied into the model bundle)
   tag_thresholds.json    # per-tag calibrated thresholds from the latest evaluation (copied into the model bundle)
   evaluation_report.json # latest held-out per-tag report, worst tags first
+  loss_history.json      # loss means for the status panel's chart, reloaded on resume
+  history/epoch-N/       # each epoch's reports (and, with --evaluation-command, its snapshot and markers)
+  snapshots/step-N/      # --snapshot-evaluation-steps reports
 ```
 
 ## Model artifacts are not checked into git

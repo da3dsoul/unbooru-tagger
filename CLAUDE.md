@@ -207,6 +207,10 @@ built the corpus around:
   locations each see most of the image. Classification still pools the full map. Exported
   as an extra ONNX output (`localization_features`); older bundles still work. A 3,000-step
   A/B: gold pointing 27.0% → 29.0% (clean 29.7% → 33.9%), deletion win 75% → 82%.
+  `--localization-map local` (`ImageTower.LocalizationSkippedLaterals`, saved in `model_config.json`,
+  mirrored by the exporter) also leaves out the coarsest (stride-16) lateral, so a location sees
+  about 100px. Tried in run 3, not adopted: it fixed shoes/gloves pointing but lost glasses,
+  blush, hats and characters.
 - **Context negatives:** `TagStatistics` splits the old "implied" band. P(t|s) ≥
   `--missing-threshold` (0.9) is still a likely-missing label (weight 0). Between
   `--implied-threshold` (0.6) and that, s is a *context source* for t: a character who
@@ -215,6 +219,14 @@ built the corpus around:
   character's hatless images were ignored, so "this character, therefore hat" was free to
   learn. `evaluate` reports a per-tag context AP (positives vs. those images); hard/random
   negatives still leave the whole band out, so the early-stopping mAP stays comparable.
+- **Context negatives at full strength (`--context-negative-weight`, run 4 uses 3):** focal
+  damping left "this character, therefore gloves" nearly free, since a confident wrong "yes" on
+  a context negative cost almost nothing. With a weight, `PairWeightBuilder` trains every such
+  pair in a batch (not just the sampled ones) as full BCE at that weight. Localizable tags only:
+  on people counts it doubled 1girl + 2girls contradictions, since those are often just
+  untagged. Run 3 A/B, weight 3 vs. off (both with mosaics): "still called with the object blanked" 85.9% → 70.3%,
+  context recall/false-positive gaps 30.0/26.3 → 24.1/21.1 pts, mAP 0.750 → 0.745. Recall where
+  context makes a tag unlikely didn't rise: the gaps shrink by suppressing context-driven calls.
 - **Label completion from Danbooru implications:** the crawler's `export-implications`
   writes `tag_implications.json` (46,895 active rules; 6,625 with both tags in run 2's
   vocabulary, e.g. witch_hat → hat, red_hat → hat). Danbooru applies them to every post,
@@ -242,6 +254,14 @@ built the corpus around:
   images with a trusted tag are cropped, so its cost tracks how much the teacher is trusted.
 - **Background suppression (`--localization-background-weight`, off):** tested and not used;
   it shrank heatmaps but didn't move peaks.
+- **Mosaic localization training (`--mosaics-per-step`, `--mosaic-weight`; `Mosaic`):** each step,
+  canvases of four of the batch's images shrunk 2x into a 2x2 grid. Unlike a crop, a tile keeps
+  all its tags, so no label has to be learned from context. Each tile is its own localization
+  bag, with the other tiles' positive tags as negatives: "gloves are in that tile, not this
+  one", even on the character who usually wears them. Run 3 A/B at 6,000 steps: gold pointing
+  33.1% → 35.7% (small 6.6 → 7.8, medium 16.1 → 20.5), mAP flat, +28% step time for 2 mosaics.
+  It trains only the localization map, so the context gaps didn't move; that took full-strength
+  context negatives. Run 4 uses both.
 - **Intel GPU / XPU training (run 3):** `-p:TorchBackend=xpu` builds against the `torch 2.10.0+xpu`
   wheel's libtorch with stock TorchSharp. The device is `(DeviceType)12`, since TorchSharp's enum has no XPU.
   `OneDnnPrecision` turns on oneDNN TF32 by calling libtorch's exported `at::Context` members, because
@@ -253,9 +273,30 @@ built the corpus around:
   continues. Results are applied in epoch order at the next checkpoint save, and marker files make
   that survive restarts. `evaluate` now reads the validation seed from a progress-only snapshot
   (`TrainingState.HasProgress`); it used to need `optimizer.dat` too and fall back to seed 0.
+- **Snapshot evaluations and trend charts (`--snapshot-evaluation-steps`):** with `--evaluation-command`, the
+  trainer also snapshots the model every N global steps and runs the same command on it in the background
+  (`SnapshotEvaluations`, reports in `snapshots/step-N/`, weights deleted once evaluated). They never feed early
+  stopping. The dashboard charts mAP, gold pointing, occlusion, the context gaps and exclusive violations over
+  every epoch and snapshot evaluation (`BrailleChart`), and the loss over the whole run (`LossHistory`, saved
+  with each checkpoint). All of it is read back from disk on resume and cut back to the resumed step.
 - **Per-epoch gold scoring (`train --gold`):** each epoch evaluation also scores the gold set
   and the crop teacher (`localization_report.json`); every epoch's reports are archived
   under `history/epoch-N/`.
+- **Object or context? (every epoch evaluation):** two checks of whether a tag is found from the
+  object or from who is in the image and who drew it.
+  - *Occlusion* (gold, `LocalizationReport.Occlusion`): blank a found tag's boxes, keep everything
+    else, and see whether the classifier still calls it; a control blanks the same sizes elsewhere.
+  - *Context reliance* (held-out, `EvaluationReport.ContextReliance`): each image's prior for a
+    tag is the highest P(tag | its character/artist/series) in training. Recall and false-positive
+    rate are compared across prior bands. Gaps near 0 mean the object is what's seen.
+
+  These replace per-tag context AP for this purpose: on a 20K sample that has a median of 2
+  context negatives per tag, so its chance level is about 0.98. `CropTeacherGate` still uses it.
+  Run 3 epoch 1 → 2: recall gap +20.8 → +29.4 pts, still called with the object blanked 87% →
+  83%, while mAP and gold pointing rose. `evaluate` prints both, plus
+  `EvaluationReport.ExclusiveViolations` (which exclusive pairs fire together, and which side is
+  true). That breakdown showed `solo, no_humans` was a wrong default rule (a lone creature or
+  robot is tagged both), so `ExclusiveTagGroups.DefaultText` no longer has it.
 
 ## Localization — implemented: heatmap, and (beyond the original scope) approximate boxes
 - **Heatmap** (`TagScorer.Heatmap`; `unbooru-tagger-inference heatmap`
