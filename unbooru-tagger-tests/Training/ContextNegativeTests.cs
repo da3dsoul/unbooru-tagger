@@ -75,6 +75,29 @@ public class ContextNegativeTests
     }
 
     [Fact]
+    public void Weights_WithAContextNegativeWeight_TrainEveryContextNegativeAtFullStrength()
+    {
+        var builder = new PairWeightBuilder(Statistics(), ExclusiveTagGroups.Empty, contextNegativeWeight: 2f);
+        // Her without the hat (not sampled as anyone's context negative), her with it, and someone else.
+        using var targets = builder.Build([[0, 2], [0, 1, 2], [3]]);
+        var (labels, weights, focal) = (targets.Labels.data<float>().ToArray(), targets.Weights.data<float>().ToArray(), targets.FocalMask.data<float>().ToArray());
+        Assert.Equal((-1f, 2f, 0f), (labels[1], weights[1], focal[1]));   // hatless her: a full-strength "no"
+        Assert.Equal((1f, 1f, 0f), (labels[5], weights[5], focal[5]));    // her with the hat: still a positive
+        Assert.Equal((-1f, 1f, 1f), (labels[9], weights[9], focal[9]));   // no context: an unverified "no"
+        using var hairless = builder.Build([[0]]);
+        Assert.Equal(0f, hairless.Weights.data<float>().ToArray()[2]);    // her without her hair color: still likely missing
+    }
+
+    [Fact]
+    public void Weights_LeaveContextNegativesOfIneligibleTagsUnverified()
+    {
+        // Hat treated as a whole-image tag (like 1girl): its context negatives stay focal-damped.
+        var builder = new PairWeightBuilder(Statistics(), ExclusiveTagGroups.Empty, contextNegativeWeight: 2f, contextNegativeTags: [true, false, true, true]);
+        using var targets = builder.Build([[0, 2]]);
+        Assert.Equal((-1f, 1f, 1f), (targets.Labels.data<float>().ToArray()[1], targets.Weights.data<float>().ToArray()[1], targets.FocalMask.data<float>().ToArray()[1]));
+    }
+
+    [Fact]
     public void Evaluate_ContextAp_CatchesAClassifierThatAnswersFromContext()
     {
         // The hat score follows the character, not the hat: hatless images of her score as

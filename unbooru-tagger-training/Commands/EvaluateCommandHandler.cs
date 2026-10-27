@@ -46,7 +46,7 @@ public static class EvaluateCommandHandler
             AnsiConsole.MarkupLineInterpolated($"{unmatched} dataset tags aren't in the checkpoint's vocabulary and are ignored.");
 
         var seed = 0;
-        if (TrainingState.Exists(checkpointDir))
+        if (TrainingState.HasProgress(checkpointDir))
             seed = TrainingState.LoadProgress(checkpointDir).ValidationSplitSeed;
         else
             AnsiConsole.MarkupLine("[yellow]No training_progress.json -- can't reconstruct this run's validation split; using seed 0, which may overlap its training images.[/]");
@@ -147,6 +147,25 @@ public static class EvaluateCommandHandler
 
             foreach (var t in localization.Teacher ?? [])
                 AnsiConsole.MarkupLine(DescribeTeacher(t));
+            foreach (var o in localization.Occlusion ?? [])
+                AnsiConsole.MarkupLine(DescribeOcclusion(o));
+        }
+        if (report!.ContextReliance is { } context)
+        {
+            var table = new Table().Title("Context reliance: whole-image calls by how often the image's characters/artists/series have the tag in training")
+                .AddColumns("context prior", "positives", "recall", "negatives", "false positives");
+            foreach (var b in context.Bands)
+                table.AddRow(Markup.Escape(b.Name), b.Positives.ToString("N0"), b.Recall.ToString("P1"), b.Negatives.ToString("N0"), b.FalsePositiveRate.ToString("P2"));
+            AnsiConsole.Write(table);
+        }
+        if (report!.ExclusiveViolations is { Count: > 0 } violations)
+        {
+            var table = new Table().Title($"Exclusive violations: {report.ExclusiveViolationRate:P2} of images call two mutually exclusive tags")
+                .AddColumns("pair", "images", "first true", "second true", "neither");
+            foreach (var v in violations.Take(worstTagsToShow))
+                table.AddRow(Markup.Escape($"{v.First} + {v.Second}"), v.Images.ToString("N0"), v.FirstTrue.ToString("N0"), v.SecondTrue.ToString("N0"),
+                    (v.Images - v.FirstTrue - v.SecondTrue).ToString("N0"));
+            AnsiConsole.Write(table);
         }
         PrintTags($"Worst {worstTagsToShow} tags by AP", report!.Tags.Take(worstTagsToShow));
         PrintTags($"Most-confused {worstTagsToShow} tags by hard-negative AP",
@@ -201,6 +220,11 @@ public static class EvaluateCommandHandler
             $"crop teacher ({t.Name}): {t.IncludePairs} include / {t.ExcludePairs} exclude crops | full-image yes {t.FullImageYesRate:P1} | " +
             $"include-crop yes {t.IncludeYesRate:P1}, exclude-crop no {t.ExcludeNoRate:P1}, balanced {t.BalancedAccuracy:P1} | " +
             $"confident (p>0.9 or <0.1) {t.ConfidentCoverage:P1} of answers, {t.ConfidentAccuracy:P1} right");
+
+    internal static string DescribeOcclusion(OcclusionResult o) =>
+        Markup.Escape(
+            $"occlusion ({o.Name}, {o.Pairs} found pairs): still called with the object blanked {o.StillYesRate:P1} | " +
+            $"confidence drop: object {o.ObjectDrop:F3}, same area elsewhere {o.ControlDrop:F3} | object hurts more {o.WinRate:P1}");
 
     internal static string DescribeGold(GoldResult g) =>
         Markup.Escape(

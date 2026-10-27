@@ -77,6 +77,8 @@ is no Python code in this repo).
   12.8 runtime, just needs a compatible driver) only on Linux. On Windows
   (and any other non-Linux OS) it falls back to `TorchSharp-cpu`, so
   training on Windows is CPU-only.
+- Or **an Intel Arc GPU** (XPU, tested on an Arc Pro B70): build with
+  `-p:TorchBackend=xpu` (see [Training on an Intel GPU](#training-on-an-intel-gpu-xpu)).
 - To run inference on an NVIDIA GPU: a CUDA 12 runtime and cuDNN 9 that
   ONNX Runtime can load. The core references `Microsoft.ML.OnnxRuntime.Gpu`
   1.24.2, the newest build against CUDA 12, which also contains the CPU
@@ -621,10 +623,26 @@ trained as unverified negatives and drawn per anchor tag
 (`--context-negatives-per-anchor`, default 1); at 90% and above an absence is
 still treated as a missing label. `evaluate` reports a per-tag context AP.
 
+`--context-negative-weight` (default 0 = off) trains every such pair in a batch,
+not just the sampled ones, as a full-strength negative with this weight instead
+of a damped one, so "this character, therefore gloves" is no longer nearly free.
+It applies to localizable tags only: whole-image tags like `1girl` are often just
+untagged.
+
 **Localization options.**
 - `--localization-map fused` trains localization (and draws heatmaps) on the
   fused high-resolution laterals only, without the last stage. Needs
-  `--fused-stages > 0`; can be switched on when resuming.
+  `--fused-stages > 0`; can be switched on when resuming. `local` also leaves
+  out the coarsest (stride-16) lateral, so each location sees about 100px
+  (needs `--fused-stages >= 2`); `full` is the whole map classification pools.
+  Omitted, a resume keeps the checkpoint's setting (a fresh run uses `full`).
+- `--mosaics-per-step` (default 0 = off): each step, this many canvases of four
+  of the batch's images, each shrunk 2x into one tile of a 2x2 grid. Every tile
+  keeps all its tags, and its tags are negatives in the other tiles, so the
+  localization loss learns each tag in its own tile. Costs a forward/backward
+  pass per mosaic (2 mosaics: about +28% step time). Needs deliberate targets,
+  `--localization-weight > 0` and at least 4 images per batch.
+  `--mosaic-weight` (default 1) scales it relative to `--localization-weight`.
 - `--crop-consistency-weight` (default 0): the classifier's answer on a random
   crop teaches the localization map where a tag is. Gated to tags with held-out
   AP ≥ `--crop-teacher-min-ap` (0.8), ≥ `--crop-teacher-min-positives` (20) and
@@ -638,9 +656,14 @@ still treated as a missing label. `evaluate` reports a per-tag context AP.
 
 **Status panel.** In a terminal, `train` shows a full-width panel: phase,
 epoch and whole-run progress with time left and finish times, speed, loss
-(this step, a 1,000-step mean and a trend sparkline), learning rate,
-checkpoints, the last evaluation and recent events. With output redirected it
-prints a one-line summary every 5 minutes.
+(this step and a 1,000-step mean), learning rate, checkpoints, the last
+evaluation and recent events. Below that are line charts: the loss over the
+whole run (2,000-step means, saved to `loss_history.json` with each checkpoint
+so a resume keeps it), and, once evaluations exist, held-out mAP, gold
+pointing, "blanked object still called", the two context gaps and
+exclusive-tag violations at every epoch and snapshot evaluation (see
+`--snapshot-evaluation-steps` below), each with its latest change. With output
+redirected it prints a one-line summary every 5 minutes.
 
 `--validation-max-images` caps how many held-out images that uses
 (default 0 = all). To measure any existing checkpoint the same way, and
@@ -665,7 +688,18 @@ images:
 
 With `--gold <gold.json>`, it also scores against hand-checked boxes:
 pointing accuracy, heatmap energy inside the boxes, and box
-precision/recall/count error. `--embeddings-cache <file>` saves held-out
+precision/recall/count error. It also runs an **occlusion** check: blank a
+found tag's gold boxes and see whether the classifier still calls it,
+against a control that blanks the same sizes elsewhere.
+
+Two more checks of whether tags are found from the object or from context
+go into `evaluation_report.json` and are printed by `evaluate`:
+- **Context reliance:** each held-out image's prior for a tag is the highest
+  P(tag | its character/artist/series) in training. Recall and
+  false-positive rate are compared across prior bands; gaps near 0 mean the
+  object is what's seen.
+- **Exclusive violations:** which mutually exclusive pairs fired together,
+  and which side the image actually carries. `--embeddings-cache <file>` saves held-out
 embeddings so re-evaluating the same checkpoint skips the slow embedding
 pass.
 
@@ -764,6 +798,61 @@ bundle. With them, inference uses each tag's calibrated threshold unless
 `--threshold` is passed explicitly, and drops the weaker of any two
 mutually exclusive tags.
 
+### Training on an Intel GPU (XPU)
+
+The stock `TorchSharp` package runs on Intel Arc GPUs against the libtorch shipped in PyTorch's
+`torch==2.10.0+xpu` pip wheel. 2.10.0 is the libtorch TorchSharp 0.107.0 is built against, and
+the C++ ABI matches, so no native rebuild is needed.
+
+1. Download that wheel and its Intel runtime dependencies from
+   `https://download.pytorch.org/whl/xpu`, unzip them, and copy every
+   `torch/lib/*.so*` and `*.data/data/lib/*.so*` into one folder. No oneAPI install is needed;
+   the system needs the `xe` driver, `libze-intel-gpu1` and `libze1`.
+2. Build with `dotnet build unbooru-tagger-training -c Release -p:TorchBackend=xpu`. This
+   references `TorchSharp` alone, with no bundled libtorch.
+3. Run with that folder on `LD_LIBRARY_PATH`, and with these variables set, so the Intel
+   runtime can't silently migrate allocations that don't fit in VRAM into host RAM. Without
+   them, over-allocating thrashes over PCIe instead of failing:
+   ```sh
+   export NEOReadDebugKeys=1 EnableSharedSystemUsmSupport=0 EnableImplicitMigrationOnFaultableHardware=0
+   ```
+
+`DeviceSelector` picks CUDA, then XPU, then CPU. On XPU it enables oneDNN's TF32 mode for
+convolutions (`OneDnnPrecision`), matching cuDNN's default on CUDA. That took the ConvNeXt-T
+tower from 203 to 138 ms/step. An XPU out-of-memory aborts the process rather than throwing a
+.NET exception, so you resume from the last checkpoint.
+
+### Offloading epoch evaluation (`--evaluation-command`)
+
+`train --evaluation-command <exe>` runs each epoch's evaluation in another process instead
+of inline, so training keeps going. A typical use is `evaluate` on a second GPU; it has to be
+a separate process because a CUDA and an XPU libtorch can't share one. At each epoch end the
+trainer writes a model-only snapshot to `history/epoch-N/checkpoint/` and starts
+`<exe> <snapshot dir> <history/epoch-N>`. The command must write the reports there and exit 0:
+
+```sh
+#!/usr/bin/env bash
+exec dotnet unbooru-tagger-training.dll evaluate --checkpoint-dir "$1" --out-dir "$2" \
+  --cache-dir ./dataset --max-images 20000 --localization-samples 0 --gold gold.json
+```
+
+`--max-images` and `--validation-fraction` must match the training run's
+`--validation-max-images`/`--validation-fraction`.
+
+Results are applied in epoch order at the next checkpoint save: early stopping, plus the
+top-level `evaluation_report.json`/`tag_thresholds.json` copies that `export-onnx` reads. That
+makes early stopping lag by up to an epoch. The best epoch's weights stay in its snapshot.
+The final epoch waits for its evaluation. Each `history/epoch-N/` also keeps
+`evaluation.log` and `evaluation.done`/`.failed`/`.applied` markers. A restarted trainer
+applies a finished evaluation it hadn't applied yet, and reruns one that never finished.
+
+`--snapshot-evaluation-steps N` (default 0 = epoch ends only; needs `--evaluation-command`)
+also snapshots the model every N global steps and runs the same command on it in the
+background, for the status panel's trend charts. Reports go to `snapshots/step-N/`, and the
+snapshot's weights are deleted once it's evaluated. They never affect early stopping. On a
+resume, finished ones are reloaded onto the charts, unfinished ones restart, and ones past
+the resumed step are deleted.
+
 ### Checkpoint directory contents
 
 ```
@@ -778,6 +867,9 @@ checkpoint/
   exclusive_tags.txt     # mutually exclusive tag groups training used (copied into the model bundle)
   tag_thresholds.json    # per-tag calibrated thresholds from the latest evaluation (copied into the model bundle)
   evaluation_report.json # latest held-out per-tag report, worst tags first
+  loss_history.json      # loss means for the status panel's chart, reloaded on resume
+  history/epoch-N/       # each epoch's reports (and, with --evaluation-command, its snapshot and markers)
+  snapshots/step-N/      # --snapshot-evaluation-steps reports
 ```
 
 ## Model artifacts are not checked into git

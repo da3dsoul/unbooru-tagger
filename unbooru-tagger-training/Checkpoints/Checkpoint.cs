@@ -58,6 +58,7 @@ public static class Checkpoint
         {
             LocalizationFromFusedOnly = config.LocalizationFromFusedOnly
         };
+        imageTower.LocalizationSkippedLaterals = config.LocalizationSkippedLaterals;
         imageTower.load(Path.Combine(directory, ImageTowerFileName));
 
         var vocabulary = TagVocabulary.Load(Path.Combine(directory, VocabularyFileName));

@@ -15,21 +15,27 @@ namespace UnbooruTagger.Training.Commands;
 /// <param name="ImpliedThreshold">P(t|s) at or above which t is "usually implied" by s. Between this and <paramref name="MissingThreshold"/>, s is a context source for t (TagStatistics.ContextSources): an image with s but not t is an unverified negative and is sampled for t as a context negative.</param>
 /// <param name="MissingThreshold">P(t|s) at or above which an image with s but not t is a likely-missing label (weight 0) rather than a negative.</param>
 /// <param name="ContextNegativesPerAnchor">Context negatives drawn per anchor tag (for tags that have context sources).</param>
+/// <param name="ContextNegativeWeight">Train context negatives (an image with one of a tag's context sources but not the tag) at full strength with this weight instead of as focal-damped unverified negatives (PairWeightBuilder). Localizable tags only. 0 = unverified, as before.</param>
 /// <param name="ExclusiveTagsPath">Mutually-exclusive tag groups file; null uses the checkpoint's saved copy, else the built-in defaults.</param>
 /// <param name="LocalizationMinedNegatives">Deliberate targets: per image, how many of the highest-scoring wrong (localizable) tags the per-location loss also trains on, besides positives and certain negatives.</param>
 /// <param name="LocalizationBackgroundWeight">Weight of the background-suppression term (SigmoidContrastiveLoss.ComputeLocalizedPairs): each positive tag's least tag-like locations must not score as the tag. 0 = off.</param>
 /// <param name="LocalizationBackgroundFraction">Fraction of an image's locations, lowest-scoring first, treated as background for that tag.</param>
 /// <param name="LocalizationFromFusedOnly">Train localization (and draw heatmaps) on the fused laterals only, without the last stage (ImageTower.LocalizationFromFusedOnly). Null keeps the checkpoint's setting.</param>
+/// <param name="LocalizationSkippedLaterals">With a fused-only map, how many of the coarsest laterals it leaves out (ImageTower.LocalizationSkippedLaterals; 1 = <c>--localization-map local</c>). Null keeps the checkpoint's setting.</param>
 /// <param name="CropConsistencyWeight">Weight of the crop-consistency loss (SigmoidContrastiveLoss.ComputeWindowConsistency): the classifier's verdict on a random crop teaches the localization map where each tag is. Costs an extra no-gradient forward pass per step. 0 = off.</param>
 /// <param name="CropTeacherMinAveragePrecision">Crop consistency only trains tags whose held-out AP in the latest epoch evaluation is at least this (CropTeacherGate), so it waits for the classifier to be a trustworthy teacher, and the trusted set grows as training improves it.</param>
 /// <param name="CropTeacherMinPositives">...and at least this many held-out positives, so a rare tag's noisy AP can't qualify it.</param>
 /// <param name="CropTeacherConfidence">Crop consistency only trains on teacher answers with p above this or below 1 minus it.</param>
+/// <param name="MosaicsPerStep">Mosaics built per step from the batch's own images (Mosaic): four at half size per canvas, each tile a localization bag with the other tiles' tags as negatives. Costs a forward/backward pass per mosaic. 0 = off.</param>
+/// <param name="MosaicWeight">Mosaic loss weight, relative to the localization weight.</param>
 /// <param name="GoldPath">Hand-checked gold.json: scored (localization + crop teacher, LocalizationEvaluator) at every epoch evaluation and written to localization_report.json. Null = skip.</param>
 /// <param name="MaxSteps">Stop after this many steps in this process, saving a checkpoint (for short comparison runs). 0 = no limit.</param>
 /// <param name="LocalizableTagsPath">Rules for which tags have a region to localize (see <c>TagLocalizability</c>); null uses the checkpoint's saved copy, else the built-in defaults.</param>
 /// <param name="CompactVocabulary">Fresh runs only: drop vocabulary rows no image carries.</param>
 /// <param name="CosineSchedule">Linear warmup over <paramref name="WarmupSteps"/>, then cosine decay of the learning rate across the run (see LearningRateSchedule). Off = constant rate.</param>
 /// <param name="Ratings">Learn content ratings from the dataset's ratings.bin, if present, as three cumulative labels.</param>
+/// <param name="EvaluationCommand">Run each epoch's evaluation as <c>&lt;command&gt; &lt;snapshot dir&gt; &lt;report dir&gt;</c> in the background instead of inline, e.g. `evaluate` on another GPU (see OffloadedEvaluations). Null = inline.</param>
+/// <param name="SnapshotEvaluationSteps">With <paramref name="EvaluationCommand"/>: also snapshot and evaluate the model every this many steps (counted over the whole run), alongside training, for the dashboard's trend charts (see SnapshotEvaluations). Doesn't affect early stopping. 0 = epochs only.</param>
 /// <param name="ValidationMaxImages">Cap on held-out images evaluated per epoch (a fixed prefix of the split, so it's the same images every epoch). 0 = the whole split.</param>
 /// <summary>Image tower shape for a fresh run (ignored on resume, where the checkpoint's config wins).</summary>
 /// <param name="FusedStages">Earlier stages fused into the spatial map (ImageTower.FusedStages): each one halves the heatmap stride.</param>
@@ -50,6 +56,7 @@ public sealed record TrainingTargetOptions(
     double ImpliedThreshold = 0.6,
     double MissingThreshold = 0.9,
     int ContextNegativesPerAnchor = 1,
+    float ContextNegativeWeight = 0f,
     string? ExclusiveTagsPath = null,
     int ValidationMaxImages = 0,
     bool Ratings = true,
@@ -62,11 +69,16 @@ public sealed record TrainingTargetOptions(
     double CropTeacherMinAveragePrecision = 0.8,
     float CropTeacherConfidence = 0.9f,
     int CropTeacherMinPositives = 20,
+    int MosaicsPerStep = 0,
+    float MosaicWeight = 1f,
     bool? LocalizationFromFusedOnly = null,
+    int? LocalizationSkippedLaterals = null,
     string? LocalizableTagsPath = null,
     bool CompactVocabulary = true,
     bool CosineSchedule = false,
-    int WarmupSteps = 0)
+    int WarmupSteps = 0,
+    string? EvaluationCommand = null,
+    int SnapshotEvaluationSteps = 0)
 {
     public static TrainingTargetOptions Default { get; } = new();
 

@@ -37,6 +37,14 @@ public sealed record PairTargets(Tensor Labels, Tensor Weights, Tensor FocalMask
 /// <item><b>Likely missing</b>: the tag is usually implied by one the image does carry
 /// (<see cref="TagStatistics.ImpliedBy"/>). Weight 0 — don't punish the model for
 /// predicting a tag the tagger probably forgot.</item>
+/// <item><b>Context negative</b> (only with <c>contextNegativeWeight</c> &gt; 0): the image
+/// carries one of the tag's <see cref="TagStatistics.ContextSources"/> (a character who usually
+/// wears a hat) but not the tag, and it isn't likely missing. Full-strength,
+/// <c>contextNegativeWeight</c>: the focal damping let "this character, therefore hat" stand,
+/// since a confident wrong "yes" there was nearly free. Off, these stay unverified negatives.
+/// Only for <c>contextNegativeTags</c> (training passes the localizable ones): whole-image tags
+/// like 1girl/2girls are often just untagged, and promoting their context negatives doubled
+/// the held-out people-count contradictions (1girl + 2girls both called) in the A/B.</item>
 /// <item><b>Exclusive</b>: the tag is mutually exclusive with one the image carries
 /// (<see cref="ExclusiveTagGroups"/>). A verified absence: full-strength, <c>certainNegativeWeight</c>.</item>
 /// <item><b>Exhaustively labeled</b>: <c>exhaustiveRows</c> (the cumulative rating labels)
@@ -57,7 +65,9 @@ public sealed class PairWeightBuilder(
     TagStatistics statistics,
     ExclusiveTagGroups exclusiveGroups,
     float certainNegativeWeight = 1f,
-    IReadOnlyList<int>? exhaustiveRows = null)
+    IReadOnlyList<int>? exhaustiveRows = null,
+    float contextNegativeWeight = 0f,
+    IReadOnlyList<bool>? contextNegativeTags = null)
 {
     public int VocabularySize => statistics.VocabularySize;
 
@@ -65,6 +75,19 @@ public sealed class PairWeightBuilder(
     private readonly int[] _siteRestricted = statistics.TagSites is { } tagSites
         ? Enumerable.Range(0, tagSites.Count).Where(t => tagSites[t] != (BooruSites.Danbooru | BooruSites.Gelbooru)).ToArray()
         : [];
+
+    /// <summary>For a source tag s, the tags it is a context source for (the inverse of <see cref="TagStatistics.ContextSources"/>).</summary>
+    private readonly int[][] _contextTargets = contextNegativeWeight > 0 ? InvertContextSources(statistics, contextNegativeTags) : [];
+
+    private static int[][] InvertContextSources(TagStatistics statistics, IReadOnlyList<bool>? eligible)
+    {
+        var targets = Enumerable.Range(0, statistics.VocabularySize).Select(_ => new List<int>()).ToArray();
+        for (var t = 0; t < statistics.ContextSources.Length; t++)
+            if (eligible is null || (t < eligible.Count && eligible[t]))
+                foreach (var s in statistics.ContextSources[t])
+                targets[s].Add(t);
+        return targets.Select(l => l.ToArray()).ToArray();
+    }
 
     /// <param name="imageTagRows">Each batch image's tags.</param>
     /// <param name="sampled">Optional per-image sampling info, same order as <paramref name="imageTagRows"/> — only used to mark anchor hard negatives.</param>
@@ -96,6 +119,19 @@ public sealed class PairWeightBuilder(
                 foreach (var t in statistics.ImpliedBy[s])
                     weights[offset + t] = 0f;
             }
+
+            if (_contextTargets.Length > 0)
+                foreach (var s in tags)
+                {
+                    if ((uint)s >= (uint)vocabularySize)
+                        continue;
+                    foreach (var t in _contextTargets[s])
+                        if (weights[offset + t] > 0)
+                        {
+                            weights[offset + t] = contextNegativeWeight;
+                            focal[offset + t] = 0f;
+                        }
+                }
 
             foreach (var s in tags)
             {

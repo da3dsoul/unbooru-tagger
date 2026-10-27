@@ -37,6 +37,16 @@ public class ExclusiveTagGroupsTests
     }
 
     [Fact]
+    public void Defaults_AllowALoneCreatureToBeSoloWithNoHumans()
+    {
+        var vocabulary = Vocabulary("solo", "no humans", "1girl");
+        var groups = ExclusiveTagGroups.Parse(ExclusiveTagGroups.DefaultText, vocabulary);
+
+        Assert.DoesNotContain(1, groups.ExcludedBy(0));
+        Assert.Contains(2, groups.ExcludedBy(1));
+    }
+
+    [Fact]
     public void Parse_SkipsCommentsAndUnknownTags()
     {
         var vocabulary = Vocabulary("a", "b");

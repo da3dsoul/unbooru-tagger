@@ -41,6 +41,8 @@ public sealed record GoldResult(string Name, int Pairs, int GoldInstances, doubl
 /// <param name="SoloSingleInstanceRate">On images tagged solo, the fraction where a once-per-person tag (blush, necktie, hat, ...) yields exactly one extracted box.</param>
 /// <param name="Teacher">Crop-teacher check on the gold set, overall and per stratum (<see cref="TeacherResult"/>); empty without a gold set.</param>
 /// <param name="TeacherTags">The same per tag.</param>
+/// <param name="Occlusion">Occlusion check on the gold set, overall, per stratum and per size bucket (<see cref="OcclusionResult"/>); empty without a gold set.</param>
+/// <param name="OcclusionTags">The same per tag.</param>
 /// <param name="Gold">Gold-set results overall ("all") and per stratum ("clean", "messy").</param>
 /// <param name="GoldTags">Gold-set results per tag, worst pointing first.</param>
 public sealed record LocalizationReport(
@@ -51,7 +53,23 @@ public sealed record LocalizationReport(
     int SoloPairs, double SoloSingleInstanceRate,
     IReadOnlyList<GoldResult> GoldTags,
     IReadOnlyList<TeacherResult>? Teacher = null,
-    IReadOnlyList<TeacherResult>? TeacherTags = null);
+    IReadOnlyList<TeacherResult>? TeacherTags = null,
+    IReadOnlyList<OcclusionResult>? Occlusion = null,
+    IReadOnlyList<OcclusionResult>? OcclusionTags = null);
+
+/// <summary>
+/// Does a whole-image call depend on the object itself? For each gold pair the classifier finds
+/// on the full image, the tag's boxes are blanked to the neutral padding value and the image is
+/// scored again, with everything else (the character, the artist's style, the rest of the outfit)
+/// still there. A control blanks rectangles of the same sizes elsewhere in the image, touching no
+/// box of the tag, so a drop from merely blanking something is subtracted out.
+/// </summary>
+/// <param name="Pairs">Pairs found on the full image (p &gt;= 0.5) that both blanks fit in.</param>
+/// <param name="StillYesRate">Fraction still called (p &gt;= 0.5) with the object blanked: answered from context. Lower is better.</param>
+/// <param name="ObjectDrop">Mean drop in confidence from blanking the object.</param>
+/// <param name="ControlDrop">Mean drop from blanking the same area elsewhere.</param>
+/// <param name="WinRate">Fraction of pairs where blanking the object dropped confidence more than the control (0.5 = the object doesn't matter).</param>
+public sealed record OcclusionResult(string Name, int Pairs, double StillYesRate, double ObjectDrop, double ControlDrop, double WinRate);
 
 /// <summary>
 /// How reliable the whole-image classifier is as a teacher for crop consistency
@@ -147,6 +165,7 @@ public sealed class LocalizationEvaluator(
 
         var (goldSummary, goldTags) = gold is { Count: > 0 } ? EvaluateGold(gold, rowOf) : ([], []);
         var (teacherSummary, teacherTags) = gold is { Count: > 0 } ? EvaluateTeacher(gold, rowOf, random) : ([], []);
+        var (occlusionSummary, occlusionTags) = gold is { Count: > 0 } ? EvaluateOcclusion(gold, rowOf, random) : ([], []);
 
         // The label-free checks cost thousands of extra forward passes; training's per-epoch
         // evaluation skips them and scores only the gold set (labelFreeChecks: false).
@@ -172,7 +191,8 @@ public sealed class LocalizationEvaluator(
             cropPairs, cropConsistency,
             soloPairs, soloSingle,
             goldTags,
-            teacherSummary, teacherTags);
+            teacherSummary, teacherTags,
+            occlusionSummary, occlusionTags);
     }
 
     /// <summary>Running totals for one tag or stratum.</summary>
@@ -303,6 +323,8 @@ public sealed class LocalizationEvaluator(
                     (perTag.TryGetValue(tag, out var tagTally) ? tagTally : perTag[tag] = new()).Add(score);
                     perStratum["all"].Add(score);
                     (perStratum.TryGetValue(image.Stratum, out var stratumTally) ? stratumTally : perStratum[image.Stratum] = new()).Add(score);
+                    var size = SizeBucket(tag, instances);
+                    (perStratum.TryGetValue(size, out var sizeTally) ? sizeTally : perStratum[size] = new()).Add(score);
                 }
             }
         }
@@ -310,6 +332,19 @@ public sealed class LocalizationEvaluator(
         return (
             perStratum.Select(kv => kv.Value.ToResult(kv.Key)).OrderBy(r => r.Name == "all" ? 0 : 1).ThenBy(r => r.Name).ToList(),
             perTag.Select(kv => kv.Value.ToResult(kv.Key)).OrderBy(r => r.PointingAccuracy).ToList());
+    }
+
+    /// <summary>
+    /// Size bucket of one (image, tag) pair, by its largest certain or group box (sqrt of area, in
+    /// the 512px input): the same tag can be 10px in a full-body shot and fill a close-up, and a
+    /// localization map has to handle both. Characters get their own bucket.
+    /// </summary>
+    public static string SizeBucket(string tag, IReadOnlyList<GoldInstance> instances)
+    {
+        if (tag.StartsWith("character:", StringComparison.Ordinal))
+            return "size: characters";
+        var largest = instances.Where(x => x.Kind != GoldKind.Ignore).Select(x => Math.Sqrt((double)x.Box[2] * x.Box[3])).DefaultIfEmpty(0).Max();
+        return largest < 32 ? "size: small <32px" : largest < 96 ? "size: medium 32-96px" : "size: large >=96px";
     }
 
     private sealed class TeacherTally
@@ -429,6 +464,154 @@ public sealed class LocalizationEvaluator(
             yield return perStratum["all"];
             yield return perStratum.TryGetValue(stratum, out var s) ? s : perStratum[stratum] = new();
         }
+    }
+
+    private sealed class OcclusionTally
+    {
+        public int Pairs, StillYes, Wins;
+        public double ObjectDrop, ControlDrop;
+
+        public void Add(float full, float occluded, float control)
+        {
+            Pairs++;
+            if (occluded >= 0.5f) StillYes++;
+            ObjectDrop += full - occluded;
+            ControlDrop += full - control;
+            if (control > occluded) Wins++;
+        }
+
+        public OcclusionResult ToResult(string name) => Pairs == 0
+            ? new(name, 0, double.NaN, double.NaN, double.NaN, double.NaN)
+            : new(name, Pairs, (double)StillYes / Pairs, ObjectDrop / Pairs, ControlDrop / Pairs, (double)Wins / Pairs);
+    }
+
+    /// <summary>Margin (input pixels) added around each blanked gold box, so its edges and the outline around it go too.</summary>
+    public const int OcclusionMargin = 4;
+
+    private (List<OcclusionResult> Summary, List<OcclusionResult> Tags) EvaluateOcclusion(
+        IReadOnlyList<GoldImage> gold, IReadOnlyDictionary<string, int> rowOf, Random random)
+    {
+        var perTag = new Dictionary<string, OcclusionTally>();
+        var perStratum = new Dictionary<string, OcclusionTally> { ["all"] = new() };
+        var floats = 3 * inputSize * inputSize;
+        foreach (var chunk in gold.Chunk(8))
+        {
+            using var scope = NewDisposeScope();
+            var (pixels, boxes) = Load(chunk.Select(g => g.CacheIndex).ToArray());
+            var (fullScore, _) = Forward(pixels);
+            var pixelArray = pixels.cpu().data<float>().ToArray();
+
+            // (image, tag, full-image confidence, object blank, control blank) for every pair to score.
+            var pairs = new List<(int Image, string Tag, float Full, List<int[]> Object, List<int[]> Control)>();
+            for (var i = 0; i < chunk.Length; i++)
+            {
+                var image = chunk[i];
+                var content = new[] { boxes[i].X, boxes[i].Y, boxes[i].Width, boxes[i].Height };
+                foreach (var tag in image.Targets.Where(t => !image.NotVisible.Contains(t) && rowOf.ContainsKey(t)).Distinct())
+                {
+                    var instances = image.Instances.Where(x => x.Tag == tag).ToList();
+                    if (!instances.Any(x => x.Kind != GoldKind.Ignore))
+                        continue;
+                    var full = fullScore(i, rowOf[tag]);
+                    if (full < 0.5f)
+                        continue;
+
+                    // Every box of the tag, ignore boxes too: whatever might be the object goes.
+                    var blank = instances.Select(x => Grow(ToCanvas(x.Box, boxes[i]), OcclusionMargin, content)).Where(b => b[2] > 0 && b[3] > 0).ToList();
+                    if (ControlRectangles(blank, content, random) is { } control)
+                        pairs.Add((i, tag, full, blank, control));
+                }
+            }
+
+            foreach (var batch in pairs.Chunk(4))
+            {
+                using var batchScope = NewDisposeScope();
+                var variants = new float[batch.Length * 2 * floats];
+                for (var k = 0; k < batch.Length; k++)
+                {
+                    var source = pixelArray.AsSpan(batch[k].Image * floats, floats);
+                    source.CopyTo(variants.AsSpan(2 * k * floats, floats));
+                    source.CopyTo(variants.AsSpan((2 * k + 1) * floats, floats));
+                    Blank(variants.AsSpan(2 * k * floats, floats), batch[k].Object, inputSize);
+                    Blank(variants.AsSpan((2 * k + 1) * floats, floats), batch[k].Control, inputSize);
+                }
+
+                var (score, _) = Forward(tensor(variants, [batch.Length * 2, 3, inputSize, inputSize]).to(device));
+                for (var k = 0; k < batch.Length; k++)
+                {
+                    var (imageIndex, tag, full, _, _) = batch[k];
+                    var occluded = score(2 * k, rowOf[tag]);
+                    var control = score(2 * k + 1, rowOf[tag]);
+                    var image = chunk[imageIndex];
+                    foreach (var key in new[] { image.Stratum, SizeBucket(tag, image.Instances.Where(x => x.Tag == tag).ToList()) })
+                        (perStratum.TryGetValue(key, out var t) ? t : perStratum[key] = new()).Add(full, occluded, control);
+                    perStratum["all"].Add(full, occluded, control);
+                    (perTag.TryGetValue(tag, out var tagTally) ? tagTally : perTag[tag] = new()).Add(full, occluded, control);
+                }
+            }
+        }
+
+        return (
+            perStratum.Select(kv => kv.Value.ToResult(kv.Key)).OrderBy(r => r.Name == "all" ? 0 : 1).ThenBy(r => r.Name).ToList(),
+            perTag.Select(kv => kv.Value.ToResult(kv.Key)).OrderByDescending(r => r.StillYesRate).ToList());
+    }
+
+    /// <summary><paramref name="box"/> grown by <paramref name="margin"/> on every side and clipped to <paramref name="content"/> (all [x, y, w, h] on the canvas).</summary>
+    public static int[] Grow(int[] box, int margin, int[] content)
+    {
+        var x0 = Math.Max(content[0], box[0] - margin);
+        var y0 = Math.Max(content[1], box[1] - margin);
+        var x1 = Math.Min(content[0] + content[2], box[0] + box[2] + margin);
+        var y1 = Math.Min(content[1] + content[3], box[1] + box[3] + margin);
+        return [x0, y0, Math.Max(0, x1 - x0), Math.Max(0, y1 - y0)];
+    }
+
+    /// <summary>
+    /// One rectangle the size of each of <paramref name="objects"/>, placed at random inside
+    /// <paramref name="content"/>, overlapping none of the objects nor each other; null if some
+    /// don't fit (an object filling most of the image has nowhere else to put its control).
+    /// </summary>
+    public static List<int[]>? ControlRectangles(IReadOnlyList<int[]> objects, int[] content, Random random, int attempts = 200)
+    {
+        var placed = new List<int[]>();
+        foreach (var size in objects.OrderByDescending(b => b[2] * b[3]))
+        {
+            if (size[2] > content[2] || size[3] > content[3])
+                return null;
+            int[]? spot = null;
+            for (var attempt = 0; attempt < attempts && spot is null; attempt++)
+            {
+                var candidate = new[]
+                {
+                    content[0] + random.Next(content[2] - size[2] + 1),
+                    content[1] + random.Next(content[3] - size[3] + 1),
+                    size[2], size[3],
+                };
+                if (!objects.Any(o => Overlaps(candidate, o)) && !placed.Any(p => Overlaps(candidate, p)))
+                    spot = candidate;
+            }
+
+            if (spot is null)
+                return null;
+            placed.Add(spot);
+        }
+
+        return placed;
+    }
+
+    /// <summary>Sets <paramref name="rectangles"/> (canvas [x, y, w, h]) of a [3, size, size] image to the normalized neutral padding value, 0.</summary>
+    public static void Blank(Span<float> image, IEnumerable<int[]> rectangles, int size)
+    {
+        var channel = size * size;
+        foreach (var r in rectangles)
+            for (var ch = 0; ch < 3; ch++)
+                for (var y = Math.Max(0, r[1]); y < Math.Min(size, r[1] + r[3]); y++)
+                {
+                    var start = Math.Max(0, r[0]);
+                    var end = Math.Min(size, r[0] + r[2]);
+                    if (end > start)
+                        image.Slice(ch * channel + y * size + start, end - start).Clear();
+                }
     }
 
     /// <summary>The content's cell range on a <paramref name="grid"/>-cell map: (first row, first column, rows, columns).</summary>

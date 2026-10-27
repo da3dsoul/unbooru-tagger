@@ -18,7 +18,11 @@ public sealed class ExclusiveTagGroups
 {
     public const string FileName = "exclusive_tags.txt";
 
-    /// <summary>The people-count and rating groups every booru agrees on — used when no file is given.</summary>
+    /// <summary>
+    /// The people-count and rating groups every booru agrees on — used when no file is given.
+    /// Not <c>no_humans, solo</c>: a lone creature or robot is tagged both (in run 3's 20K
+    /// held-out sample, at least 54 images carried both), so it trained true tags as certain negatives.
+    /// </summary>
     public const string DefaultText =
         """
         # One group per line; every pair of tags on a line is mutually exclusive.
@@ -30,7 +34,6 @@ public sealed class ExclusiveTagGroups
         1boy, multiple_boys
         solo, multiple_boys
         solo, 2boys, 3boys, 4boys, 5boys, 6+boys
-        no_humans, solo
         no_humans, 1girl
         no_humans, 1boy
         no_humans, multiple_girls

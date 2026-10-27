@@ -216,6 +216,11 @@ public static class TrainCommandHandler
             imageTower.LocalizationFromFusedOnly = fusedOnly;
             AnsiConsole.MarkupLineInterpolated($"Localization map: {(fusedOnly ? "fused laterals only" : "full spatial map")}.");
         }
+        if (targetOptions.LocalizationSkippedLaterals is { } skipped && skipped != imageTower.LocalizationSkippedLaterals)
+        {
+            imageTower.LocalizationSkippedLaterals = skipped;
+            AnsiConsole.MarkupLineInterpolated($"Localization map: leaving out the {skipped} coarsest fused lateral(s); {imageTower.FusedStages - skipped} kept.");
+        }
 
         exclusiveGroups = ExclusiveTagGroups.Parse(exclusiveGroups.SourceText, vocabulary);
         if (ratingRows is not null)
@@ -275,9 +280,7 @@ public static class TrainCommandHandler
                 contextNegativesPerAnchor: targetOptions.ContextNegativesPerAnchor)
             : null;
         AnsiConsole.MarkupLineInterpolated(
-            $"{statistics.ContextSources.Count(c => c.Length > 0)} tags have context sources (P(tag|source) in [[{targetOptions.ImpliedThreshold}, {targetOptions.MissingThreshold})); {targetOptions.ContextNegativesPerAnchor} context negative(s) per anchor.");
-        var pairWeightBuilder = new PairWeightBuilder(statistics, exclusiveGroups, targetOptions.CertainNegativeWeight,
-            exhaustiveRows: ratings is not null ? ratingRows : null);
+            $"{statistics.ContextSources.Count(c => c.Length > 0)} tags have context sources (P(tag|source) in [[{targetOptions.ImpliedThreshold}, {targetOptions.MissingThreshold})); {targetOptions.ContextNegativesPerAnchor} context negative(s) per anchor, trained {(targetOptions.ContextNegativeWeight > 0 ? $"at full strength, weight {targetOptions.ContextNegativeWeight}, for localizable tags" : "as unverified negatives")}.");
         AnsiConsole.MarkupLineInterpolated(
             $"{statistics.Positives.Count(p => p.Length > 0)} of {vocabulary.Records.Count} tags have training images; {(tagCentricSampler is not null ? $"{tagCentricSampler.AnchorTagCount} anchor tags" : "rare-tag image sampling")}.");
 
@@ -289,6 +292,9 @@ public static class TrainCommandHandler
         var localizability = TagLocalizability.Load(targetOptions.LocalizableTagsPath ?? Path.Combine(checkpointDir, TagLocalizability.FileName));
         localizability.Save(Path.Combine(checkpointDir, TagLocalizability.FileName));
         var localizable = vocabulary.Records.Select(r => localizability.IsLocalizable(r.Tag)).ToArray();
+        var pairWeightBuilder = new PairWeightBuilder(statistics, exclusiveGroups, targetOptions.CertainNegativeWeight,
+            exhaustiveRows: ratings is not null ? ratingRows : null, contextNegativeWeight: targetOptions.ContextNegativeWeight,
+            contextNegativeTags: localizable);
 
         // Crop consistency trains only tags the classifier is already good at (CropTeacherGate),
         // starting from the last epoch's evaluation and refreshed after every epoch.
@@ -299,6 +305,15 @@ public static class TrainCommandHandler
         if (targetOptions.CropConsistencyWeight > 0)
             AnsiConsole.MarkupLineInterpolated(
                 $"Crop consistency: {cropGate.TrustedCount} localizable tags trusted as teachers (held-out AP >= {targetOptions.CropTeacherMinAveragePrecision}, >= {targetOptions.CropTeacherMinPositives} positives){(cropGate.TrustedCount == 0 ? "; off until an epoch evaluation trusts some" : "")}; re-checked after every epoch.");
+        if (targetOptions.MosaicsPerStep > 0)
+        {
+            if (!targetOptions.DeliberateTargets || localizationWeight <= 0)
+                throw new ArgumentException("--mosaics-per-step trains the localization loss on deliberate targets; it needs --targets deliberate and --localization-weight > 0.");
+            if (batchSize < Mosaic.TilesPerMosaic)
+                throw new ArgumentException($"--mosaics-per-step needs at least {Mosaic.TilesPerMosaic} images per batch (--batch-size {batchSize}).");
+            AnsiConsole.MarkupLineInterpolated(
+                $"Mosaic: {Math.Min(targetOptions.MosaicsPerStep, batchSize / Mosaic.TilesPerMosaic)} canvas(es) of four half-size batch images per step, weight {targetOptions.MosaicWeight} x the localization weight.");
+        }
 
         var earlyStopping = new EarlyStopping(earlyStoppingPatience);
         // Only resume early-stopping history recorded against the same metric -- a best
@@ -346,16 +361,117 @@ public static class TrainCommandHandler
             ? new BatchPrefetcher(TrainingRequests(), readWindow, resolvedInputSize, prefetchWindowBatches, 2 * prefetchWindowBatches)
             : null;
 
+        // Global step the run resumes at; the loss history and snapshot evaluations are cut back to it.
+        var resumedGlobalStep = (long)startEpoch * stepsPerEpoch + resumedStepsInEpoch;
+        var snapshotEvery = targetOptions.EvaluationCommand is not null && validationIndices.Count > 0 ? Math.Max(0, targetOptions.SnapshotEvaluationSteps) : 0;
+        if (targetOptions.SnapshotEvaluationSteps > 0 && snapshotEvery == 0)
+            AnsiConsole.MarkupLine("[yellow]--snapshot-evaluation-steps needs --evaluation-command and a validation split: no snapshot evaluations.[/]");
         var dashboard = new TrainingDashboard(new TrainingRunInfo(
             $"training · {Path.GetFileName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(checkpointDir)))} · {imageTower.StageChannels[^1]}-channel tower · batch {batchSize}×{gradientAccumulationSteps}",
-            epochs, stepsPerEpoch, startEpoch, resumedStepsInEpoch, batchSize, checkpointInterval));
+            epochs, stepsPerEpoch, startEpoch, resumedStepsInEpoch, batchSize, checkpointInterval,
+            EvaluationsOffloaded: targetOptions.EvaluationCommand is not null && validationIndices.Count > 0,
+            SnapshotEvaluationSteps: snapshotEvery),
+            lossHistory: resumingOptimizerState ? LossHistory.Load(checkpointDir, resumedGlobalStep) : null);
+        // Every finished evaluation so far, for the trend charts: epoch ends (history/epoch-N), then snapshots.
+        for (var e = 1; e <= startEpoch; e++)
+            if (EvaluationPoint.Read(Path.Combine(checkpointDir, "history", $"epoch-{e}"), (long)e * stepsPerEpoch, endOfEpoch: true) is { } epochPoint)
+                dashboard.AddEvaluationPoint(epochPoint);
+        using var snapshots = snapshotEvery > 0 ? new SnapshotEvaluations(checkpointDir, targetOptions.EvaluationCommand!) : null;
+        if (snapshots is not null)
+        {
+            var (finished, relaunched) = snapshots.Resume(resumedGlobalStep);
+            foreach (var point in finished.Select(f => f.Point).OfType<EvaluationPoint>())
+                dashboard.AddEvaluationPoint(point);
+            foreach (var step in relaunched)
+                dashboard.SnapshotEvaluationStarted(step);
+            AnsiConsole.MarkupLineInterpolated($"Snapshot evaluations every {snapshotEvery:N0} steps: {finished.Count(f => f.Point is not null)} finished so far{(relaunched.Count > 0 ? $", {relaunched.Count} unfinished restarted" : "")}.");
+        }
         // Interactive terminals get the live panel; redirected output (a log file, tests)
         // gets a one-line summary every few minutes instead of a panel per refresh.
         var gold = targetOptions.GoldPath is not null ? LocalizationEvaluator.LoadGold(targetOptions.GoldPath) : null;
         if (gold is not null)
             AnsiConsole.MarkupLineInterpolated($"Gold set: {gold.Count} images, scored at every epoch evaluation.");
+        // --evaluation-command: epoch evaluations run in another process (e.g. `evaluate` on a
+        // second GPU) while training continues; their results are applied as they come back.
+        using var offloaded = targetOptions.EvaluationCommand is not null && validationIndices.Count > 0
+            ? new OffloadedEvaluations(checkpointDir, targetOptions.EvaluationCommand)
+            : null;
+        if (offloaded is not null)
+            foreach (var pending in offloaded.ResumePending(startEpoch))
+            {
+                AnsiConsole.MarkupLineInterpolated($"Re-running the offloaded evaluation of epoch {pending}: it never finished before the last stop.");
+                dashboard.EvaluationOffloaded(pending);
+            }
+
+        // Applies offloaded evaluations that have come back, in epoch order. Returns the epochs
+        // applied (to mark once the state reflecting them is saved) and whether early stopping fired.
+        (List<int> Applied, bool StopEarly) ApplyOffloaded()
+        {
+            var applied = new List<int>();
+            var stop = false;
+            foreach (var result in offloaded!.TakeFinished())
+            {
+                applied.Add(result.Epoch);
+                if (result.Report is null)
+                {
+                    dashboard.OffloadedEvaluationFailed(result.Epoch);
+                    dashboard.Log("[red]" + Markup.Escape($"offloaded evaluation of epoch {result.Epoch} failed ({result.Failure}; see {Path.Combine(result.Directory, "evaluation.log")}): it doesn't count toward early stopping") + "[/]");
+                    continue;
+                }
+                // The top-level copies are what export-onnx and CropTeacherGate.Load read.
+                foreach (var name in new[] { EvaluationReportFileName, RatingReportFileName, EvaluateCommandHandler.LocalizationReportFileName, TagThresholds.FileName })
+                    if (File.Exists(Path.Combine(result.Directory, name)))
+                        File.Copy(Path.Combine(result.Directory, name), Path.Combine(checkpointDir, name), overwrite: true);
+                if (targetOptions.CropConsistencyWeight > 0)
+                {
+                    cropGate = CropTeacherGate.From(result.Report, vocabulary, localizable, targetOptions.CropTeacherMinAveragePrecision, targetOptions.CropTeacherMinPositives);
+                    cropTrusted.Dispose();
+                    cropTrusted = tensor(cropGate.Trusted.Select(t => t ? 1f : 0f).ToArray(), device: device);
+                    dashboard.Log(Markup.Escape($"crop consistency: {cropGate.TrustedCount} tags now trusted as teachers (held-out AP >= {targetOptions.CropTeacherMinAveragePrecision})"));
+                }
+                dashboard.EvaluationFinished(result.Epoch - 1, result.Report, result.Ratings);
+                if (EvaluationPoint.Read(result.Directory, (long)result.Epoch * stepsPerEpoch, endOfEpoch: true) is { } epochPoint)
+                    dashboard.AddEvaluationPoint(epochPoint);
+                dashboard.Log(Markup.Escape($"epoch {result.Epoch}/{epochs} (offloaded evaluation)"));
+                dashboard.Log(DescribeReport(result.Report));
+                if (result.Ratings is not null)
+                    dashboard.Log(DescribeRatings(result.Ratings));
+                if (!stop && earlyStopping.ShouldStop(result.Report.EarlyStoppingValue))
+                {
+                    dashboard.Log("[yellow]" + Markup.Escape($"Early stopping: held-out mAP stopped improving after epoch {result.Epoch}. Its weights are kept in {offloaded.SnapshotDirectory(result.Epoch - earlyStopping.EvaluationsSinceImprovement)}.") + "[/]");
+                    stop = true;
+                }
+            }
+            return (applied, stop);
+        }
+
+        // A model-only copy for an evaluation in another process (epoch or step snapshot).
+        void WriteSnapshot(string snapshot, int completedEpochs, int stepsInEpoch)
+        {
+            SaveCheckpoint(snapshot, imageTower, tagTower, logitScaleBias, embeddingDim, resolvedInputSize, vocabulary);
+            foreach (var name in new[] { ExclusiveTagGroups.FileName, TagLocalizability.FileName })
+                if (File.Exists(Path.Combine(checkpointDir, name)))
+                    File.Copy(Path.Combine(checkpointDir, name), Path.Combine(snapshot, name), overwrite: true);
+            // evaluate reconstructs the held-out split from this.
+            TrainingState.SaveProgress(snapshot, new TrainingProgress(completedEpochs, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, stepsInEpoch, validationSplitSeed, stepsPerEpoch, EarlyStoppingMetricName));
+        }
+
+        // Snapshot evaluations that came back: onto the trend charts, or logged if they failed.
+        void TakeFinishedSnapshots()
+        {
+            foreach (var finished in snapshots!.TakeFinished())
+                if (finished.Point is { } point)
+                    dashboard.AddEvaluationPoint(point);
+                else
+                {
+                    dashboard.SnapshotEvaluationFailed(finished.Step);
+                    dashboard.Log("[red]" + Markup.Escape($"snapshot evaluation at step {finished.Step:N0} failed ({finished.Failure}; see {Path.Combine(finished.Directory, "evaluation.log")})") + "[/]");
+                }
+        }
+
         var stepsThisProcess = 0;
         var cropRandom = new Random();
+        var mosaicRandom = new Random();
         long croppedImages = 0;
         void TrainingLoop()
         {
@@ -480,6 +596,7 @@ public static class TrainCommandHandler
                     var tagLoss = loss;
                     Tensor? sparseLocalized = null;
                     Tensor? cropTerm = null;
+                    Tensor? mosaicTerm = null;
 
                     // Deliberate targets: the per-location loss only on pairs where "where is
                     // it?" has an answer (LocalizationPairSelector) -- ~100 pairs per image
@@ -519,6 +636,26 @@ public static class TrainCommandHandler
                                 localizationMap, tagEmbeddings, devicePairs, windowMask, teacher, (float)localizationTemperature, logitScaleBias,
                                 pairTrusted, targetOptions.CropTeacherConfidence);
                             loss += targetOptions.CropConsistencyWeight * cropTerm;
+                        }
+
+                        // Mosaic: four of the batch's images at half size on one canvas; each tile is
+                        // a bag of its own, and the other tiles' tags must not light up in it (Mosaic).
+                        var tileImages = targetOptions.MosaicsPerStep > 0
+                            ? Mosaic.PickTiles((int)pixelBatch.shape[0], targetOptions.MosaicsPerStep, mosaicRandom)
+                            : [];
+                        if (tileImages.Length > 0)
+                        {
+                            var canvases = Mosaic.Compose(pixelBatch, tileImages, resolvedInputSize);
+                            var (_, mosaicMap) = imageTower.ForwardMaps(canvases);
+                            var tileBoxes = tileImages.Select((image, k) => Mosaic.TileBox(boxes[image], k % Mosaic.TilesPerMosaic, resolvedInputSize)).ToArray();
+                            using var tileMask = SpatialMask.Build(tileBoxes, resolvedInputSize, mosaicMap.shape[2], mosaicMap.shape[3], device);
+                            using var cpuTilePairs = Mosaic.TilePairs(pairs, cpuTargets, tileImages);
+                            using var tilePairs = cpuTilePairs.To(device);
+                            using var canvasOfTile = tensor(Enumerable.Range(0, tileImages.Length).Select(k => (long)(k / Mosaic.TilesPerMosaic)).ToArray(), device: device);
+                            mosaicTerm = SigmoidContrastiveLoss.ComputeLocalizedPairs(
+                                mosaicMap.index_select(0, canvasOfTile), tagEmbeddings, tilePairs, (float)localizationTemperature, tileMask, logitScaleBias,
+                                targetOptions.NegativeGamma, targetOptions.NegativeClip);
+                            loss += localizationWeight * targetOptions.MosaicWeight * mosaicTerm;
                         }
                     }
 
@@ -585,12 +722,27 @@ public static class TrainCommandHandler
                         : (float)(localizationWeight * localizedLossValue);
                     if (cropTerm is not null)
                         localizationShown += (float)(targetOptions.CropConsistencyWeight * cropTerm.item<float>());
+                    if (mosaicTerm is not null)
+                        localizationShown += (float)(localizationWeight * targetOptions.MosaicWeight * mosaicTerm.item<float>());
                     var currentRate = targetOptions.CosineSchedule
                         ? LearningRateSchedule.At((long)epoch * stepsPerEpoch + step, (long)epochs * stepsPerEpoch, learningRate, targetOptions.WarmupSteps)
                         : learningRate;
                     dashboard.StepCompleted(step + 1, lossValue, tagLoss.item<float>(), localizationShown, currentRate, stepMs - waitMs, waitMs);
                     if (targetOptions.CropConsistencyWeight > 0)
                         dashboard.CropTeacher(cropGate.TrustedCount, croppedImages / (double)((stepsThisProcess + 1L) * batchSize));
+
+                    if (snapshots is not null)
+                    {
+                        TakeFinishedSnapshots();
+                        // Epoch ends get their own evaluation below.
+                        var globalStep = (long)epoch * stepsPerEpoch + step + 1;
+                        if (globalStep % snapshotEvery == 0 && step + 1 < stepsPerEpoch)
+                        {
+                            dashboard.Phase($"snapshotting step {globalStep:N0} for evaluation");
+                            snapshots.Launch(globalStep, snapshot => WriteSnapshot(snapshot, epoch, step + 1));
+                            dashboard.SnapshotEvaluationStarted(globalStep);
+                        }
+                    }
 
                     // Mid-epoch safety net: an epoch can take multiple days, so waiting
                     // for the epoch-boundary save below to be the only recovery point
@@ -602,6 +754,7 @@ public static class TrainCommandHandler
                     var reachedMaxSteps = targetOptions.MaxSteps > 0 && stepsThisProcess >= targetOptions.MaxSteps;
                     if (sinceLastCheckpoint.Elapsed >= checkpointInterval || reachedMaxSteps)
                     {
+                        var (appliedOffloaded, offloadedStop) = offloaded is not null ? ApplyOffloaded() : ([], false);
                         dashboard.Phase("saving checkpoint");
                         SaveCheckpoint(checkpointDir, imageTower, tagTower, logitScaleBias, embeddingDim, resolvedInputSize, vocabulary);
                         TrainingState.Save(
@@ -609,8 +762,16 @@ public static class TrainCommandHandler
                             new TrainingProgress(epoch, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, step + 1, validationSplitSeed, stepsPerEpoch, EarlyStoppingMetricName),
                             optimizer);
                         TrainingState.SaveLogitScaleBiasOptimizerState(checkpointDir, logitScaleBiasOptimizer);
+                        dashboard.SaveLossHistory(checkpointDir);
                         sinceLastCheckpoint.Restart();
                         dashboard.CheckpointSaved();
+                        foreach (var e in appliedOffloaded)
+                            offloaded!.MarkApplied(e);
+                        if (offloadedStop)
+                        {
+                            dashboard.Finished("early stopping (offloaded evaluation)");
+                            return;
+                        }
                     }
 
                     if (reachedMaxSteps)
@@ -629,9 +790,31 @@ public static class TrainCommandHandler
                 dashboard.CheckpointSaved();
 
                 var stopEarly = false;
+                List<int> appliedAtEpochEnd = [];
                 if (validationIndices.Count == 0)
                 {
                     dashboard.Log("Not enough images for a validation split — running the full epoch count without early stopping.");
+                }
+                else if (offloaded is not null)
+                {
+                    var completedEpoch = epoch + 1;
+                    dashboard.Phase($"end of epoch {completedEpoch}: snapshotting for the offloaded evaluation");
+                    offloaded.Launch(completedEpoch, snapshot => WriteSnapshot(snapshot, completedEpoch, 0));
+                    dashboard.EvaluationOffloaded(completedEpoch);
+                    dashboard.Log(Markup.Escape($"epoch {completedEpoch}: evaluation started in the background ({targetOptions.EvaluationCommand}); training continues"));
+
+                    // The last epoch has nothing left to overlap with: wait, so the run ends with its reports.
+                    if (epoch == epochs - 1)
+                    {
+                        dashboard.Phase($"end of epoch {completedEpoch}: waiting for the offloaded evaluations");
+                        offloaded.WaitAll();
+                        if (snapshots is not null)
+                        {
+                            snapshots.WaitAll();
+                            TakeFinishedSnapshots();
+                        }
+                    }
+                    (appliedAtEpochEnd, stopEarly) = ApplyOffloaded();
                 }
                 else
                 {
@@ -687,6 +870,8 @@ public static class TrainCommandHandler
                         dashboard.Log(Markup.Escape($"crop consistency: {cropGate.TrustedCount} tags now trusted as teachers (held-out AP >= {targetOptions.CropTeacherMinAveragePrecision})"));
                     }
                     dashboard.EvaluationFinished(epoch, report, ratingReport);
+                    if (EvaluationPoint.Read(Path.Combine(checkpointDir, "history", $"epoch-{epoch + 1}"), (long)(epoch + 1) * stepsPerEpoch, endOfEpoch: true) is { } epochPoint)
+                        dashboard.AddEvaluationPoint(epochPoint);
                     dashboard.Log(Markup.Escape($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:G4}"));
                     dashboard.Log(DescribeReport(report));
                     if (ratingReport is not null)
@@ -706,6 +891,9 @@ public static class TrainCommandHandler
                 dashboard.Phase($"end of epoch {epoch + 1}: saving training state");
                 TrainingState.Save(checkpointDir, new TrainingProgress(epoch + 1, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, CompletedStepsInEpoch: 0, validationSplitSeed, stepsPerEpoch, EarlyStoppingMetricName), optimizer);
                 TrainingState.SaveLogitScaleBiasOptimizerState(checkpointDir, logitScaleBiasOptimizer);
+                dashboard.SaveLossHistory(checkpointDir);
+                foreach (var e in appliedAtEpochEnd)
+                    offloaded!.MarkApplied(e);
 
                 if (stopEarly)
                     break;
@@ -830,7 +1018,10 @@ public static class TrainCommandHandler
     internal static string DescribeReport(EvaluationReport report) =>
         Markup.Escape(
             $"held-out: {report.Images} images, {report.EvaluatedTags} tags | mAP {report.MeanAveragePrecision:F4}, hard-negative mAP {report.MeanHardAveragePrecision:F4}, context mAP {report.MeanContextAveragePrecision:F4}, mean best-F1 {report.MeanBestF1:F4}, mean held-out F1 at calibrated thresholds {report.MeanHeldOutF1:F4} | " +
-            $"image-level at calibrated thresholds: precision {report.MicroPrecision:F4}, recall {report.MicroRecall:F4}, F1 {report.MicroF1:F4}, R-precision {report.RPrecision:F4}, exclusive-tag violations {report.ExclusiveViolationRate:P2}");
+            $"image-level at calibrated thresholds: precision {report.MicroPrecision:F4}, recall {report.MicroRecall:F4}, F1 {report.MicroF1:F4}, R-precision {report.RPrecision:F4}, exclusive-tag violations {report.ExclusiveViolationRate:P2}" +
+            (report.ContextReliance is { } c
+                ? $" | context reliance: recall gap {c.MacroRecallGap:+0.0%;-0.0%} ({c.RecallGapTags} tags), false-positive gap {c.MacroFalsePositiveGap:+0.0%;-0.0%} ({c.FalsePositiveGapTags} tags)"
+                : ""));
 
     internal static (double Loss, float[] Pooled) Evaluate(
         ImageTower imageTower,
