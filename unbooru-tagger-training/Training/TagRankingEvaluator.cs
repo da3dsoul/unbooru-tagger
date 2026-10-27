@@ -6,6 +6,13 @@ using static TorchSharp.torch;
 
 namespace UnbooruTagger.Training.Training;
 
+/// <summary>
+/// Held-out images where two mutually exclusive tags (<see cref="ExclusiveTagGroups"/>) both cleared their
+/// thresholds. <paramref name="FirstTrue"/> / <paramref name="SecondTrue"/>: how many of those images
+/// actually carry that tag (the rest of each pair's images carry neither).
+/// </summary>
+public sealed record ExclusiveViolation(string First, string Second, int Images, int FirstTrue, int SecondTrue);
+
 /// <summary>One tag's held-out ranking quality.</summary>
 /// <param name="AveragePrecision">AP over the tag's positives vs. its hard AND random negatives.</param>
 /// <param name="HardAveragePrecision">AP over the tag's positives vs. only its hard negatives (NaN if it had none) — how well it separates from the tags it's actually confused with.</param>
@@ -17,7 +24,7 @@ namespace UnbooruTagger.Training.Training;
 /// </param>
 /// <param name="HeldOutF1">F1 over every held-out image at <paramref name="Threshold"/>; NaN if the tag had too few held-out positives to calibrate (it then uses the fallback threshold).</param>
 /// <param name="ContextNegatives">Held-out context negatives scored (<see cref="TagStatistics.ContextSources"/>: the tag's usual context without the tag).</param>
-/// <param name="ContextAveragePrecision">AP of positives vs. only those (NaN if none): can the classifier tell the object from its context? Some are missing labels, so this is a lower bound.</param>
+/// <param name="ContextAveragePrecision">AP of positives vs. only those (NaN if none): can the classifier tell the object from its context? Some are missing labels, so this is a lower bound. With few context negatives (a median of 2 per tag on a 20K sample) its chance level is close to 1, so it says little; <see cref="EvaluationReport.ContextReliance"/> measures the same question on every held-out image.</param>
 public sealed record TagEvaluation(
     string Tag, int Positives, int HardNegatives, int RandomNegatives,
     double AveragePrecision, double HardAveragePrecision, double BestF1, float Threshold, double HeldOutF1,
@@ -34,12 +41,16 @@ public sealed record TagEvaluation(
 /// <param name="RPrecision">Image-level: for an image with R true tags, the fraction of its top-R scored tags that are true, averaged over images — threshold-free.</param>
 /// <param name="ExclusiveViolationRate">Fraction of images where two mutually exclusive tags both cleared their thresholds.</param>
 /// <param name="MeanContextAveragePrecision">Macro mean of <see cref="TagEvaluation.ContextAveragePrecision"/> over tags that had context negatives.</param>
+/// <param name="ExclusiveViolations">Which mutually exclusive pairs fired together, most frequent first, and which side the image actually carries.</param>
+/// <param name="ContextReliance">Recall and false positives by how strongly each image's characters/artists/series predict the tag (<see cref="ContextRelianceEvaluator"/>).</param>
 public sealed record EvaluationReport(
     int Images, int EvaluatedTags,
     double MeanAveragePrecision, double MeanHardAveragePrecision, double MeanBestF1, double MeanHeldOutF1,
     double MicroPrecision, double MicroRecall, double MicroF1, double RPrecision, double ExclusiveViolationRate,
     IReadOnlyList<TagEvaluation> Tags,
-    double MeanContextAveragePrecision = double.NaN)
+    double MeanContextAveragePrecision = double.NaN,
+    ContextRelianceReport? ContextReliance = null,
+    IReadOnlyList<ExclusiveViolation>? ExclusiveViolations = null)
 {
     /// <summary>Lower-is-better form of <see cref="MeanAveragePrecision"/> for <see cref="EarlyStopping"/>.</summary>
     public double EarlyStoppingValue => 1 - MeanAveragePrecision;
@@ -199,6 +210,8 @@ public static class TagRankingEvaluator
         var evaluated = results.OfType<TagEvaluation>().ToList();
 
         var imageLevel = ImageLevelMetrics(pooled, imageTags, tagEmbeddings, dim, scaling, thresholds, trainingStatistics, exclusiveGroups, device, imageSites);
+        var contextReliance = ContextRelianceEvaluator.Evaluate(
+            pooled, imageTags, tagEmbeddings, dim, scaling, vocabulary, trainingStatistics, thresholds, device, seed: seed, imageSites: imageSites);
 
         var hardAps = evaluated.Select(e => e.HardAveragePrecision).Where(x => !double.IsNaN(x)).ToList();
         var contextAps = evaluated.Select(e => e.ContextAveragePrecision).Where(x => !double.IsNaN(x)).ToList();
@@ -210,7 +223,11 @@ public static class TagRankingEvaluator
             evaluated.Any(e => !double.IsNaN(e.HeldOutF1)) ? evaluated.Where(e => !double.IsNaN(e.HeldOutF1)).Average(e => e.HeldOutF1) : 0,
             imageLevel.Precision, imageLevel.Recall, imageLevel.F1, imageLevel.RPrecision, imageLevel.ExclusiveViolationRate,
             evaluated.OrderBy(e => e.AveragePrecision).ToList(),
-            contextAps.Count > 0 ? contextAps.Average() : double.NaN);
+            contextAps.Count > 0 ? contextAps.Average() : double.NaN,
+            contextReliance,
+            imageLevel.Violations
+                .Select(v => new ExclusiveViolation(vocabulary.Records[v.Key.First].Tag, vocabulary.Records[v.Key.Second].Tag, v.Value.Images, v.Value.FirstTrue, v.Value.SecondTrue))
+                .OrderByDescending(v => v.Images).ToList());
     }
 
     /// <summary>Thresholds keyed by tag name for <see cref="TagThresholds"/>, for every tag that had enough held-out positives to calibrate — the rest fall back to inference's default.</summary>
@@ -349,7 +366,8 @@ public static class TagRankingEvaluator
         return any ? tensor(mask, [imageSites.Count, tags.Length]) : null;
     }
 
-    private static (double Precision, double Recall, double F1, double RPrecision, double ExclusiveViolationRate) ImageLevelMetrics(
+    private static (double Precision, double Recall, double F1, double RPrecision, double ExclusiveViolationRate,
+        Dictionary<(int First, int Second), (int Images, int FirstTrue, int SecondTrue)> Violations) ImageLevelMetrics(
         float[] pooled, IReadOnlyList<IReadOnlyList<int>> imageTags, float[] tagEmbeddings, int dim, LogitScaling scaling,
         float[] thresholds, TagStatistics trainingStatistics, ExclusiveTagGroups exclusiveGroups, Device device,
         IReadOnlyList<BooruSites>? imageSites = null)
@@ -357,7 +375,7 @@ public static class TagRankingEvaluator
         var imageCount = imageTags.Count;
         var vocabularySize = thresholds.Length;
         if (imageCount == 0)
-            return (0, 0, 0, 0, 0);
+            return (0, 0, 0, 0, 0, []);
 
         var restricted = trainingStatistics.TagSites is { } coverage
             ? Enumerable.Range(0, vocabularySize).Where(t => coverage[t] != (BooruSites.Danbooru | BooruSites.Gelbooru)).ToArray()
@@ -375,6 +393,7 @@ public static class TagRankingEvaluator
         using var exclusiveColumnTensor = tensor(exclusiveColumns.Select(t => (long)t).ToArray()).to(device);
 
         long truePositives = 0, predicted = 0, actual = 0, violations = 0;
+        var pairs = new Dictionary<(int First, int Second), (int Images, int FirstTrue, int SecondTrue)>();
         double rPrecisionSum = 0;
         const int chunk = 256;
         for (var start = 0; start < imageCount; start += chunk)
@@ -422,7 +441,16 @@ public static class TagRankingEvaluator
                     for (var c = 0; c < exclusiveColumns.Length; c++)
                         if (exclusiveReported[i * exclusiveColumns.Length + c])
                             fired.Add(exclusiveColumns[c]);
-                    if (fired.Any(t => exclusiveGroups.ExcludedBy(t).Any(fired.Contains)))
+                    var violated = false;
+                    foreach (var a in fired)
+                        foreach (var b in exclusiveGroups.ExcludedBy(a))
+                            if (a < b && fired.Contains(b))
+                            {
+                                violated = true;
+                                var (pairImages, firstTrue, secondTrue) = pairs.GetValueOrDefault((a, b));
+                                pairs[(a, b)] = (pairImages + 1, firstTrue + (truthMask[i * vocabularySize + a] ? 1 : 0), secondTrue + (truthMask[i * vocabularySize + b] ? 1 : 0));
+                            }
+                    if (violated)
                         violations++;
                 }
             }
@@ -447,7 +475,7 @@ public static class TagRankingEvaluator
         var precision = predicted > 0 ? truePositives / (double)predicted : 0;
         var recall = actual > 0 ? truePositives / (double)actual : 0;
         var f1 = precision + recall > 0 ? 2 * precision * recall / (precision + recall) : 0;
-        return (precision, recall, f1, rPrecisionSum / imageCount, violations / (double)imageCount);
+        return (precision, recall, f1, rPrecisionSum / imageCount, violations / (double)imageCount, pairs);
     }
 
     private static void Shuffle(List<int> list, Random random)

@@ -957,7 +957,10 @@ public static class TrainCommandHandler
     internal static string DescribeReport(EvaluationReport report) =>
         Markup.Escape(
             $"held-out: {report.Images} images, {report.EvaluatedTags} tags | mAP {report.MeanAveragePrecision:F4}, hard-negative mAP {report.MeanHardAveragePrecision:F4}, context mAP {report.MeanContextAveragePrecision:F4}, mean best-F1 {report.MeanBestF1:F4}, mean held-out F1 at calibrated thresholds {report.MeanHeldOutF1:F4} | " +
-            $"image-level at calibrated thresholds: precision {report.MicroPrecision:F4}, recall {report.MicroRecall:F4}, F1 {report.MicroF1:F4}, R-precision {report.RPrecision:F4}, exclusive-tag violations {report.ExclusiveViolationRate:P2}");
+            $"image-level at calibrated thresholds: precision {report.MicroPrecision:F4}, recall {report.MicroRecall:F4}, F1 {report.MicroF1:F4}, R-precision {report.RPrecision:F4}, exclusive-tag violations {report.ExclusiveViolationRate:P2}" +
+            (report.ContextReliance is { } c
+                ? $" | context reliance: recall gap {c.MacroRecallGap:+0.0%;-0.0%} ({c.RecallGapTags} tags), false-positive gap {c.MacroFalsePositiveGap:+0.0%;-0.0%} ({c.FalsePositiveGapTags} tags)"
+                : ""));
 
     internal static (double Loss, float[] Pooled) Evaluate(
         ImageTower imageTower,
