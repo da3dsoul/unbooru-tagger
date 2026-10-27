@@ -26,7 +26,11 @@ public static class ImageTowerOnnxExporter
         var graph = new GraphProto { Name = "image_tower" };
         var names = new NameAllocator();
 
-        graph.Input.Add(MakeValueInfo("pixel_values", 1, 3, inputSize, inputSize));
+        // Symbolic batch dimension: every op below works per image, so inference can run several
+        // images per call (OnnxImageEncoder.EncodeBatch). Bundles exported before this pin it to 1.
+        var input = MakeValueInfo("pixel_values", 1, 3, inputSize, inputSize);
+        input.Type.TensorType.Shape.Dim[0] = new TensorShapeProto.Types.Dimension { DimParam = "batch" };
+        graph.Input.Add(input);
 
         var current = ExportConv2d(graph, tower.Stem, "pixel_values", names);
         var stageOutputs = new string[tower.StageChannels.Length];

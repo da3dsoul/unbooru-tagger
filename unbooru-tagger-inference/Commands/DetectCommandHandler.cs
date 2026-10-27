@@ -63,25 +63,28 @@ public static class DetectCommandHandler
         ModelBundle model, string imagePath, float? threshold, float boxThreshold, float boxPercentile, float minHeatmapRange = 0.05f,
         float minBoxFraction = 0f, int maxBoxesPerTag = 0)
     {
-        var encoding = model.ImageEncoder.Encode(imagePath);
-
         using var bitmap = SKBitmap.Decode(imagePath)
             ?? throw new InvalidDataException($"Could not decode image at '{imagePath}'.");
+        var encoding = model.ImageEncoder.EncodeBatch([ImagePreprocessing.Normalize(bitmap, model.ImageEncoder.InputSize)])[0];
+        return Detect(model, encoding, RefinementGuide.From(bitmap), threshold, boxThreshold, boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag);
+    }
 
-        var guide = HeatmapRefiner.BuildGuide(bitmap, RefinementSize, out var refinementContent);
+    /// <summary>What box refinement needs from the source image, so a caller can drop the decoded bitmap early.</summary>
+    public sealed record RefinementGuide(float[,,] Guide, LetterboxBox Content, int ImageWidth, int ImageHeight)
+    {
+        public static RefinementGuide From(SKBitmap bitmap) =>
+            new(HeatmapRefiner.BuildGuide(bitmap, RefinementSize, out var content), content, bitmap.Width, bitmap.Height);
+    }
 
-        var candidates = new List<(int Row, float Confidence)>();
-        for (var row = 0; row < model.Embeddings.RowCount; row++)
-        {
-            var confidence = TagScorer.Score(encoding.PooledEmbedding, model.Embeddings.GetRow(row), model.LogitScaling);
-            if (confidence >= model.ThresholdFor(row, threshold))
-                candidates.Add((row, confidence));
-        }
-
-        candidates.Sort((a, b) => b.Confidence.CompareTo(a.Confidence));
-
+    /// <summary>Same as <see cref="Detect(ModelBundle, string, float?, float, float, float, float, int)"/> for an image already encoded (e.g. as part of a batch).</summary>
+    public static List<TagDetection> Detect(
+        ModelBundle model, ImageEncoding encoding, RefinementGuide guide, float? threshold, float boxThreshold, float boxPercentile,
+        float minHeatmapRange = 0.05f, float minBoxFraction = 0f, int maxBoxesPerTag = 0)
+    {
+        var spatialFeatures = encoding.SpatialFeatures
+            ?? throw new ArgumentException("Detection needs the encoding's spatial features (EncodeBatch with withHeatmapFeatures: true).", nameof(encoding));
         var detections = new List<TagDetection>();
-        foreach (var (row, confidence) in model.ExclusiveGroups.Resolve(candidates, c => c.Row))
+        foreach (var (row, confidence) in TagCommandHandler.ScoreRows(model, encoding, threshold))
         {
             var tag = model.Vocabulary.GetByRowIndex(row).Tag;
             if (!model.Localizability.IsLocalizable(tag))
@@ -92,10 +95,10 @@ public static class DetectCommandHandler
             }
 
             var tagEmbedding = model.Embeddings.GetRow(row);
-            var heatmap = TagScorer.Heatmap(tagEmbedding, encoding.SpatialFeatures, model.LogitScaling);
-            var refinedHeatmap = HeatmapRefiner.Refine(heatmap, guide);
+            var heatmap = TagScorer.Heatmap(tagEmbedding, spatialFeatures, model.LogitScaling);
+            var refinedHeatmap = HeatmapRefiner.Refine(heatmap, guide.Guide);
             var boxes = TagScorer.DetectBoxes(
-                refinedHeatmap, boxThreshold, boxPercentile, refinementContent, RefinementSize, bitmap.Width, bitmap.Height, minHeatmapRange,
+                refinedHeatmap, boxThreshold, boxPercentile, guide.Content, RefinementSize, guide.ImageWidth, guide.ImageHeight, minHeatmapRange,
                 minBoxFraction, maxBoxesPerTag);
             detections.Add(new TagDetection(model.Vocabulary.GetByRowIndex(row).Tag, confidence, boxes));
         }

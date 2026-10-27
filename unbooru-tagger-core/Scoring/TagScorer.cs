@@ -1,3 +1,4 @@
+using System.Numerics.Tensors;
 using UnbooruTagger.Core.Encoding;
 
 namespace UnbooruTagger.Core.Scoring;
@@ -173,10 +174,8 @@ public static class TagScorer
         if (a.Length != b.Length)
             throw new ArgumentException("Vectors must be the same length to dot-product.");
 
-        var sum = 0f;
-        for (var i = 0; i < a.Length; i++)
-            sum += a[i] * b[i];
-        return sum;
+        // SIMD: a 128x128 heatmap is 16K of these per tag at 512 dims.
+        return TensorPrimitives.Dot(a, b);
     }
 
     private static float Sigmoid(float x) => 1f / (1f + MathF.Exp(-x));

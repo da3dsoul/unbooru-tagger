@@ -9,7 +9,10 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.10" />
-    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.27.1" />
+    <!-- The GPU build also has the CPU provider; CUDA loads only when OnnxImageEncoder asks for it.
+         1.24.2 is the newest built against CUDA 12 (installed here); 1.25+ need CUDA 13. -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.24.2" />
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.0" />
     <PackageReference Include="SkiaSharp" Version="4.150.1" />
     <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="4.150.1" />
   </ItemGroup>

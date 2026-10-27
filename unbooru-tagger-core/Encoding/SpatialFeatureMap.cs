@@ -37,4 +37,5 @@ public sealed class SpatialFeatureMap
 /// padding included, so callers mapping grid cells back to the original image's pixel
 /// space need <see cref="Content"/> to exclude the padding bars.
 /// </summary>
-public sealed record ImageEncoding(float[] PooledEmbedding, SpatialFeatureMap SpatialFeatures, LetterboxBox Content);
+/// <see cref="SpatialFeatures"/> is null when the caller asked only for whole-image scores (<see cref="OnnxImageEncoder.EncodeBatch"/>).
+public sealed record ImageEncoding(float[] PooledEmbedding, SpatialFeatureMap? SpatialFeatures, LetterboxBox Content);

@@ -61,8 +61,8 @@ public class OnnxImageEncoderTests
             Assert.True(encoding.Content.Y > 0);
             Assert.True(encoding.Content.Height < inputSize);
 
-            var manualMaskedPooled = ManualMaskedPool(encoding.SpatialFeatures, encoding.Content, inputSize);
-            var manualUnmaskedPooled = ManualUnmaskedPool(encoding.SpatialFeatures);
+            var manualMaskedPooled = ManualMaskedPool(encoding.SpatialFeatures!, encoding.Content, inputSize);
+            var manualUnmaskedPooled = ManualUnmaskedPool(encoding.SpatialFeatures!);
 
             for (var c = 0; c < embeddingDim; c++)
                 Assert.Equal(manualMaskedPooled[c], encoding.PooledEmbedding[c], 4);

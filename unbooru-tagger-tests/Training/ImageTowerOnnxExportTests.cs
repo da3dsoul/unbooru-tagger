@@ -30,6 +30,50 @@ public class ImageTowerOnnxExportTests
             new ImageTower(8, stemChannels: 8, stageChannels: [8, 12, 16], blocksPerStage: [1, 1, 1], fusedStages: 2) { LocalizationFromFusedOnly = true },
             64, expectedSpatialSize: 16);
 
+    [Fact]
+    public void ExportedGraph_RunsABatchAsIfEachImageWereAlone()
+    {
+        const int inputSize = 64;
+        var tower = new ImageTower(8, stemChannels: 8, stageChannels: [8, 12, 16], blocksPerStage: [1, 1, 1], fusedStages: 2) { LocalizationFromFusedOnly = true };
+        tower.eval();
+        var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.onnx");
+        try
+        {
+            ImageTowerOnnxExporter.Export(tower, tempFile, inputSize);
+            using var session = new InferenceSession(tempFile);
+            Assert.Equal(-1, session.InputMetadata["pixel_values"].Dimensions[0]);
+
+            // Two different images: GroupNorm's statistics must stay per image, not per batch.
+            var imageSize = 3 * inputSize * inputSize;
+            var first = Enumerable.Range(0, imageSize).Select(i => 0.01f * ((i % 11) - 5)).ToArray();
+            var second = Enumerable.Range(0, imageSize).Select(i => 0.03f * ((i % 5) - 2) + 0.2f).ToArray();
+            float[][] Run(float[] pixels, int batch)
+            {
+                using var results = session.Run([NamedOnnxValue.CreateFromTensor("pixel_values", new DenseTensor<float>(pixels, [batch, 3, inputSize, inputSize]))]);
+                return new[] { "pooled_embedding", "spatial_features", ImageTowerOnnxExporter.LocalizationOutputName }
+                    .Select(name => results.First(r => r.Name == name).AsTensor<float>().ToArray()).ToArray();
+            }
+
+            var batched = Run([.. first, .. second], 2);
+            var alone = new[] { Run(first, 1), Run(second, 1) };
+            for (var output = 0; output < batched.Length; output++)
+            {
+                var perImage = batched[output].Length / 2;
+                for (var image = 0; image < 2; image++)
+                {
+                    Assert.Equal(perImage, alone[image][output].Length);
+                    for (var i = 0; i < perImage; i++)
+                        Assert.Equal(alone[image][output][i], batched[output][image * perImage + i], 4);
+                }
+            }
+        }
+        finally
+        {
+            if (File.Exists(tempFile))
+                File.Delete(tempFile);
+        }
+    }
+
     private static void AssertExportMatches(ImageTower tower, int inputSize, int expectedSpatialSize)
     {
         tower.eval();

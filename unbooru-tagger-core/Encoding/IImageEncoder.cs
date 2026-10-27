@@ -9,4 +9,7 @@ public interface IImageEncoder
     int InputSize { get; }
 
     ImageEncoding Encode(string imagePath);
+
+    /// <summary>Encodes several already-preprocessed images; <paramref name="withHeatmapFeatures"/> false leaves <see cref="ImageEncoding.SpatialFeatures"/> null.</summary>
+    IReadOnlyList<ImageEncoding> EncodeBatch(IReadOnlyList<PreprocessedImage> images, bool withHeatmapFeatures = true);
 }

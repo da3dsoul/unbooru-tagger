@@ -1,3 +1,4 @@
+using UnbooruTagger.Core.Encoding;
 using System.CommandLine;
 using UnbooruTagger.Inference.Commands;
 
@@ -65,14 +66,38 @@ tagCommand.SetAction(parseResult => TagCommandHandler.Run(
     parseResult.GetRequiredValue(imageArgument),
     parseResult.GetValue(thresholdOption)));
 
+var batchSizeOption = new Option<int>("--batch-size")
+{
+    Description = "Images per model run. Needs a bundle exported with a batch dimension; older ones run one at a time",
+    DefaultValueFactory = _ => 16
+};
+
+var workersOption = new Option<int>("--workers")
+{
+    Description = "Threads for decoding images and for per-image scoring/box extraction (each). 0 = half the logical CPUs",
+    DefaultValueFactory = _ => 0
+};
+
+var deviceOption = new Option<InferenceDevice>("--device")
+{
+    Description = "Where the image model runs: Auto (CUDA GPU 0 if ONNX Runtime can load it, else CPU), Cuda, or Cpu",
+    DefaultValueFactory = _ => InferenceDevice.Auto
+};
+
 var tagBatchCommand = new Command("tag-batch", "Score every image in a directory against the tag vocabulary");
 tagBatchCommand.Arguments.Add(directoryArgument);
 tagBatchCommand.Options.Add(modelDirOption);
 tagBatchCommand.Options.Add(thresholdOption);
+tagBatchCommand.Options.Add(batchSizeOption);
+tagBatchCommand.Options.Add(workersOption);
+tagBatchCommand.Options.Add(deviceOption);
 tagBatchCommand.SetAction(parseResult => TagBatchCommandHandler.Run(
     parseResult.GetRequiredValue(modelDirOption),
     parseResult.GetRequiredValue(directoryArgument),
-    parseResult.GetValue(thresholdOption)));
+    parseResult.GetValue(thresholdOption),
+    parseResult.GetRequiredValue(batchSizeOption),
+    parseResult.GetRequiredValue(workersOption),
+    parseResult.GetRequiredValue(deviceOption)));
 
 var heatmapCommand = new Command("heatmap", "Render a rough localization heatmap for one tag on one image");
 heatmapCommand.Arguments.Add(imageArgument);
@@ -140,10 +165,53 @@ renderGoldCommand.SetAction(parseResult => RenderGoldCommandHandler.Run(
     parseResult.GetValue(allTagsOption),
     parseResult.GetValue(pngOption)));
 
+var resultsOption = new Option<string>("--out")
+{
+    Description = "Where to write the results, one JSON object per image per line (JSONL)",
+    Required = true
+};
+var renderDirOption = new Option<string?>("--render-dir") { Description = "If set, also write each image with its boxes drawn on it here (PNG)" };
+var noBoxesOption = new Option<bool>("--no-boxes") { Description = "Whole-image tags only: skip heatmaps and box extraction" };
+var recursiveOption = new Option<bool>("--recursive") { Description = "Include images in subdirectories" };
+
+var detectBatchCommand = new Command("detect-batch", "Tag and detect every image in a directory in one pass, batched on the GPU when available");
+detectBatchCommand.Arguments.Add(directoryArgument);
+detectBatchCommand.Options.Add(modelDirOption);
+detectBatchCommand.Options.Add(resultsOption);
+detectBatchCommand.Options.Add(renderDirOption);
+detectBatchCommand.Options.Add(noBoxesOption);
+detectBatchCommand.Options.Add(recursiveOption);
+detectBatchCommand.Options.Add(batchSizeOption);
+detectBatchCommand.Options.Add(workersOption);
+detectBatchCommand.Options.Add(deviceOption);
+detectBatchCommand.Options.Add(thresholdOption);
+detectBatchCommand.Options.Add(boxThresholdOption);
+detectBatchCommand.Options.Add(boxPercentileOption);
+detectBatchCommand.Options.Add(minHeatmapRangeOption);
+detectBatchCommand.Options.Add(minBoxFractionOption);
+detectBatchCommand.Options.Add(maxBoxesPerTagOption);
+detectBatchCommand.SetAction(parseResult => DetectBatchCommandHandler.Run(
+    parseResult.GetRequiredValue(modelDirOption),
+    parseResult.GetRequiredValue(directoryArgument),
+    parseResult.GetRequiredValue(resultsOption),
+    parseResult.GetValue(renderDirOption),
+    !parseResult.GetValue(noBoxesOption),
+    parseResult.GetValue(recursiveOption),
+    parseResult.GetRequiredValue(batchSizeOption),
+    parseResult.GetRequiredValue(workersOption),
+    parseResult.GetRequiredValue(deviceOption),
+    parseResult.GetValue(thresholdOption),
+    parseResult.GetRequiredValue(boxThresholdOption),
+    parseResult.GetRequiredValue(boxPercentileOption),
+    parseResult.GetRequiredValue(minHeatmapRangeOption),
+    parseResult.GetRequiredValue(minBoxFractionOption),
+    parseResult.GetRequiredValue(maxBoxesPerTagOption)));
+
 var rootCommand = new RootCommand("unbooru-tagger inference CLI")
 {
     tagCommand,
     tagBatchCommand,
+    detectBatchCommand,
     heatmapCommand,
     detectCommand,
     renderGoldCommand

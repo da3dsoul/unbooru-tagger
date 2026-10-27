@@ -44,14 +44,14 @@ public sealed class ModelBundle : IDisposable
         _ownedEncoder = ownedEncoder;
     }
 
-    public static ModelBundle Load(string directory, int inputSize = 224)
+    public static ModelBundle Load(string directory, int inputSize = 224, InferenceDevice device = InferenceDevice.Cpu)
     {
         var vocabulary = TagVocabulary.Load(Path.Combine(directory, VocabularyFileName));
         var embeddings = TagEmbeddingStore.Load(Path.Combine(directory, EmbeddingsFileName));
         var logitScaling = LogitScaling.Load(Path.Combine(directory, LogitScalingFileName));
         var exclusiveGroups = ExclusiveTagGroups.Load(Path.Combine(directory, ExclusiveTagGroups.FileName), vocabulary, fallBackToDefaults: false);
         var thresholds = TagThresholds.Load(Path.Combine(directory, TagThresholds.FileName));
-        var encoder = new OnnxImageEncoder(Path.Combine(directory, ImageEncoderFileName), embeddings.EmbeddingDim, inputSize);
+        var encoder = new OnnxImageEncoder(Path.Combine(directory, ImageEncoderFileName), embeddings.EmbeddingDim, inputSize, device: device);
         var localizability = TagLocalizability.Load(Path.Combine(directory, TagLocalizability.FileName));
         return new ModelBundle(encoder, vocabulary, embeddings, logitScaling, exclusiveGroups, thresholds, localizability, encoder);
     }

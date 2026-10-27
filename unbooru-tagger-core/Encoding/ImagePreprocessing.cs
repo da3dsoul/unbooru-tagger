@@ -304,7 +304,8 @@ public static class ImagePreprocessing
     private static byte Denormalize(float normalized, float mean, float std) =>
         (byte)Math.Clamp(Math.Round(((normalized * std) + mean) * 255f), 0, 255);
 
-    private static PreprocessedImage Normalize(SKBitmap original, int inputSize)
+    /// <summary>The model input for an already-decoded image (letterboxed, normalized, channels-first).</summary>
+    public static PreprocessedImage Normalize(SKBitmap original, int inputSize)
     {
         using var canvas = BuildLetterboxCanvas(original, inputSize, out var content);
 

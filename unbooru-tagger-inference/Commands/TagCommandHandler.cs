@@ -1,4 +1,5 @@
 using UnbooruTagger.Core.Dataset;
+using UnbooruTagger.Core.Encoding;
 using UnbooruTagger.Core.Runtime;
 using UnbooruTagger.Core.Scoring;
 
@@ -35,10 +36,17 @@ public static class TagCommandHandler
     }
 
     /// <param name="threshold">An explicit cutoff for every tag, or null to use each tag's calibrated threshold (see <see cref="ModelBundle.ThresholdFor"/>).</param>
-    public static List<(string Tag, float Confidence)> Score(ModelBundle model, string imagePath, float? threshold)
-    {
-        var encoding = model.ImageEncoder.Encode(imagePath);
+    public static List<(string Tag, float Confidence)> Score(ModelBundle model, string imagePath, float? threshold) =>
+        Score(model, model.ImageEncoder.Encode(imagePath), threshold);
 
+    public static List<(string Tag, float Confidence)> Score(ModelBundle model, ImageEncoding encoding, float? threshold) =>
+        ScoreRows(model, encoding, threshold)
+            .Select(r => (model.Vocabulary.GetByRowIndex(r.Row).Tag, r.Confidence))
+            .ToList();
+
+    /// <summary>Vocabulary rows that clear their threshold, strongest first, with contradictory pairs resolved.</summary>
+    internal static List<(int Row, float Confidence)> ScoreRows(ModelBundle model, ImageEncoding encoding, float? threshold)
+    {
         var results = new List<(int Row, float Confidence)>();
         for (var row = 0; row < model.Embeddings.RowCount; row++)
         {
@@ -48,8 +56,6 @@ public static class TagCommandHandler
         }
 
         results.Sort((a, b) => b.Confidence.CompareTo(a.Confidence));
-        return model.ExclusiveGroups.Resolve(results, r => r.Row)
-            .Select(r => (model.Vocabulary.GetByRowIndex(r.Row).Tag, r.Confidence))
-            .ToList();
+        return model.ExclusiveGroups.Resolve(results, r => r.Row).ToList();
     }
 }
