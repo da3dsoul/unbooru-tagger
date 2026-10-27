@@ -361,10 +361,31 @@ public static class TrainCommandHandler
             ? new BatchPrefetcher(TrainingRequests(), readWindow, resolvedInputSize, prefetchWindowBatches, 2 * prefetchWindowBatches)
             : null;
 
+        // Global step the run resumes at; the loss history and snapshot evaluations are cut back to it.
+        var resumedGlobalStep = (long)startEpoch * stepsPerEpoch + resumedStepsInEpoch;
+        var snapshotEvery = targetOptions.EvaluationCommand is not null && validationIndices.Count > 0 ? Math.Max(0, targetOptions.SnapshotEvaluationSteps) : 0;
+        if (targetOptions.SnapshotEvaluationSteps > 0 && snapshotEvery == 0)
+            AnsiConsole.MarkupLine("[yellow]--snapshot-evaluation-steps needs --evaluation-command and a validation split: no snapshot evaluations.[/]");
         var dashboard = new TrainingDashboard(new TrainingRunInfo(
             $"training · {Path.GetFileName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(checkpointDir)))} · {imageTower.StageChannels[^1]}-channel tower · batch {batchSize}×{gradientAccumulationSteps}",
             epochs, stepsPerEpoch, startEpoch, resumedStepsInEpoch, batchSize, checkpointInterval,
-            EvaluationsOffloaded: targetOptions.EvaluationCommand is not null && validationIndices.Count > 0));
+            EvaluationsOffloaded: targetOptions.EvaluationCommand is not null && validationIndices.Count > 0,
+            SnapshotEvaluationSteps: snapshotEvery),
+            lossHistory: resumingOptimizerState ? LossHistory.Load(checkpointDir, resumedGlobalStep) : null);
+        // Every finished evaluation so far, for the trend charts: epoch ends (history/epoch-N), then snapshots.
+        for (var e = 1; e <= startEpoch; e++)
+            if (EvaluationPoint.Read(Path.Combine(checkpointDir, "history", $"epoch-{e}"), (long)e * stepsPerEpoch, endOfEpoch: true) is { } epochPoint)
+                dashboard.AddEvaluationPoint(epochPoint);
+        using var snapshots = snapshotEvery > 0 ? new SnapshotEvaluations(checkpointDir, targetOptions.EvaluationCommand!) : null;
+        if (snapshots is not null)
+        {
+            var (finished, relaunched) = snapshots.Resume(resumedGlobalStep);
+            foreach (var point in finished.Select(f => f.Point).OfType<EvaluationPoint>())
+                dashboard.AddEvaluationPoint(point);
+            foreach (var step in relaunched)
+                dashboard.SnapshotEvaluationStarted(step);
+            AnsiConsole.MarkupLineInterpolated($"Snapshot evaluations every {snapshotEvery:N0} steps: {finished.Count(f => f.Point is not null)} finished so far{(relaunched.Count > 0 ? $", {relaunched.Count} unfinished restarted" : "")}.");
+        }
         // Interactive terminals get the live panel; redirected output (a log file, tests)
         // gets a one-line summary every few minutes instead of a panel per refresh.
         var gold = targetOptions.GoldPath is not null ? LocalizationEvaluator.LoadGold(targetOptions.GoldPath) : null;
@@ -409,6 +430,8 @@ public static class TrainCommandHandler
                     dashboard.Log(Markup.Escape($"crop consistency: {cropGate.TrustedCount} tags now trusted as teachers (held-out AP >= {targetOptions.CropTeacherMinAveragePrecision})"));
                 }
                 dashboard.EvaluationFinished(result.Epoch - 1, result.Report, result.Ratings);
+                if (EvaluationPoint.Read(result.Directory, (long)result.Epoch * stepsPerEpoch, endOfEpoch: true) is { } epochPoint)
+                    dashboard.AddEvaluationPoint(epochPoint);
                 dashboard.Log(Markup.Escape($"epoch {result.Epoch}/{epochs} (offloaded evaluation)"));
                 dashboard.Log(DescribeReport(result.Report));
                 if (result.Ratings is not null)
@@ -420,6 +443,30 @@ public static class TrainCommandHandler
                 }
             }
             return (applied, stop);
+        }
+
+        // A model-only copy for an evaluation in another process (epoch or step snapshot).
+        void WriteSnapshot(string snapshot, int completedEpochs, int stepsInEpoch)
+        {
+            SaveCheckpoint(snapshot, imageTower, tagTower, logitScaleBias, embeddingDim, resolvedInputSize, vocabulary);
+            foreach (var name in new[] { ExclusiveTagGroups.FileName, TagLocalizability.FileName })
+                if (File.Exists(Path.Combine(checkpointDir, name)))
+                    File.Copy(Path.Combine(checkpointDir, name), Path.Combine(snapshot, name), overwrite: true);
+            // evaluate reconstructs the held-out split from this.
+            TrainingState.SaveProgress(snapshot, new TrainingProgress(completedEpochs, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, stepsInEpoch, validationSplitSeed, stepsPerEpoch, EarlyStoppingMetricName));
+        }
+
+        // Snapshot evaluations that came back: onto the trend charts, or logged if they failed.
+        void TakeFinishedSnapshots()
+        {
+            foreach (var finished in snapshots!.TakeFinished())
+                if (finished.Point is { } point)
+                    dashboard.AddEvaluationPoint(point);
+                else
+                {
+                    dashboard.SnapshotEvaluationFailed(finished.Step);
+                    dashboard.Log("[red]" + Markup.Escape($"snapshot evaluation at step {finished.Step:N0} failed ({finished.Failure}; see {Path.Combine(finished.Directory, "evaluation.log")})") + "[/]");
+                }
         }
 
         var stepsThisProcess = 0;
@@ -684,6 +731,19 @@ public static class TrainCommandHandler
                     if (targetOptions.CropConsistencyWeight > 0)
                         dashboard.CropTeacher(cropGate.TrustedCount, croppedImages / (double)((stepsThisProcess + 1L) * batchSize));
 
+                    if (snapshots is not null)
+                    {
+                        TakeFinishedSnapshots();
+                        // Epoch ends get their own evaluation below.
+                        var globalStep = (long)epoch * stepsPerEpoch + step + 1;
+                        if (globalStep % snapshotEvery == 0 && step + 1 < stepsPerEpoch)
+                        {
+                            dashboard.Phase($"snapshotting step {globalStep:N0} for evaluation");
+                            snapshots.Launch(globalStep, snapshot => WriteSnapshot(snapshot, epoch, step + 1));
+                            dashboard.SnapshotEvaluationStarted(globalStep);
+                        }
+                    }
+
                     // Mid-epoch safety net: an epoch can take multiple days, so waiting
                     // for the epoch-boundary save below to be the only recovery point
                     // would mean a crash loses up to a full epoch of work. Same two
@@ -702,6 +762,7 @@ public static class TrainCommandHandler
                             new TrainingProgress(epoch, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, step + 1, validationSplitSeed, stepsPerEpoch, EarlyStoppingMetricName),
                             optimizer);
                         TrainingState.SaveLogitScaleBiasOptimizerState(checkpointDir, logitScaleBiasOptimizer);
+                        dashboard.SaveLossHistory(checkpointDir);
                         sinceLastCheckpoint.Restart();
                         dashboard.CheckpointSaved();
                         foreach (var e in appliedOffloaded)
@@ -738,15 +799,7 @@ public static class TrainCommandHandler
                 {
                     var completedEpoch = epoch + 1;
                     dashboard.Phase($"end of epoch {completedEpoch}: snapshotting for the offloaded evaluation");
-                    offloaded.Launch(completedEpoch, snapshot =>
-                    {
-                        SaveCheckpoint(snapshot, imageTower, tagTower, logitScaleBias, embeddingDim, resolvedInputSize, vocabulary);
-                        foreach (var name in new[] { ExclusiveTagGroups.FileName, TagLocalizability.FileName })
-                            if (File.Exists(Path.Combine(checkpointDir, name)))
-                                File.Copy(Path.Combine(checkpointDir, name), Path.Combine(snapshot, name), overwrite: true);
-                        // evaluate reconstructs the held-out split from this.
-                        TrainingState.SaveProgress(snapshot, new TrainingProgress(completedEpoch, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, CompletedStepsInEpoch: 0, validationSplitSeed, stepsPerEpoch, EarlyStoppingMetricName));
-                    });
+                    offloaded.Launch(completedEpoch, snapshot => WriteSnapshot(snapshot, completedEpoch, 0));
                     dashboard.EvaluationOffloaded(completedEpoch);
                     dashboard.Log(Markup.Escape($"epoch {completedEpoch}: evaluation started in the background ({targetOptions.EvaluationCommand}); training continues"));
 
@@ -755,6 +808,11 @@ public static class TrainCommandHandler
                     {
                         dashboard.Phase($"end of epoch {completedEpoch}: waiting for the offloaded evaluations");
                         offloaded.WaitAll();
+                        if (snapshots is not null)
+                        {
+                            snapshots.WaitAll();
+                            TakeFinishedSnapshots();
+                        }
                     }
                     (appliedAtEpochEnd, stopEarly) = ApplyOffloaded();
                 }
@@ -812,6 +870,8 @@ public static class TrainCommandHandler
                         dashboard.Log(Markup.Escape($"crop consistency: {cropGate.TrustedCount} tags now trusted as teachers (held-out AP >= {targetOptions.CropTeacherMinAveragePrecision})"));
                     }
                     dashboard.EvaluationFinished(epoch, report, ratingReport);
+                    if (EvaluationPoint.Read(Path.Combine(checkpointDir, "history", $"epoch-{epoch + 1}"), (long)(epoch + 1) * stepsPerEpoch, endOfEpoch: true) is { } epochPoint)
+                        dashboard.AddEvaluationPoint(epochPoint);
                     dashboard.Log(Markup.Escape($"epoch {epoch + 1}/{epochs} validation loss {validationLoss:G4}"));
                     dashboard.Log(DescribeReport(report));
                     if (ratingReport is not null)
@@ -831,6 +891,7 @@ public static class TrainCommandHandler
                 dashboard.Phase($"end of epoch {epoch + 1}: saving training state");
                 TrainingState.Save(checkpointDir, new TrainingProgress(epoch + 1, earlyStopping.BestLoss, earlyStopping.EvaluationsSinceImprovement, CompletedStepsInEpoch: 0, validationSplitSeed, stepsPerEpoch, EarlyStoppingMetricName), optimizer);
                 TrainingState.SaveLogitScaleBiasOptimizerState(checkpointDir, logitScaleBiasOptimizer);
+                dashboard.SaveLossHistory(checkpointDir);
                 foreach (var e in appliedAtEpochEnd)
                     offloaded!.MarkApplied(e);
 

@@ -15,7 +15,8 @@ public sealed record TrainingRunInfo(
     int StartStepInEpoch,
     int ImagesPerStep,
     TimeSpan CheckpointInterval,
-    bool EvaluationsOffloaded = false);
+    bool EvaluationsOffloaded = false,
+    int SnapshotEvaluationSteps = 0);
 
 /// <summary>
 /// Live full-width status panel for <see cref="TrainCommandHandler"/>, replacing two
@@ -26,8 +27,10 @@ public sealed record TrainingRunInfo(
 /// checkpoint saves count at their real cost and a changed step time shows up within
 /// minutes instead of being averaged against the whole run. The run estimate adds the
 /// measured per-epoch evaluation time once one has run. The per-step loss is too noisy to
-/// read directly, so the panel also shows a trailing mean and a sparkline of
-/// <see cref="LossBucketSteps"/>-step means.
+/// read directly, so the panel also shows a trailing mean and a chart of
+/// <see cref="LossHistory"/>'s bucket means over the whole run (saved with each checkpoint, so a
+/// restart keeps it). Below that, one chart per headline metric across every evaluation so far,
+/// epoch and mid-epoch snapshot alike (<see cref="SnapshotEvaluations"/>).
 /// </para>
 /// State is written from the training thread and rendered from a timer thread, so every
 /// access goes through <see cref="_lock"/>.
@@ -36,10 +39,9 @@ public sealed class TrainingDashboard
 {
     public static readonly TimeSpan RateWindow = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan RateSampleInterval = TimeSpan.FromSeconds(5);
-    public const int LossBucketSteps = 2000;
     private const int RecentLossSteps = 1000;
-    private const int SparklineWidth = 48;
     private const int BarWidth = 40;
+    private const int ChartRows = 4;
 
     private readonly TrainingRunInfo _info;
     private readonly Func<DateTime> _now;
@@ -49,9 +51,9 @@ public sealed class TrainingDashboard
     private readonly Queue<(DateTime Time, long Step)> _rateSamples = new();
     private readonly Queue<float> _recentLosses = new();
     private double _recentLossSum;
-    private readonly List<float> _lossBuckets = [];
-    private double _bucketSum;
-    private int _bucketCount;
+    private readonly LossHistory _lossHistory;
+    private readonly SortedDictionary<long, EvaluationPoint> _points = new();
+    private readonly SortedDictionary<long, DateTime> _runningSnapshots = new();
 
     private int _epoch;
     private int _stepInEpoch;
@@ -74,9 +76,10 @@ public sealed class TrainingDashboard
     private readonly List<string> _events = [];
     private const int ShownEvents = 8;
 
-    public TrainingDashboard(TrainingRunInfo info, Func<DateTime>? now = null)
+    public TrainingDashboard(TrainingRunInfo info, Func<DateTime>? now = null, LossHistory? lossHistory = null)
     {
         _info = info;
+        _lossHistory = lossHistory ?? new LossHistory();
         _now = now ?? (() => DateTime.Now);
         _startedAt = _now();
         _epoch = info.StartEpoch;
@@ -143,6 +146,12 @@ public sealed class TrainingDashboard
                         $" · run ends in {Duration(TimeSpan.FromSeconds((TotalSteps - _globalStep) / rate))}";
             if (_recentLosses.Count > 0)
                 text += $" · loss (mean of last {_recentLosses.Count:N0}) {_recentLossSum / _recentLosses.Count:G4}";
+            if (_points.Count > 0)
+            {
+                var p = _points.Values.Last();
+                text += Markup.Escape($" · evaluation at step {p.Step:N0}: mAP {p.MeanAveragePrecision:F3}, gold pointing {p.GoldPointing:P1}, " +
+                                      $"context gaps {p.RecallGap:P1} / {p.FalsePositiveGap:P1}, blanked still called {p.OccludedStillCalled:P1}");
+            }
             return text;
         }
     }
@@ -184,15 +193,39 @@ public sealed class TrainingDashboard
             if (_recentLosses.Count > RecentLossSteps)
                 _recentLossSum -= _recentLosses.Dequeue();
 
-            _bucketSum += loss;
-            if (++_bucketCount == LossBucketSteps)
-            {
-                _lossBuckets.Add((float)(_bucketSum / _bucketCount));
-                if (_lossBuckets.Count > SparklineWidth)
-                    _lossBuckets.RemoveAt(0);
-                (_bucketSum, _bucketCount) = (0, 0);
-            }
+            _lossHistory.Add(_globalStep, loss);
         }
+    }
+
+    /// <summary>Writes the loss history next to a checkpoint being saved (<see cref="LossHistory.Load"/> reads it back on resume).</summary>
+    public void SaveLossHistory(string checkpointDir)
+    {
+        lock (_lock)
+            _lossHistory.Save(checkpointDir);
+    }
+
+    /// <summary>An evaluation's headline numbers, epoch or snapshot, for the trend charts.</summary>
+    public void AddEvaluationPoint(EvaluationPoint point)
+    {
+        lock (_lock)
+        {
+            _points[point.Step] = point;
+            _runningSnapshots.Remove(point.Step);
+        }
+    }
+
+    /// <summary>A snapshot evaluation started (or restarted) in another process.</summary>
+    public void SnapshotEvaluationStarted(long step)
+    {
+        lock (_lock)
+            _runningSnapshots[step] = _now();
+    }
+
+    /// <summary>A snapshot evaluation ended without a result; it's logged separately.</summary>
+    public void SnapshotEvaluationFailed(long step)
+    {
+        lock (_lock)
+            _runningSnapshots.Remove(step);
     }
 
     /// <summary>A step-free activity (checkpoint save, ranking evaluation); cleared by the next step.</summary>
@@ -346,21 +379,28 @@ public sealed class TrainingDashboard
                 Row("evaluating", string.Join(" · ", _offloadedEvaluations.Select(p =>
                         $"epoch {p.Key} in another process since {p.Value:HH:mm}, running {Duration(now - p.Value)}")) +
                     " [grey](applied at the first checkpoint save after it finishes)[/]");
+            if (_info.SnapshotEvaluationSteps > 0)
+                Row("snapshots", SnapshotText(now, rate));
             Row("last evaluation", _lastEvaluation is not null
                 ? Markup.Escape(_lastEvaluation)
                 : _offloadedEvaluations.Count > 0
                     ? "[grey]none applied yet[/]"
                     : $"[grey]none yet: runs at the end of epoch {_epoch + 1}{(epochLeft is { } e ? $" (≈ {Clock(now + e, now)})" : "")}[/]");
 
+            var body = new List<IRenderable> { grid };
+            body.AddRange(Charts());
+
             if (_events.Count > 0)
             {
-                grid.AddEmptyRow();
+                var events = new Grid().AddColumn(new GridColumn().NoWrap().PadRight(2)).AddColumn();
                 var shown = _events.Skip(Math.Max(0, _events.Count - ShownEvents)).ToList();
                 for (var k = 0; k < shown.Count; k++)
-                    grid.AddRow(new Markup(k == 0 ? $"[grey]events{(_events.Count > ShownEvents ? $" (last {ShownEvents})" : "")}[/]" : ""), new Markup(shown[k]));
+                    events.AddRow(new Markup(k == 0 ? $"[grey]events{(_events.Count > ShownEvents ? $" (last {ShownEvents})" : "")}[/]" : ""), new Markup(shown[k]));
+                body.Add(new Text(""));
+                body.Add(events);
             }
 
-            return new Panel(grid)
+            return new Panel(new Rows(body))
                 .Header($" {Markup.Escape(_info.Title)} ")
                 .Border(BoxBorder.Rounded)
                 .Expand();
@@ -389,11 +429,80 @@ public sealed class TrainingDashboard
             text.Append(CultureInfo.InvariantCulture, $" [grey](tags {_tagLoss:G4} + weighted localization {_localizationLoss:G4})[/]");
         if (_recentLosses.Count > 0)
             text.Append(CultureInfo.InvariantCulture, $" · mean of last {_recentLosses.Count:N0}: [bold]{_recentLossSum / _recentLosses.Count:G4}[/]");
-        if (_lossBuckets.Count >= 2)
-            text.Append(CultureInfo.InvariantCulture,
-                $" · trend {_lossBuckets[0]:G3} [aqua]{Sparkline(_lossBuckets)}[/] {_lossBuckets[^1]:G3} [grey](mean per {LossBucketSteps:N0} steps)[/]");
         return text.ToString();
     }
+
+    private string SnapshotText(DateTime now, double rate)
+    {
+        var every = _info.SnapshotEvaluationSteps;
+        var snapshots = _points.Values.Count(p => !p.EndOfEpoch);
+        var next = (_globalStep / every + 1) * every;
+        var text = $"every {every:N0} steps · {snapshots:N0} evaluated so far · next at step {next:N0}" +
+                   (rate > 0 ? $" (≈ {Clock(now + TimeSpan.FromSeconds((next - _globalStep) / rate), now)})" : "");
+        if (_runningSnapshots.Count > 0)
+            text += " · evaluating " + string.Join(", ", _runningSnapshots.Select(r => $"step {r.Key:N0} (since {r.Value:HH:mm})"));
+        return text + " [grey](in another process; trend charts below)[/]";
+    }
+
+    /// <summary>The loss chart, then one chart per headline evaluation metric.</summary>
+    private IEnumerable<IRenderable> Charts()
+    {
+        if (_lossHistory.Buckets.Count >= 2)
+        {
+            yield return new Text("");
+            var loss = _lossHistory.Buckets.Select(b => ((double)b.End, (double)b.Mean)).ToList();
+            yield return Chart($"loss, mean per {_lossHistory.BucketSteps:N0} steps", loss, false, v => v.ToString("G3", CultureInfo.InvariantCulture), Color.Aqua);
+        }
+        if (_points.Count == 0)
+            yield break;
+
+        static string Fraction(double v) => v.ToString("F3", CultureInfo.InvariantCulture);
+        static string Percent(double v) => (100 * v).ToString("F1", CultureInfo.InvariantCulture) + "%";
+        var metrics = new (string Name, Func<EvaluationPoint, double> Value, bool LowerIsBetter, Func<double, string> Format)[]
+        {
+            ("held-out mAP", p => p.MeanAveragePrecision, false, Fraction),
+            ("gold pointing", p => p.GoldPointing, false, Percent),
+            ("blanked object still called", p => p.OccludedStillCalled, true, Percent),
+            ("context recall gap", p => p.RecallGap, true, Percent),
+            ("context false-positive gap", p => p.FalsePositiveGap, true, Percent),
+            ("exclusive-tag violations", p => p.ExclusiveViolations, true, Percent),
+        };
+        var grid = new Grid();
+        for (var c = 0; c < 3; c++)
+            grid.AddColumn(new GridColumn().PadRight(c < 2 ? 4 : 0));
+        var charts = metrics.Select(m => Chart(m.Name, _points.Values.Select(p => ((double)p.Step, m.Value(p))).ToList(), m.LowerIsBetter, m.Format, Color.Green)).ToList();
+        for (var k = 0; k < charts.Count; k += 3)
+            grid.AddRow(charts.Skip(k).Take(3).ToArray());
+        yield return new Text("");
+        yield return new Markup($"[grey]evaluations: {_points.Count:N0} ({_points.Values.Count(p => p.EndOfEpoch)} at epoch ends), by training step · ↓ = lower is better[/]");
+        yield return grid;
+    }
+
+    /// <summary>A chart under a title line with the latest value and its change since the point before.</summary>
+    private static IRenderable Chart(string name, List<(double X, double Y)> points, bool lowerIsBetter, Func<double, string> format, Color color)
+    {
+        var valid = points.Where(p => !double.IsNaN(p.Y)).ToList();
+        var title = $"[grey]{Markup.Escape(name)}[/]";
+        if (valid.Count > 0)
+            title += $" [bold]{Markup.Escape(format(valid[^1].Y))}[/]";
+        if (valid.Count > 1)
+        {
+            var change = valid[^1].Y - valid[^2].Y;
+            var better = lowerIsBetter ? change < 0 : change > 0;
+            var sign = change >= 0 ? "+" : "−";
+            var magnitude = format(Math.Abs(change));
+            title += $" [{(change == 0 ? "grey" : better ? "green" : "red")}]{sign}{Markup.Escape(magnitude)}[/] [grey]since step {Steps(valid[^2].X)}[/]";
+        }
+        if (lowerIsBetter)
+            title += " [grey]↓[/]";
+        return new Rows(new Markup(title), new BrailleChart(points, ChartRows, format, Steps, color));
+    }
+
+    /// <summary>A step count in thousands or millions: "24.9K", "1.45M".</summary>
+    public static string Steps(double step) =>
+        step >= 1_000_000 ? (step / 1_000_000).ToString("0.##", CultureInfo.InvariantCulture) + "M"
+        : step >= 1_000 ? (step / 1_000).ToString("0.#", CultureInfo.InvariantCulture) + "K"
+        : step.ToString("0", CultureInfo.InvariantCulture);
 
     public static string Sparkline(IReadOnlyList<float> values)
     {

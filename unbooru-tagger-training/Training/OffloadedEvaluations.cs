@@ -26,12 +26,12 @@ namespace UnbooruTagger.Training.Training;
 public sealed class OffloadedEvaluations(string checkpointDir, string command) : IDisposable
 {
     public const string SnapshotDirectoryName = "checkpoint";
-    private const string DoneMarker = "evaluation.done";
-    private const string FailedMarker = "evaluation.failed";
+    internal const string DoneMarker = "evaluation.done";
+    internal const string FailedMarker = "evaluation.failed";
     private const string AppliedMarker = "evaluation.applied";
     private const string LogFileName = "evaluation.log";
 
-    private static readonly JsonSerializerOptions JsonOptions = new() { NumberHandling = JsonNumberHandling.AllowNamedFloatingPointLiterals };
+    internal static readonly JsonSerializerOptions JsonOptions = new() { NumberHandling = JsonNumberHandling.AllowNamedFloatingPointLiterals };
 
     private readonly SortedDictionary<int, (Process Process, StreamWriter Log)> _running = new();
 
@@ -127,18 +127,20 @@ public sealed class OffloadedEvaluations(string checkpointDir, string command) :
             process.WaitForExit();
     }
 
-    private void Start(int epoch)
+    private void Start(int epoch) => _running[epoch] = StartProcess(command, SnapshotDirectory(epoch), EpochDirectory(epoch));
+
+    /// <summary>Starts <c>&lt;command&gt; &lt;snapshot&gt; &lt;reportDirectory&gt;</c>, its output going to evaluation.log in the report directory.</summary>
+    internal static (Process Process, StreamWriter Log) StartProcess(string command, string snapshot, string reportDirectory)
     {
-        var epochDir = EpochDirectory(epoch);
         var start = new ProcessStartInfo(command)
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
         };
-        start.ArgumentList.Add(SnapshotDirectory(epoch));
-        start.ArgumentList.Add(epochDir);
-        var log = new StreamWriter(Path.Combine(epochDir, LogFileName), append: false) { AutoFlush = true };
+        start.ArgumentList.Add(snapshot);
+        start.ArgumentList.Add(reportDirectory);
+        var log = new StreamWriter(Path.Combine(reportDirectory, LogFileName), append: false) { AutoFlush = true };
         var process = new Process { StartInfo = start };
         DataReceivedEventHandler write = (_, e) =>
         {
@@ -156,10 +158,10 @@ public sealed class OffloadedEvaluations(string checkpointDir, string command) :
         process.Start();
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
-        _running[epoch] = (process, log);
+        return (process, log);
     }
 
-    private static T? Read<T>(string directory, string fileName) where T : class
+    internal static T? Read<T>(string directory, string fileName) where T : class
     {
         var path = Path.Combine(directory, fileName);
         return File.Exists(path) ? JsonSerializer.Deserialize<T>(File.ReadAllText(path), JsonOptions) : null;

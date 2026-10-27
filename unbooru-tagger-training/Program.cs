@@ -170,6 +170,11 @@ var evaluationCommandOption = new Option<string?>("--evaluation-command")
 {
     Description = "Executable that runs each epoch's evaluation in the background, called as <command> <snapshot dir> <report dir> (e.g. a script running `evaluate` on another GPU). Training continues meanwhile; results are applied as they come back. Unset = evaluate inline."
 };
+var snapshotEvaluationStepsOption = new Option<int>("--snapshot-evaluation-steps")
+{
+    Description = "With --evaluation-command: also evaluate a snapshot of the model every this many steps (counted over the whole run) in the background, for the dashboard's trend charts. Reports go to <checkpoint>/snapshots/step-N/; the snapshot's weights are deleted once evaluated. Doesn't affect early stopping. 0 = only at epoch ends.",
+    DefaultValueFactory = _ => 0
+};
 var localizableTagsOption = new Option<string?>("--localizable-tags")
 {
     Description = "Rules file for which tags have no region to localize (backgrounds, mediums, styles, lighting, framing, people counts, artist:/series:/...). One rule per line: 'tag', 'prefix*', '*suffix', '!' prefix for exceptions. Omit to reuse the checkpoint's saved copy, or the built-in defaults."
@@ -248,6 +253,7 @@ trainCommand.Options.Add(localizationBackgroundWeightOption);
 trainCommand.Options.Add(localizationBackgroundFractionOption);
 trainCommand.Options.Add(maxStepsOption);
 trainCommand.Options.Add(evaluationCommandOption);
+trainCommand.Options.Add(snapshotEvaluationStepsOption);
 trainCommand.Options.Add(trainGoldOption);
 trainCommand.Options.Add(cropConsistencyWeightOption);
 trainCommand.Options.Add(cropTeacherMinApOption);
@@ -309,7 +315,8 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         CompactVocabulary: !parseResult.GetValue(keepVocabularyOption),
         CosineSchedule: parseResult.GetRequiredValue(lrScheduleOption) == "cosine",
         WarmupSteps: parseResult.GetRequiredValue(warmupStepsOption),
-        EvaluationCommand: parseResult.GetValue(evaluationCommandOption)),
+        EvaluationCommand: parseResult.GetValue(evaluationCommandOption),
+        SnapshotEvaluationSteps: parseResult.GetRequiredValue(snapshotEvaluationStepsOption)),
     parseResult.GetRequiredValue(ioParallelismOption),
     parseResult.GetRequiredValue(prefetchBatchesOption),
     new TowerOptions(

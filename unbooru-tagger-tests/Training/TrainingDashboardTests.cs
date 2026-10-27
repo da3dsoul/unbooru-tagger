@@ -52,7 +52,7 @@ public class TrainingDashboardTests
         Assert.Contains("19h 34m left · epoch ends", text);
         Assert.Contains("epoch 1/6", text);
         Assert.Contains("finishes", text);
-        Assert.Contains("trend", text);
+        Assert.Contains("loss, mean per 2,000 steps", text);
         Assert.Contains("none yet: runs at the end of epoch 1", text);
         Assert.DoesNotContain("…", text.Replace("estimating…", ""));
     }
@@ -109,6 +109,26 @@ public class TrainingDashboardTests
         var applied = Render(dashboard);
         Assert.DoesNotContain("in another process since", applied);
         Assert.Contains("epoch 1: mAP 0.8100", applied);
+    }
+
+    [Fact]
+    public void EvaluationPoints_AreChartedWithTheirLatestChange()
+    {
+        var now = new DateTime(2026, 10, 27, 2, 0, 0);
+        var dashboard = new TrainingDashboard(Info with { EvaluationsOffloaded = true, SnapshotEvaluationSteps = 10_000 }, () => now);
+        dashboard.AddEvaluationPoint(new EvaluationPoint(190_000, false, 0.40, 0.29, 0.056, 0.107, 0.86, 0.27));
+        dashboard.AddEvaluationPoint(new EvaluationPoint(200_000, false, 0.42, 0.30, 0.060, 0.100, 0.84, double.NaN));
+        dashboard.SnapshotEvaluationStarted(210_000);
+
+        var text = Render(dashboard);
+        Assert.Contains("every 10,000 steps · 2 evaluated so far · next at step 200,000", text);
+        Assert.Contains("evaluating step 210,000 (since 02:00)", text);
+        Assert.Contains("held-out mAP 0.420 +0.020 since step 190K", text);
+        Assert.Contains("blanked object still called 84.0% −2.0% since step 190K ↓", text);
+        Assert.Contains("exclusive-tag violations 27.0%", text); // the latest point without it keeps the last known value
+        Assert.Contains("190K", text);
+        Assert.Contains("200K", text);
+        Assert.DoesNotContain("…", text.Replace("estimating…", "")); // nothing cut off
     }
 
     private static string Render(TrainingDashboard dashboard)
