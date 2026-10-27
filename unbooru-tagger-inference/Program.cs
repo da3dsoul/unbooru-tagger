@@ -114,6 +114,7 @@ var optionalModelDirOption = new Option<string?>("--model-dir")
 };
 
 var allTagsOption = new Option<bool>("--all-tags") { Description = "Show every tag the model detects, not just the ones the gold set boxes on that image" };
+var pngOption = new Option<bool>("--png") { Description = "With a model, also write the side-by-side PNGs with the boxes drawn in (they're otherwise only written to boxes.json, for gold/compare.html's interactive view)" };
 var renderGoldCommand = new Command("render-gold", "Render a gold set's hand-checked boxes the way detect renders, optionally side by side with a model's detect output, for manual comparison");
 renderGoldCommand.Arguments.Add(goldArgument);
 renderGoldCommand.Options.Add(renderOutDirOption);
@@ -125,6 +126,7 @@ renderGoldCommand.Options.Add(minHeatmapRangeOption);
 renderGoldCommand.Options.Add(minBoxFractionOption);
 renderGoldCommand.Options.Add(maxBoxesPerTagOption);
 renderGoldCommand.Options.Add(allTagsOption);
+renderGoldCommand.Options.Add(pngOption);
 renderGoldCommand.SetAction(parseResult => RenderGoldCommandHandler.Run(
     parseResult.GetRequiredValue(goldArgument),
     parseResult.GetRequiredValue(renderOutDirOption),
@@ -135,7 +137,8 @@ renderGoldCommand.SetAction(parseResult => RenderGoldCommandHandler.Run(
     parseResult.GetRequiredValue(minHeatmapRangeOption),
     parseResult.GetRequiredValue(minBoxFractionOption),
     parseResult.GetRequiredValue(maxBoxesPerTagOption),
-    parseResult.GetValue(allTagsOption)));
+    parseResult.GetValue(allTagsOption),
+    parseResult.GetValue(pngOption)));
 
 var rootCommand = new RootCommand("unbooru-tagger inference CLI")
 {

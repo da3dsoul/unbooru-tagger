@@ -11,14 +11,20 @@ namespace UnbooruTagger.Inference.Commands;
 /// gold boxes and that model's <c>detect</c> output side by side, so localization can be judged
 /// by eye against ground truth image by image. The model panel shows only the tags the gold set
 /// boxes on that image unless <c>--all-tags</c> is given.
+///
+/// With a model, the boxes also go to <see cref="BoxesFileName"/> (per image: each detected tag,
+/// its confidence and its boxes, in image pixels), which gold/compare.html draws on a canvas over
+/// the plain image with one list entry per box, so overlapping boxes can be told apart. The PNGs
+/// are then only written with <c>--png</c>.
 /// </summary>
 public static class RenderGoldCommandHandler
 {
     private const int HeaderHeight = 24;
+    public const string BoxesFileName = "boxes.json";
 
     public static int Run(
         string goldPath, string outputDirectory, string? modelDir, float? threshold,
-        float boxThreshold, float boxPercentile, float minHeatmapRange, float minBoxFraction, int maxBoxesPerTag, bool allTags = false)
+        float boxThreshold, float boxPercentile, float minHeatmapRange, float minBoxFraction, int maxBoxesPerTag, bool allTags = false, bool png = false)
     {
         var goldDirectory = Path.GetDirectoryName(Path.GetFullPath(goldPath))!;
         using var document = JsonDocument.Parse(File.ReadAllText(goldPath));
@@ -26,6 +32,8 @@ public static class RenderGoldCommandHandler
         Directory.CreateDirectory(outputDirectory);
 
         var count = 0;
+        var boxes = new Dictionary<string, object>();
+        var writePng = model is null || png;
         foreach (var image in document.RootElement.GetProperty("images").EnumerateArray())
         {
             if (image.TryGetProperty("excluded", out var excluded) && excluded.ValueKind == JsonValueKind.True)
@@ -47,9 +55,9 @@ public static class RenderGoldCommandHandler
                 .GroupBy(i => i.Tag)
                 .Select(g => new TagDetection(g.Key, 1f, g.Select(i => new BoundingBox(i.Box[0], i.Box[1], i.Box[2], i.Box[3], 1f)).ToList()))
                 .ToList();
-            using var goldRender = DetectCommandHandler.RenderBoxes(original, gold, showConfidence: false);
+            using var goldRender = writePng ? DetectCommandHandler.RenderBoxes(original, gold, showConfidence: false) : null;
 
-            SKBitmap output;
+            SKBitmap? output = null;
             if (model is not null)
             {
                 var detections = DetectCommandHandler.Detect(model, imagePath, threshold, boxThreshold, boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag);
@@ -59,24 +67,42 @@ public static class RenderGoldCommandHandler
                     var targets = image.GetProperty("targets").EnumerateArray().Select(t => t.GetString()!).ToHashSet(StringComparer.Ordinal);
                     detections = detections.Where(d => targets.Contains(d.Tag) || targets.Contains(d.Tag.Replace(' ', '_'))).ToList();
                 }
-                using var modelRender = DetectCommandHandler.RenderBoxes(original, detections);
-                output = SideBySide(($"gold ({StratumOf(image)})", goldRender), ($"model ({Path.GetFileName(Path.TrimEndingDirectorySeparator(modelDir!))})", modelRender));
+                boxes[index.ToString()] = detections.Select(d => new
+                {
+                    tag = d.Tag,
+                    confidence = d.Confidence,
+                    boxes = d.Boxes.Select(b => new[] { b.X, b.Y, b.Width, b.Height, b.Confidence }),
+                });
+                if (writePng)
+                {
+                    using var modelRender = DetectCommandHandler.RenderBoxes(original, detections);
+                    output = SideBySide(($"gold ({StratumOf(image)})", goldRender!), ($"model ({ModelName(modelDir!)})", modelRender));
+                }
             }
             else
             {
-                output = SideBySide(($"gold ({StratumOf(image)})", goldRender));
+                output = SideBySide(($"gold ({StratumOf(image)})", goldRender!));
             }
 
-            using (output)
-            using (var encoded = SKImage.FromBitmap(output).Encode(SKEncodedImageFormat.Png, 100))
-            using (var stream = File.Create(Path.Combine(outputDirectory, $"{index}.png")))
-                encoded.SaveTo(stream);
+            if (output is not null)
+            {
+                using (output)
+                using (var encoded = SKImage.FromBitmap(output).Encode(SKEncodedImageFormat.Png, 100))
+                using (var stream = File.Create(Path.Combine(outputDirectory, $"{index}.png")))
+                    encoded.SaveTo(stream);
+            }
             count++;
         }
 
-        Console.WriteLine($"Rendered {count} images to '{outputDirectory}'.");
+        if (model is not null)
+            File.WriteAllText(Path.Combine(outputDirectory, BoxesFileName), JsonSerializer.Serialize(new { model = ModelName(modelDir!), images = boxes }));
+        Console.WriteLine(writePng
+            ? $"Rendered {count} images to '{outputDirectory}'."
+            : $"Wrote {count} images' boxes to '{Path.Combine(outputDirectory, BoxesFileName)}'.");
         return 0;
     }
+
+    private static string ModelName(string modelDir) => Path.GetFileName(Path.TrimEndingDirectorySeparator(modelDir));
 
     private static string StratumOf(JsonElement image) =>
         image.TryGetProperty("stratum", out var stratum) ? stratum.GetString() ?? "clean" : "clean";
