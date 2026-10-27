@@ -58,7 +58,7 @@ public static class ImageTowerOnnxExporter
         {
             var lateral = ExportConv2d(graph, tower.Laterals[k - 1], stageOutputs[tower.StageChannels.Length - 1 - k], names);
             projectedSpatial = ExportBinaryOp(graph, "Add", ExportUpsample2x(graph, projectedSpatial, names), lateral, names, "fused");
-            if (tower.LocalizationFromFusedOnly)
+            if (tower.LocalizationFromFusedOnly && k > tower.LocalizationSkippedLaterals)
                 localization = localization is null
                     ? lateral
                     : ExportBinaryOp(graph, "Add", ExportUpsample2x(graph, localization, names), lateral, names, "localization");

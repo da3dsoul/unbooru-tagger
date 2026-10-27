@@ -30,6 +30,14 @@ public class ImageTowerOnnxExportTests
             new ImageTower(8, stemChannels: 8, stageChannels: [8, 12, 16], blocksPerStage: [1, 1, 1], fusedStages: 2) { LocalizationFromFusedOnly = true },
             64, expectedSpatialSize: 16);
 
+    [Fact]
+    public void ExportedGraph_WithLocalMap_LeavesOutTheCoarsestLateral()
+    {
+        var tower = new ImageTower(8, stemChannels: 8, stageChannels: [8, 12, 16, 20], blocksPerStage: [1, 1, 1, 1], fusedStages: 3) { LocalizationFromFusedOnly = true };
+        tower.LocalizationSkippedLaterals = 1;
+        AssertExportMatches(tower, 64, expectedSpatialSize: 16);
+    }
+
     private static void AssertExportMatches(ImageTower tower, int inputSize, int expectedSpatialSize)
     {
         tower.eval();

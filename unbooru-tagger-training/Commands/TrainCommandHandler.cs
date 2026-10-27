@@ -216,6 +216,11 @@ public static class TrainCommandHandler
             imageTower.LocalizationFromFusedOnly = fusedOnly;
             AnsiConsole.MarkupLineInterpolated($"Localization map: {(fusedOnly ? "fused laterals only" : "full spatial map")}.");
         }
+        if (targetOptions.LocalizationSkippedLaterals is { } skipped && skipped != imageTower.LocalizationSkippedLaterals)
+        {
+            imageTower.LocalizationSkippedLaterals = skipped;
+            AnsiConsole.MarkupLineInterpolated($"Localization map: leaving out the {skipped} coarsest fused lateral(s); {imageTower.FusedStages - skipped} kept.");
+        }
 
         exclusiveGroups = ExclusiveTagGroups.Parse(exclusiveGroups.SourceText, vocabulary);
         if (ratingRows is not null)
@@ -275,9 +280,7 @@ public static class TrainCommandHandler
                 contextNegativesPerAnchor: targetOptions.ContextNegativesPerAnchor)
             : null;
         AnsiConsole.MarkupLineInterpolated(
-            $"{statistics.ContextSources.Count(c => c.Length > 0)} tags have context sources (P(tag|source) in [[{targetOptions.ImpliedThreshold}, {targetOptions.MissingThreshold})); {targetOptions.ContextNegativesPerAnchor} context negative(s) per anchor.");
-        var pairWeightBuilder = new PairWeightBuilder(statistics, exclusiveGroups, targetOptions.CertainNegativeWeight,
-            exhaustiveRows: ratings is not null ? ratingRows : null);
+            $"{statistics.ContextSources.Count(c => c.Length > 0)} tags have context sources (P(tag|source) in [[{targetOptions.ImpliedThreshold}, {targetOptions.MissingThreshold})); {targetOptions.ContextNegativesPerAnchor} context negative(s) per anchor, trained {(targetOptions.ContextNegativeWeight > 0 ? $"at full strength, weight {targetOptions.ContextNegativeWeight}, for localizable tags" : "as unverified negatives")}.");
         AnsiConsole.MarkupLineInterpolated(
             $"{statistics.Positives.Count(p => p.Length > 0)} of {vocabulary.Records.Count} tags have training images; {(tagCentricSampler is not null ? $"{tagCentricSampler.AnchorTagCount} anchor tags" : "rare-tag image sampling")}.");
 
@@ -289,6 +292,9 @@ public static class TrainCommandHandler
         var localizability = TagLocalizability.Load(targetOptions.LocalizableTagsPath ?? Path.Combine(checkpointDir, TagLocalizability.FileName));
         localizability.Save(Path.Combine(checkpointDir, TagLocalizability.FileName));
         var localizable = vocabulary.Records.Select(r => localizability.IsLocalizable(r.Tag)).ToArray();
+        var pairWeightBuilder = new PairWeightBuilder(statistics, exclusiveGroups, targetOptions.CertainNegativeWeight,
+            exhaustiveRows: ratings is not null ? ratingRows : null, contextNegativeWeight: targetOptions.ContextNegativeWeight,
+            contextNegativeTags: localizable);
 
         // Crop consistency trains only tags the classifier is already good at (CropTeacherGate),
         // starting from the last epoch's evaluation and refreshed after every epoch.
@@ -299,6 +305,15 @@ public static class TrainCommandHandler
         if (targetOptions.CropConsistencyWeight > 0)
             AnsiConsole.MarkupLineInterpolated(
                 $"Crop consistency: {cropGate.TrustedCount} localizable tags trusted as teachers (held-out AP >= {targetOptions.CropTeacherMinAveragePrecision}, >= {targetOptions.CropTeacherMinPositives} positives){(cropGate.TrustedCount == 0 ? "; off until an epoch evaluation trusts some" : "")}; re-checked after every epoch.");
+        if (targetOptions.MosaicsPerStep > 0)
+        {
+            if (!targetOptions.DeliberateTargets || localizationWeight <= 0)
+                throw new ArgumentException("--mosaics-per-step trains the localization loss on deliberate targets; it needs --targets deliberate and --localization-weight > 0.");
+            if (batchSize < Mosaic.TilesPerMosaic)
+                throw new ArgumentException($"--mosaics-per-step needs at least {Mosaic.TilesPerMosaic} images per batch (--batch-size {batchSize}).");
+            AnsiConsole.MarkupLineInterpolated(
+                $"Mosaic: {Math.Min(targetOptions.MosaicsPerStep, batchSize / Mosaic.TilesPerMosaic)} canvas(es) of four half-size batch images per step, weight {targetOptions.MosaicWeight} x the localization weight.");
+        }
 
         var earlyStopping = new EarlyStopping(earlyStoppingPatience);
         // Only resume early-stopping history recorded against the same metric -- a best
@@ -409,6 +424,7 @@ public static class TrainCommandHandler
 
         var stepsThisProcess = 0;
         var cropRandom = new Random();
+        var mosaicRandom = new Random();
         long croppedImages = 0;
         void TrainingLoop()
         {
@@ -533,6 +549,7 @@ public static class TrainCommandHandler
                     var tagLoss = loss;
                     Tensor? sparseLocalized = null;
                     Tensor? cropTerm = null;
+                    Tensor? mosaicTerm = null;
 
                     // Deliberate targets: the per-location loss only on pairs where "where is
                     // it?" has an answer (LocalizationPairSelector) -- ~100 pairs per image
@@ -572,6 +589,26 @@ public static class TrainCommandHandler
                                 localizationMap, tagEmbeddings, devicePairs, windowMask, teacher, (float)localizationTemperature, logitScaleBias,
                                 pairTrusted, targetOptions.CropTeacherConfidence);
                             loss += targetOptions.CropConsistencyWeight * cropTerm;
+                        }
+
+                        // Mosaic: four of the batch's images at half size on one canvas; each tile is
+                        // a bag of its own, and the other tiles' tags must not light up in it (Mosaic).
+                        var tileImages = targetOptions.MosaicsPerStep > 0
+                            ? Mosaic.PickTiles((int)pixelBatch.shape[0], targetOptions.MosaicsPerStep, mosaicRandom)
+                            : [];
+                        if (tileImages.Length > 0)
+                        {
+                            var canvases = Mosaic.Compose(pixelBatch, tileImages, resolvedInputSize);
+                            var (_, mosaicMap) = imageTower.ForwardMaps(canvases);
+                            var tileBoxes = tileImages.Select((image, k) => Mosaic.TileBox(boxes[image], k % Mosaic.TilesPerMosaic, resolvedInputSize)).ToArray();
+                            using var tileMask = SpatialMask.Build(tileBoxes, resolvedInputSize, mosaicMap.shape[2], mosaicMap.shape[3], device);
+                            using var cpuTilePairs = Mosaic.TilePairs(pairs, cpuTargets, tileImages);
+                            using var tilePairs = cpuTilePairs.To(device);
+                            using var canvasOfTile = tensor(Enumerable.Range(0, tileImages.Length).Select(k => (long)(k / Mosaic.TilesPerMosaic)).ToArray(), device: device);
+                            mosaicTerm = SigmoidContrastiveLoss.ComputeLocalizedPairs(
+                                mosaicMap.index_select(0, canvasOfTile), tagEmbeddings, tilePairs, (float)localizationTemperature, tileMask, logitScaleBias,
+                                targetOptions.NegativeGamma, targetOptions.NegativeClip);
+                            loss += localizationWeight * targetOptions.MosaicWeight * mosaicTerm;
                         }
                     }
 
@@ -638,6 +675,8 @@ public static class TrainCommandHandler
                         : (float)(localizationWeight * localizedLossValue);
                     if (cropTerm is not null)
                         localizationShown += (float)(targetOptions.CropConsistencyWeight * cropTerm.item<float>());
+                    if (mosaicTerm is not null)
+                        localizationShown += (float)(localizationWeight * targetOptions.MosaicWeight * mosaicTerm.item<float>());
                     var currentRate = targetOptions.CosineSchedule
                         ? LearningRateSchedule.At((long)epoch * stepsPerEpoch + step, (long)epochs * stepsPerEpoch, learningRate, targetOptions.WarmupSteps)
                         : learningRate;

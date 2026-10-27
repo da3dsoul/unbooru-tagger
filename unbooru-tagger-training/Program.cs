@@ -88,6 +88,11 @@ var contextNegativesPerAnchorOption = new Option<int>("--context-negatives-per-a
     Description = "Tag-centric sampling: context negatives drawn per anchor tag (images with a tag that usually comes with the anchor, but without the anchor), for tags that have any.",
     DefaultValueFactory = _ => 1
 };
+var contextNegativeWeightOption = new Option<float>("--context-negative-weight")
+{
+    Description = "Deliberate targets: train context negatives (an image with a tag that usually comes with tag t, but without t) as full-strength negatives with this weight, instead of focal-damped unverified ones. Applies to every such pair in a batch, not just sampled ones, for localizable tags only (whole-image tags like 1girl are often just untagged). 0 = unverified (the original behavior).",
+    DefaultValueFactory = _ => 0f
+};
 var exclusiveTagsOption = new Option<string?>("--exclusive-tags")
 {
     Description = "File of mutually exclusive tag groups (one comma-separated group per line, e.g. 'solo, multiple_girls'). Omit to reuse the checkpoint's saved copy, or the built-in people-count/rating groups."
@@ -119,9 +124,9 @@ var localizationBackgroundFractionOption = new Option<float>("--localization-bac
 };
 var localizationMapOption = new Option<string?>("--localization-map")
 {
-    Description = "Which map localization trains on and heatmaps are drawn from: 'fused' = the fused high-resolution laterals only (needs --fused-stages > 0), 'full' = the whole spatial map classification pools. Applies on resume too; omitted keeps the checkpoint's setting (full for a fresh run)."
+    Description = "Which map localization trains on and heatmaps are drawn from: 'local' = the fused laterals without the coarsest one (stride 16), so each location sees about 100px (needs --fused-stages >= 2); 'fused' = all fused high-resolution laterals (needs --fused-stages > 0); 'full' = the whole spatial map classification pools. Applies on resume too; omitted keeps the checkpoint's setting (full for a fresh run)."
 };
-localizationMapOption.AcceptOnlyFromAmong("full", "fused");
+localizationMapOption.AcceptOnlyFromAmong("full", "fused", "local");
 var cropConsistencyWeightOption = new Option<float>("--crop-consistency-weight")
 {
     Description = "Crop consistency: each step, the classifier scores a random square crop of every image (an extra forward pass without gradients), and the localization map pooled over the same window is trained to agree, which pulls heatmap peaks onto the objects. Weight added to the loss; 0 = off.",
@@ -141,6 +146,16 @@ var cropTeacherConfidenceOption = new Option<float>("--crop-teacher-confidence")
 {
     Description = "Crop consistency only trains on the classifier's crop answers with p above this or below 1 minus it.",
     DefaultValueFactory = _ => 0.9f
+};
+var mosaicsPerStepOption = new Option<int>("--mosaics-per-step")
+{
+    Description = "Mosaic localization training: each step, this many canvases of four of the batch's images, each shrunk 2x into one tile. Every tile keeps all its tags (nothing is cropped away) and its location is known, so the localization loss learns each tag in its own tile and not in the others, at half scale. Costs a forward/backward pass per mosaic; needs deliberate targets and --localization-weight > 0. 0 = off.",
+    DefaultValueFactory = _ => 0
+};
+var mosaicWeightOption = new Option<float>("--mosaic-weight")
+{
+    Description = "Mosaic loss weight, relative to --localization-weight.",
+    DefaultValueFactory = _ => 1f
 };
 var trainGoldOption = new Option<string?>("--gold")
 {
@@ -216,6 +231,7 @@ trainCommand.Options.Add(certainNegativeWeightOption);
 trainCommand.Options.Add(impliedThresholdOption);
 trainCommand.Options.Add(missingThresholdOption);
 trainCommand.Options.Add(contextNegativesPerAnchorOption);
+trainCommand.Options.Add(contextNegativeWeightOption);
 trainCommand.Options.Add(exclusiveTagsOption);
 trainCommand.Options.Add(validationMaxImagesOption);
 trainCommand.Options.Add(ioParallelismOption);
@@ -236,6 +252,8 @@ trainCommand.Options.Add(trainGoldOption);
 trainCommand.Options.Add(cropConsistencyWeightOption);
 trainCommand.Options.Add(cropTeacherMinApOption);
 trainCommand.Options.Add(cropTeacherConfidenceOption);
+trainCommand.Options.Add(mosaicsPerStepOption);
+trainCommand.Options.Add(mosaicWeightOption);
 trainCommand.Options.Add(cropTeacherMinPositivesOption);
 trainCommand.Options.Add(localizationMapOption);
 trainCommand.Options.Add(localizableTagsOption);
@@ -270,6 +288,7 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         ImpliedThreshold: parseResult.GetRequiredValue(impliedThresholdOption),
         MissingThreshold: parseResult.GetRequiredValue(missingThresholdOption),
         ContextNegativesPerAnchor: parseResult.GetRequiredValue(contextNegativesPerAnchorOption),
+        ContextNegativeWeight: parseResult.GetRequiredValue(contextNegativeWeightOption),
         ExclusiveTagsPath: parseResult.GetValue(exclusiveTagsOption),
         ValidationMaxImages: parseResult.GetRequiredValue(validationMaxImagesOption),
         Ratings: !parseResult.GetValue(noRatingsOption),
@@ -282,7 +301,10 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         CropTeacherMinAveragePrecision: parseResult.GetRequiredValue(cropTeacherMinApOption),
         CropTeacherConfidence: parseResult.GetRequiredValue(cropTeacherConfidenceOption),
         CropTeacherMinPositives: parseResult.GetRequiredValue(cropTeacherMinPositivesOption),
-        LocalizationFromFusedOnly: parseResult.GetValue(localizationMapOption) switch { "fused" => true, "full" => false, _ => null },
+        MosaicsPerStep: parseResult.GetRequiredValue(mosaicsPerStepOption),
+        MosaicWeight: parseResult.GetRequiredValue(mosaicWeightOption),
+        LocalizationFromFusedOnly: parseResult.GetValue(localizationMapOption) switch { "fused" or "local" => true, "full" => false, _ => null },
+        LocalizationSkippedLaterals: parseResult.GetValue(localizationMapOption) switch { "local" => 1, "fused" or "full" => 0, _ => null },
         LocalizableTagsPath: parseResult.GetValue(localizableTagsOption),
         CompactVocabulary: !parseResult.GetValue(keepVocabularyOption),
         CosineSchedule: parseResult.GetRequiredValue(lrScheduleOption) == "cosine",

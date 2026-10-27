@@ -65,6 +65,28 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
 
     private bool _localizationFromFusedOnly;
 
+    /// <summary>
+    /// With <see cref="LocalizationFromFusedOnly"/>, how many of the coarsest fused laterals the
+    /// localization map leaves out (0 = all of them). Even the fused-only map carries the stride-16
+    /// lateral, whose locations see most of the image: run 3 at epoch 2 put the shoes and gloves
+    /// peaks on faces, a spot that can see a whole outfit, with 0% gold pointing for shoes and
+    /// animal ears. Leaving it out (<c>--localization-map local</c>) keeps only laterals whose
+    /// locations see roughly 100px, so a location can only claim a tag it can see. Classification
+    /// still pools the full map. Not a weight change: it can be switched when resuming.
+    /// </summary>
+    public int LocalizationSkippedLaterals
+    {
+        get => _localizationSkippedLaterals;
+        set
+        {
+            if (value < 0 || (value > 0 && (!LocalizationFromFusedOnly || value >= FusedStages)))
+                throw new InvalidOperationException($"Skipping {value} laterals needs a fused-only localization map that keeps at least one (--fused-stages {FusedStages}).");
+            _localizationSkippedLaterals = value;
+        }
+    }
+
+    private int _localizationSkippedLaterals;
+
     /// <summary>Input pixels per spatial-map cell: the stem's stride, x2 per downsampling stage, /2 per fused stage.</summary>
     public int OutputStride { get; }
 
@@ -164,7 +186,7 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
         {
             var lateral = Laterals[k - 1].forward(stageOutputs[StageChannels.Length - 1 - k]);
             spatial = Upsample(spatial, lateral) + lateral;
-            if (LocalizationFromFusedOnly)
+            if (LocalizationFromFusedOnly && k > LocalizationSkippedLaterals)
                 localization = localization is null ? lateral : Upsample(localization, lateral) + lateral;
         }
 
