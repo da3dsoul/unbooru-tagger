@@ -473,6 +473,19 @@ public static class TrainCommandHandler
         var cropRandom = new Random();
         var mosaicRandom = new Random();
         long croppedImages = 0;
+        // Ctrl+C stops at the end of the current step with a checkpoint saved; a second Ctrl+C quits at once.
+        // Being killed mid-step left GPU copies in flight on the Arc: the copy engine faulted on the freed
+        // memory, and the next process to load a checkpoint onto the GPU hung until it was killed.
+        using var stopRequest = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) =>
+        {
+            if (stopRequest.IsCancellationRequested)
+                return;
+            e.Cancel = true;
+            stopRequest.Cancel();
+            dashboard.Log("[yellow]Ctrl+C: stopping after this step, with a checkpoint saved. Ctrl+C again quits at once.[/]");
+        };
+
         void TrainingLoop()
         {
             for (var epoch = startEpoch; epoch < epochs; epoch++)
@@ -752,7 +765,8 @@ public static class TrainCommandHandler
                     // recording how far into this epoch we got.
                     stepsThisProcess++;
                     var reachedMaxSteps = targetOptions.MaxSteps > 0 && stepsThisProcess >= targetOptions.MaxSteps;
-                    if (sinceLastCheckpoint.Elapsed >= checkpointInterval || reachedMaxSteps)
+                    var stopping = reachedMaxSteps || stopRequest.IsCancellationRequested;
+                    if (sinceLastCheckpoint.Elapsed >= checkpointInterval || stopping)
                     {
                         var (appliedOffloaded, offloadedStop) = offloaded is not null ? ApplyOffloaded() : ([], false);
                         dashboard.Phase("saving checkpoint");
@@ -774,9 +788,9 @@ public static class TrainCommandHandler
                         }
                     }
 
-                    if (reachedMaxSteps)
+                    if (stopping)
                     {
-                        dashboard.Finished($"stopped after --max-steps {targetOptions.MaxSteps}");
+                        dashboard.Finished(reachedMaxSteps ? $"stopped after --max-steps {targetOptions.MaxSteps}" : "stopped by Ctrl+C, checkpoint saved");
                         return;
                     }
                 }
