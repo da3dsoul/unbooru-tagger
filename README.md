@@ -77,6 +77,10 @@ is no Python code in this repo).
   12.8 runtime, just needs a compatible driver) only on Linux. On Windows
   (and any other non-Linux OS) it falls back to `TorchSharp-cpu`, so
   training on Windows is CPU-only.
+- To run inference on an NVIDIA GPU: a CUDA 12 runtime and cuDNN 9 that
+  ONNX Runtime can load. The core references `Microsoft.ML.OnnxRuntime.Gpu`
+  1.24.2, the newest build against CUDA 12, which also contains the CPU
+  provider; without CUDA, inference runs on the CPU.
 
 ## Getting started (end users — tagging images)
 
@@ -114,6 +118,26 @@ dotnet run --project unbooru-tagger-inference -- tag-batch ./images --model-dir 
 ```
 
 Prints a single JSON object: `{ "filename.png": { "tag": confidence, ... }, ... }`.
+Images are decoded on `--workers` threads (default 0 = half the logical CPUs)
+and encoded `--batch-size` at a time (default 16). `--device` picks where the
+model runs: `Auto` (default; CUDA GPU 0 if ONNX Runtime can load it, else CPU),
+`Cuda` or `Cpu`. A bundle exported before batching existed runs one image at
+a time. An image that can't be decoded is reported and skipped, and the
+command exits 1 at the end.
+
+**Tag and detect a directory in one pass:**
+
+```sh
+dotnet run --project unbooru-tagger-inference -c Release -- detect-batch ./images --model-dir ./model --out results.jsonl
+```
+
+Writes one JSON object per image per line, in completion order:
+`{"image": "<path relative to the directory>", "rating": ..., "tags": [{"tag", "confidence", "boxes": [{"x", "y", "width", "height", "confidence"}]}]}`.
+One model run per image gives both the tags and, for localizable tags, the
+boxes. `--recursive` includes subdirectories, `--render-dir <dir>` also writes
+each image with its boxes drawn on it, and `--no-boxes` skips heatmaps and
+boxes. Takes `tag-batch`'s `--batch-size`/`--workers`/`--device` and
+`detect`'s threshold and box options.
 
 **Render a heatmap for one tag on one image:**
 
@@ -142,11 +166,14 @@ box is labeled with its own peak confidence, not the tag's whole-image score.
 dotnet run --project unbooru-tagger-inference -- render-gold ./gold/gold.json --out-dir ./gold/renders --model-dir ./model
 ```
 
-Writes one PNG per gold image. It shows the hand-checked boxes drawn
-exactly as `detect` draws, with the same per-tag colors, beside that
-model's `detect` output. The model panel shows only the tags the gold set
-boxes on that image (`--all-tags` shows everything). Omit `--model-dir` to
-render the gold boxes alone. Takes the same box options as `detect`.
+With a model, writes `boxes.json` to `--out-dir`: per gold image, the
+model's `detect` output (each tag, its confidence and its boxes, in image
+pixels), for an interactive page to draw over the image. The model output
+shows only the tags the gold set boxes on that image (`--all-tags` shows
+everything). `--png` also writes one PNG per gold image: the hand-checked
+boxes drawn exactly as `detect` draws, with the same per-tag colors, beside
+the model's boxes. Without `--model-dir` it writes PNGs of the gold boxes
+alone. Takes the same box options as `detect`.
 
 Every command accepts `--model-dir` (default `./model`). `tag`, `tag-batch`
 and `detect` also accept `--threshold` for the minimum tag confidence to report.
@@ -489,6 +516,14 @@ checkpointing. Uses CUDA if available, CPU otherwise. Key flags:
 `--embedding-dim` (default 512), `--lr` (default 1e-4),
 `--validation-fraction` (default 0.1), `--early-stopping-patience`
 (default 3).
+
+**Tower size (fresh runs only; a resume uses the checkpoint's
+`model_config.json`).** `--stem-channels` (default 64), `--stage-channels`
+(default `64,128,256`; each width change downsamples 2x) and
+`--blocks-per-stage` (default `2,2,2`) set the ConvNeXt tower.
+`--fused-stages` (default 0) adds a top-down path that fuses earlier stages
+into the spatial map, each one halving the heatmap stride: 4 stages + 2 fused
+is stride 8, a 64x64 map at 512px.
 
 **Deliberate batches and targets (default).** The corpus was crawled per
 tag, with positives and co-occurrence-chosen hard negatives for each one,

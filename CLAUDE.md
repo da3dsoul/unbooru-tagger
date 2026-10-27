@@ -200,7 +200,10 @@ built the corpus around:
   hand-checked validation images (164 clean, 125 messy) with certain, group and
   ignore boxes (COCO-style crowd/ignore semantics). Scored by `evaluate --gold`,
   rendered side by side with `render-gold`. Run 1's epoch-12 baseline is in
-  `run1-small-convnext-epoch12-COMPARISON-ONLY/README.txt`.
+  `run1-small-convnext-epoch12-COMPARISON-ONLY/README.txt`. With a model, `render-gold`
+  writes the detections to `boxes.json` instead of PNGs (unless `--png`), which the gold
+  set's `compare.html` draws on a canvas, one list entry per box: in a PNG, overlapping
+  boxes from several tags can't be told apart.
 - **Separate localization map (`--localization-map fused`, run 2 from epoch 2):** the
   localization loss, `evaluate`'s gold scoring and inference heatmaps use the fused
   laterals alone (`ImageTower.ForwardMaps`), without the upsampled last stage, whose
@@ -267,6 +270,14 @@ built the corpus around:
 - All of this is still rough, approximate localization, not a trained
   detector — that part of the original framing still holds even though
   boxes now exist.
+- **Batched inference (`detect-batch`, `tag-batch`):** the exporter declares a symbolic
+  batch dimension, so `OnnxImageEncoder.EncodeBatch` runs many images per call; every op is
+  per image (GroupNorm included), tested against running each image alone. Bundles exported
+  before this have the batch pinned to 1 and run one image at a time (`SupportsBatches`).
+  `BatchPipeline` overlaps decoding, batched encoding and per-image scoring/boxes through
+  bounded queues. `--device Auto` uses ONNX Runtime's CUDA provider when it loads (the core
+  references `Microsoft.ML.OnnxRuntime.Gpu` 1.24.2, the newest built for CUDA 12), else CPU.
+  `detect-batch` gets tags and boxes from one model run per image, one JSON line per image.
 
 ## Handling tag growth
 - **New tag pipeline — implemented** (`unbooru-tagger-training add-tag`):
