@@ -21,7 +21,7 @@ public class DashboardScreenTests
             Assert.StartsWith("\u001b[?1049h", first); // alternate screen
             Assert.Single(Sixels(first));
             Assert.Contains("every 10,000 steps", first); // the panel
-            Assert.DoesNotContain("⠀", first);            // without its text charts
+            Assert.DoesNotMatch("[\u2801-\u28FF]", first); // without its text charts (blank rows are U+2800)
 
             // The panel's rows are rewritten every tick; the image isn't, until there's something new.
             output.GetStringBuilder().Clear();
@@ -47,16 +47,19 @@ public class DashboardScreenTests
         screen.Draw();
         var text = output.ToString();
 
-        // The panel's last row, then the image positioned one blank row below it.
-        var panelRows = System.Text.RegularExpressions.Regex.Matches(text, @"\u001b\[(\d+);1H(?!\u001bP)").Select(m => int.Parse(m.Groups[1].Value)).ToList();
+        // The panel's rows (not the rows cleared below it), then the image positioned below them.
+        var panelRows = System.Text.RegularExpressions.Regex.Matches(text, @"\u001b\[(\d+);1H(?!\u001bP|\u001b\[2K)").Select(m => int.Parse(m.Groups[1].Value)).ToList();
         var image = System.Text.RegularExpressions.Regex.Match(text, @"\u001b\[(\d+);1H\u001bP");
         Assert.True(image.Success);
         var imageRow = int.Parse(image.Groups[1].Value);
         var header = System.Text.RegularExpressions.Regex.Match(text, "\"1;1;(\\d+);(\\d+)");
         Assert.Equal(120 * 8, int.Parse(header.Groups[1].Value));
-        var imageRows = int.Parse(header.Groups[2].Value) / 15;
-        Assert.True(imageRow + imageRows - 1 <= 49, $"image rows {imageRow}..{imageRow + imageRows - 1} reach the last row");
-        Assert.True(imageRow > 1);
+        var imageHeight = int.Parse(header.Groups[2].Value);
+        Assert.Equal(0, imageHeight % 6); // sent exactly as tall as planned, not rounded up a band
+        var lastImageRow = imageRow + (imageHeight + 14) / 15 - 1;
+        // Two rows stay free under the image: the cursor moving below it must not scroll the screen.
+        Assert.True(lastImageRow <= 48, $"image rows {imageRow}..{lastImageRow} come within two rows of the bottom");
+        Assert.True(imageRow > panelRows.Max(), "the image starts below the panel");
     }
 
     private static IEnumerable<int> Sixels(string text)

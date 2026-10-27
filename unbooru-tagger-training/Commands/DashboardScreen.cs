@@ -60,20 +60,27 @@ public sealed class DashboardScreen : IDisposable
                 var frame = new StringBuilder();
                 frame.Append("\u001b[?2026h"); // synchronized update: the terminal shows the frame at once
 
-                // The image: below the panel, filling the rest of the screen but its last row (an image
-                // touching the bottom row would scroll the screen).
+                // The image: one blank row below the panel, then the rest of the screen but its last two rows.
+                // After an image the terminal moves the cursor below it, and an image reaching the bottom
+                // row scrolls the whole screen up, pushing the image's top under the panel.
                 var chartTop = panel.Count + 1;
-                var chartRows = rows - chartTop - 1;
+                var chartRows = rows - chartTop - 2;
                 var (series, version) = _dashboard.ChartData();
                 var key = $"{version}|{columns}x{rows}|{panel.Count}";
                 if (key != _chartKey)
                 {
+                    // Erasing a row clears tmux's copy but leaves an old image's pixels in Konsole; only text
+                    // drawn over them removes them. So blank rows are written with the blank braille character.
+                    var blank = new string('⠀', columns);
                     for (var row = Math.Min(_panelRows, panel.Count) + 1; row <= rows; row++)
-                        frame.Append($"\u001b[{row};1H\u001b[2K");
+                        frame.Append($"\u001b[{row};1H\u001b[2K").Append(blank);
                     if (chartRows >= MinimumChartRows)
                     {
                         var (cellWidth, cellHeight) = _cell;
-                        using var bitmap = TrainingCharts.Render(series, columns * cellWidth, chartRows * cellHeight, DateTime.Now, header: false, textScale: cellHeight / 15f);
+                        // Sixel draws in bands of six pixel rows: a height that isn't a multiple of six is sent
+                        // rounded up, one row taller than planned.
+                        var height = chartRows * cellHeight / 6 * 6;
+                        using var bitmap = TrainingCharts.Render(series, columns * cellWidth, height, DateTime.Now, header: false, textScale: cellHeight / 15f);
                         frame.Append($"\u001b[{chartTop + 1};1H").Append(Sixel.Encode(bitmap));
                     }
                     _chartKey = key;
