@@ -662,8 +662,28 @@ whole run (2,000-step means, saved to `loss_history.json` with each checkpoint
 so a resume keeps it), and, once evaluations exist, held-out mAP, gold
 pointing, "blanked object still called", the two context gaps and
 exclusive-tag violations at every epoch and snapshot evaluation (see
-`--snapshot-evaluation-steps` below), each with its latest change. With output
-redirected it prints a one-line summary every 5 minutes.
+`--snapshot-evaluation-steps` below), each with its latest change.
+
+In a terminal that shows Sixel images (Konsole, xterm, WezTerm, foot, or tmux
+3.4+ built with sixel, which tmux reports per client), those charts are real
+graphics: the trainer switches to the alternate screen, keeps the panel in the
+top rows and draws the charts as one image below it, redrawn only when new data
+arrives or the window is resized. `--chart-reference label=dir` (repeatable)
+adds another run's evaluation as a dashed reference line on each chart, e.g.
+`--chart-reference v3-e1=context-check/v3-e1`. `--text-dashboard` keeps the
+all-text panel with braille line charts, which is also what other terminals get.
+With output redirected it prints a one-line summary every 5 minutes.
+
+The same charts without the trainer, from any checkpoint directory (they only
+read it, so this works alongside a running training):
+
+```sh
+dotnet run --project unbooru-tagger-training -- charts --checkpoint-dir <checkpoint> --watch \
+  [--png charts.png] [--reference label=report-dir ...]
+```
+
+`--watch` redraws whenever a checkpoint save or a finished evaluation changes
+the data; `--png` also (or, with output redirected, only) writes the image.
 
 `--validation-max-images` caps how many held-out images that uses
 (default 0 = all). To measure any existing checkpoint the same way, and

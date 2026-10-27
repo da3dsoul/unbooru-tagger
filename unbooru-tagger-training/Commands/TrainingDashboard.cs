@@ -54,6 +54,8 @@ public sealed class TrainingDashboard
     private readonly LossHistory _lossHistory;
     private readonly SortedDictionary<long, EvaluationPoint> _points = new();
     private readonly SortedDictionary<long, DateTime> _runningSnapshots = new();
+    private IReadOnlyList<(string Label, EvaluationPoint Point)> _chartReferences = [];
+    private bool _graphicalCharts;
 
     private int _epoch;
     private int _stepInEpoch;
@@ -202,6 +204,40 @@ public sealed class TrainingDashboard
     {
         lock (_lock)
             _lossHistory.Save(checkpointDir);
+    }
+
+    /// <summary>Other runs' evaluations, drawn as reference lines on the graphical charts.</summary>
+    public void SetChartReferences(IReadOnlyList<(string Label, EvaluationPoint Point)> references)
+    {
+        lock (_lock)
+            _chartReferences = references;
+    }
+
+    /// <summary>
+    /// The charts are drawn as an image below the panel (<see cref="DashboardScreen"/>), so the panel
+    /// leaves out its text ones.
+    /// </summary>
+    public bool GraphicalCharts
+    {
+        set
+        {
+            lock (_lock)
+                _graphicalCharts = value;
+        }
+    }
+
+    /// <summary>
+    /// What the graphical charts draw, and a version that changes only when that does: a new
+    /// evaluation or a completed loss bucket, not every step.
+    /// </summary>
+    public (TrainingSeries Series, string Version) ChartData()
+    {
+        lock (_lock)
+        {
+            var loss = _lossHistory.Copy();
+            var series = new TrainingSeries(_info.Title, loss, _points.Values.ToList(), _globalStep, _info.StepsPerEpoch, _info.Epochs, _chartReferences);
+            return (series, $"{_points.Count}|{(_points.Count > 0 ? _points.Keys.Last() : 0)}|{loss.Buckets.Count}|{_chartReferences.Count}");
+        }
     }
 
     /// <summary>An evaluation's headline numbers, epoch or snapshot, for the trend charts.</summary>
@@ -388,7 +424,8 @@ public sealed class TrainingDashboard
                     : $"[grey]none yet: runs at the end of epoch {_epoch + 1}{(epochLeft is { } e ? $" (≈ {Clock(now + e, now)})" : "")}[/]");
 
             var body = new List<IRenderable> { grid };
-            body.AddRange(Charts());
+            if (!_graphicalCharts)
+                body.AddRange(Charts());
 
             if (_events.Count > 0)
             {

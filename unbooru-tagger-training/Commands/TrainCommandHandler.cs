@@ -902,7 +902,26 @@ public static class TrainCommandHandler
             dashboard.Finished("finished");
         }
 
-        if (AnsiConsole.Profile.Capabilities.Interactive)
+        var references = new List<(string, EvaluationPoint)>();
+        foreach (var reference in targetOptions.ChartReferences ?? [])
+        {
+            var split = reference.IndexOf('=');
+            if (split > 0 && EvaluationPoint.Read(reference[(split + 1)..], 0, endOfEpoch: true) is { } point)
+                references.Add((reference[..split], point));
+            else
+                AnsiConsole.MarkupLineInterpolated($"[yellow]--chart-reference '{reference}': expected label=directory with an evaluation_report.json; ignored.[/]");
+        }
+        dashboard.SetChartReferences(references);
+
+        if (AnsiConsole.Profile.Capabilities.Interactive && !targetOptions.TextDashboard && TerminalGraphics.SupportsSixel())
+        {
+            using (new DashboardScreen(dashboard, refresh: TimeSpan.FromSeconds(1)))
+                TrainingLoop();
+            AnsiConsole.Write(dashboard.Render());
+            foreach (var line in dashboard.Events)
+                AnsiConsole.MarkupLine(line);
+        }
+        else if (AnsiConsole.Profile.Capabilities.Interactive)
         {
             AnsiConsole.Live(dashboard.Render())
                 .AutoClear(false)

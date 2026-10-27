@@ -175,6 +175,12 @@ var snapshotEvaluationStepsOption = new Option<int>("--snapshot-evaluation-steps
     Description = "With --evaluation-command: also evaluate a snapshot of the model every this many steps (counted over the whole run) in the background, for the dashboard's trend charts. Reports go to <checkpoint>/snapshots/step-N/; the snapshot's weights are deleted once evaluated. Doesn't affect early stopping. 0 = only at epoch ends.",
     DefaultValueFactory = _ => 0
 };
+var chartReferenceOption = new Option<string[]>("--chart-reference")
+{
+    Description = "Another run's evaluation to compare against on the dashboard's graphical charts, as label=report directory (e.g. v3-e1=context-check/v3-e1). Repeatable.",
+    DefaultValueFactory = _ => []
+};
+var textDashboardOption = new Option<bool>("--text-dashboard") { Description = "Keep the all-text dashboard even in a terminal that can show graphical charts (Sixel)" };
 var localizableTagsOption = new Option<string?>("--localizable-tags")
 {
     Description = "Rules file for which tags have no region to localize (backgrounds, mediums, styles, lighting, framing, people counts, artist:/series:/...). One rule per line: 'tag', 'prefix*', '*suffix', '!' prefix for exceptions. Omit to reuse the checkpoint's saved copy, or the built-in defaults."
@@ -254,6 +260,8 @@ trainCommand.Options.Add(localizationBackgroundFractionOption);
 trainCommand.Options.Add(maxStepsOption);
 trainCommand.Options.Add(evaluationCommandOption);
 trainCommand.Options.Add(snapshotEvaluationStepsOption);
+trainCommand.Options.Add(chartReferenceOption);
+trainCommand.Options.Add(textDashboardOption);
 trainCommand.Options.Add(trainGoldOption);
 trainCommand.Options.Add(cropConsistencyWeightOption);
 trainCommand.Options.Add(cropTeacherMinApOption);
@@ -316,7 +324,9 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         CosineSchedule: parseResult.GetRequiredValue(lrScheduleOption) == "cosine",
         WarmupSteps: parseResult.GetRequiredValue(warmupStepsOption),
         EvaluationCommand: parseResult.GetValue(evaluationCommandOption),
-        SnapshotEvaluationSteps: parseResult.GetRequiredValue(snapshotEvaluationStepsOption)),
+        SnapshotEvaluationSteps: parseResult.GetRequiredValue(snapshotEvaluationStepsOption),
+        ChartReferences: parseResult.GetValue(chartReferenceOption) ?? [],
+        TextDashboard: parseResult.GetValue(textDashboardOption)),
     parseResult.GetRequiredValue(ioParallelismOption),
     parseResult.GetRequiredValue(prefetchBatchesOption),
     new TowerOptions(
@@ -429,12 +439,44 @@ evaluateCommand.SetAction(parseResult => EvaluateCommandHandler.Run(
     parseResult.GetValue(goldOption),
     parseResult.GetRequiredValue(localizationSamplesOption)));
 
+var chartsEpochsOption = new Option<int>("--epochs") { Description = "The run's --epochs, for the step axis and epoch markers", DefaultValueFactory = _ => 6 };
+var chartsReferenceOption = new Option<string[]>("--reference")
+{
+    Description = "Another run's evaluation to compare against, as label=report directory (e.g. v3-e1=context-check/v3-e1); drawn as a dashed line in each panel. Repeatable.",
+    DefaultValueFactory = _ => [],
+    AllowMultipleArgumentsPerToken = false
+};
+var chartsPngOption = new Option<string?>("--png") { Description = "Also (or, when output is redirected, only) save the charts to this PNG" };
+var chartsWatchOption = new Option<bool>("--watch") { Description = "Keep the charts up and redraw them whenever a checkpoint save or a finished evaluation changes the data" };
+var chartsIntervalOption = new Option<int>("--interval") { Description = "With --watch: seconds between checks for new data", DefaultValueFactory = _ => 30 };
+var chartsWidthOption = new Option<int>("--width") { Description = "Image width in pixels (default: the terminal's)", DefaultValueFactory = _ => 0 };
+var chartsHeightOption = new Option<int>("--height") { Description = "Image height in pixels (default: the terminal's)", DefaultValueFactory = _ => 0 };
+var chartsCommand = new Command("charts", "Draw a run's loss and evaluation trends as graphics: in the terminal as Sixel (Konsole, xterm, WezTerm, tmux 3.4+), or to a PNG. Reads only the checkpoint directory, so it runs alongside training.");
+chartsCommand.Options.Add(checkpointDirOption);
+chartsCommand.Options.Add(chartsEpochsOption);
+chartsCommand.Options.Add(chartsReferenceOption);
+chartsCommand.Options.Add(chartsPngOption);
+chartsCommand.Options.Add(chartsWatchOption);
+chartsCommand.Options.Add(chartsIntervalOption);
+chartsCommand.Options.Add(chartsWidthOption);
+chartsCommand.Options.Add(chartsHeightOption);
+chartsCommand.SetAction(parseResult => ChartsCommandHandler.Run(
+    parseResult.GetRequiredValue(checkpointDirOption),
+    parseResult.GetRequiredValue(chartsEpochsOption),
+    parseResult.GetValue(chartsReferenceOption) ?? [],
+    parseResult.GetValue(chartsPngOption),
+    parseResult.GetValue(chartsWatchOption),
+    parseResult.GetRequiredValue(chartsIntervalOption),
+    parseResult.GetRequiredValue(chartsWidthOption),
+    parseResult.GetRequiredValue(chartsHeightOption)));
+
 var rootCommand = new RootCommand("unbooru-tagger training CLI")
 {
     trainCommand,
     addTagCommand,
     exportOnnxCommand,
-    evaluateCommand
+    evaluateCommand,
+    chartsCommand
 };
 
 return rootCommand.Parse(args).Invoke();

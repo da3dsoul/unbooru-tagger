@@ -282,6 +282,13 @@ built the corpus around:
   stopping. The dashboard charts mAP, gold pointing, occlusion, the context gaps and exclusive violations over
   every epoch and snapshot evaluation (`BrailleChart`), and the loss over the whole run (`LossHistory`, saved
   with each checkpoint). All of it is read back from disk on resume and cut back to the resumed step.
+- **Graphical charts (`DashboardScreen`, `charts` command):** in a Sixel-capable terminal (`TerminalGraphics`;
+  inside tmux, the attached client's reported features) the dashboard draws the charts as an image
+  (`TrainingCharts`, SkiaSharp, encoded by `Sixel` with an adaptive 256-color palette) instead of braille text.
+  Spectre's live display can't host it: it rewrites every line each refresh, and overwriting an image's lines
+  erases it (tmux drops it). So the trainer draws the screen itself: the Spectre-rendered panel in the top rows
+  every second, the image in the rows below, redrawn only when its data, the panel's height or the terminal size
+  changes. `charts` draws the same image from a checkpoint directory alone (or to a PNG).
 - **Per-epoch gold scoring (`train --gold`):** each epoch evaluation also scores the gold set
   and the crop teacher (`localization_report.json`); every epoch's reports are archived
   under `history/epoch-N/`.

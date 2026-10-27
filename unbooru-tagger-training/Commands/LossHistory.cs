@@ -36,6 +36,14 @@ public sealed class LossHistory
         (_partialSum, _partialCount) = (0, 0);
     }
 
+    /// <summary>An independent copy, for drawing from another thread.</summary>
+    public LossHistory Copy()
+    {
+        var copy = new LossHistory(BucketSteps) { _partialSum = _partialSum, _partialCount = _partialCount, _lastStep = _lastStep };
+        copy._buckets.AddRange(_buckets);
+        return copy;
+    }
+
     private sealed record Saved(int BucketSteps, long[] Ends, float[] Means, double PartialSum, int PartialCount, long LastStep);
 
     public void Save(string directory)

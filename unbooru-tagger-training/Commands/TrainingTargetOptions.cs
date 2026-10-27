@@ -36,6 +36,8 @@ namespace UnbooruTagger.Training.Commands;
 /// <param name="Ratings">Learn content ratings from the dataset's ratings.bin, if present, as three cumulative labels.</param>
 /// <param name="EvaluationCommand">Run each epoch's evaluation as <c>&lt;command&gt; &lt;snapshot dir&gt; &lt;report dir&gt;</c> in the background instead of inline, e.g. `evaluate` on another GPU (see OffloadedEvaluations). Null = inline.</param>
 /// <param name="SnapshotEvaluationSteps">With <paramref name="EvaluationCommand"/>: also snapshot and evaluate the model every this many steps (counted over the whole run), alongside training, for the dashboard's trend charts (see SnapshotEvaluations). Doesn't affect early stopping. 0 = epochs only.</param>
+/// <param name="ChartReferences">Other runs' evaluation report directories to draw as reference lines on the dashboard's graphical charts, as label=directory.</param>
+/// <param name="TextDashboard">Keep the all-text dashboard even when the terminal can show the graphical charts (DashboardScreen).</param>
 /// <param name="ValidationMaxImages">Cap on held-out images evaluated per epoch (a fixed prefix of the split, so it's the same images every epoch). 0 = the whole split.</param>
 /// <summary>Image tower shape for a fresh run (ignored on resume, where the checkpoint's config wins).</summary>
 /// <param name="FusedStages">Earlier stages fused into the spatial map (ImageTower.FusedStages): each one halves the heatmap stride.</param>
@@ -78,7 +80,9 @@ public sealed record TrainingTargetOptions(
     bool CosineSchedule = false,
     int WarmupSteps = 0,
     string? EvaluationCommand = null,
-    int SnapshotEvaluationSteps = 0)
+    int SnapshotEvaluationSteps = 0,
+    IReadOnlyList<string>? ChartReferences = null,
+    bool TextDashboard = false)
 {
     public static TrainingTargetOptions Default { get; } = new();
 
