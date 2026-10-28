@@ -98,6 +98,28 @@ public static class TagRankingEvaluator
         int seed = 0,
         IReadOnlyList<BooruSites>? imageSites = null)
     {
+        using var logits = ImageTagLogits.Linear(pooled, tagEmbeddings, dim, scaling);
+        return Evaluate(logits, imageTags, vocabulary, trainingStatistics, exclusiveGroups, device, minPositives, hardNegativesPerPositive,
+            randomNegativesPerPositive, fallbackThreshold, minCalibrationPositives, minThreshold, seed, imageSites);
+    }
+
+    /// <param name="logits">Every held-out image's logits for every tag (<see cref="ImageTagLogits"/>).</param>
+    public static EvaluationReport Evaluate(
+        ImageTagLogits logits,
+        IReadOnlyList<IReadOnlyList<int>> imageTags,
+        TagVocabulary vocabulary,
+        TagStatistics trainingStatistics,
+        ExclusiveTagGroups exclusiveGroups,
+        Device device,
+        int minPositives = 5,
+        int hardNegativesPerPositive = 5,
+        int randomNegativesPerPositive = 5,
+        float fallbackThreshold = 0.5f,
+        int minCalibrationPositives = 20,
+        float minThreshold = 0.05f,
+        int seed = 0,
+        IReadOnlyList<BooruSites>? imageSites = null)
+    {
         var imageCount = imageTags.Count;
         var vocabularySize = trainingStatistics.VocabularySize;
 
@@ -147,7 +169,7 @@ public static class TagRankingEvaluator
             if (positives.Count < minPositives || imageCount <= positives.Count)
                 return;
 
-            var random = new Random(HashCode.Combine(seed, t));
+            var random = new Random(DeterministicSeed.For(seed, t));
 
             var hardPool = new HashSet<int>();
             foreach (var source in trainingStatistics.HardNegativeSources[t])
@@ -179,11 +201,10 @@ public static class TagRankingEvaluator
             if (context.Count > hardNegativesPerPositive * positives.Count)
                 context.RemoveRange(hardNegativesPerPositive * positives.Count, context.Count - hardNegativesPerPositive * positives.Count);
 
-            var tagRow = new ReadOnlySpan<float>(tagEmbeddings, t * dim, dim);
-            var positiveScores = Score(positives, tagRow);
-            var contextAp = context.Count > 0 ? RankingMetrics(positiveScores, Score(context, tagRow)).AveragePrecision : double.NaN;
-            var hardScores = Score(hard, tagRow);
-            var randomScores = Score(randomNegatives, tagRow);
+            var positiveScores = Score(positives, t);
+            var contextAp = context.Count > 0 ? RankingMetrics(positiveScores, Score(context, t)).AveragePrecision : double.NaN;
+            var hardScores = Score(hard, t);
+            var randomScores = Score(randomNegatives, t);
 
             var allNegatives = hardScores.Concat(randomScores).ToArray();
             var (ap, bestF1, threshold) = RankingMetrics(positiveScores, allNegatives);
@@ -194,24 +215,24 @@ public static class TagRankingEvaluator
                 context.Count, contextAp);
         });
 
-        float[] Score(List<int> images, ReadOnlySpan<float> tagRow)
+        float[] Score(List<int> images, int tag)
         {
             var scores = new float[images.Count];
             for (var i = 0; i < images.Count; i++)
-                scores[i] = Sigmoid(scaling.Apply(Dot(new ReadOnlySpan<float>(pooled, images[i] * dim, dim), tagRow)));
+                scores[i] = logits.Probability(images[i], tag);
             return scores;
         }
 
-        var (thresholds, heldOutF1) = CalibrateThresholds(pooled, heldOut, tagEmbeddings, dim, scaling, minCalibrationPositives, minThreshold, fallbackThreshold, device, imageSites, tagSites);
+        var (thresholds, heldOutF1) = CalibrateThresholds(logits, heldOut, minCalibrationPositives, minThreshold, fallbackThreshold, device, imageSites, tagSites);
         for (var t = 0; t < vocabularySize; t++)
             if (results[t] is { } result)
                 results[t] = result with { Threshold = thresholds[t], HeldOutF1 = heldOutF1[t] };
 
         var evaluated = results.OfType<TagEvaluation>().ToList();
 
-        var imageLevel = ImageLevelMetrics(pooled, imageTags, tagEmbeddings, dim, scaling, thresholds, trainingStatistics, exclusiveGroups, device, imageSites);
+        var imageLevel = ImageLevelMetrics(logits, imageTags, thresholds, trainingStatistics, exclusiveGroups, device, imageSites);
         var contextReliance = ContextRelianceEvaluator.Evaluate(
-            pooled, imageTags, tagEmbeddings, dim, scaling, vocabulary, trainingStatistics, thresholds, device, seed: seed, imageSites: imageSites);
+            logits, imageTags, vocabulary, trainingStatistics, thresholds, device, seed: seed, imageSites: imageSites);
 
         var hardAps = evaluated.Select(e => e.HardAveragePrecision).Where(x => !double.IsNaN(x)).ToList();
         var contextAps = evaluated.Select(e => e.ContextAveragePrecision).Where(x => !double.IsNaN(x)).ToList();
@@ -285,12 +306,12 @@ public static class TagRankingEvaluator
     /// reported at confidence 0.00-0.01).
     /// </summary>
     private static (float[] Thresholds, double[] F1) CalibrateThresholds(
-        float[] pooled, List<int>[] heldOutPositives, float[] tagEmbeddings, int dim, LogitScaling scaling,
+        ImageTagLogits logits, List<int>[] heldOutPositives,
         int minPositives, float minThreshold, float fallbackThreshold, Device device,
         IReadOnlyList<BooruSites>? imageSites = null, IReadOnlyList<BooruSites>? tagSites = null)
     {
         var vocabularySize = heldOutPositives.Length;
-        var imageCount = pooled.Length / dim;
+        var imageCount = logits.ImageCount;
         var thresholds = new float[vocabularySize];
         var f1s = new double[vocabularySize];
         Array.Fill(thresholds, fallbackThreshold);
@@ -301,7 +322,6 @@ public static class TagRankingEvaluator
             return (thresholds, f1s);
 
         using var _ = no_grad();
-        using var images = tensor(pooled, [imageCount, dim]).to(device);
         using var ranks = arange(1, imageCount + 1, dtype: ScalarType.Float32, device: device).unsqueeze(1);
 
         // Bounds the [images, block] score/sort/label tensors to a few hundred MB on a whole
@@ -312,17 +332,12 @@ public static class TagRankingEvaluator
             using var scope = NewDisposeScope();
             var tags = calibrated.Skip(start).Take(block).ToArray();
 
-            var rows = new float[tags.Length * dim];
-            for (var j = 0; j < tags.Length; j++)
-                Array.Copy(tagEmbeddings, tags[j] * dim, rows, j * dim, dim);
-            var tagBlock = tensor(rows, [tags.Length, dim]).to(device);
-
             var labels = new bool[imageCount * tags.Length];
             for (var j = 0; j < tags.Length; j++)
                 foreach (var image in heldOutPositives[tags[j]])
                     labels[image * tags.Length + j] = true;
 
-            var probabilities = (images.matmul(tagBlock.t()) * scaling.Scale + scaling.Bias).sigmoid();
+            var probabilities = logits.Columns(tags, device).sigmoid();
             if (SiteBlindMask(imageSites, tagSites, tags, labels) is { } blind)
                 probabilities = probabilities.masked_fill(blind.to(device), -1f); // sorts last: never a false positive
             var (sorted, order) = probabilities.sort(dim: 0, descending: true);
@@ -368,7 +383,7 @@ public static class TagRankingEvaluator
 
     private static (double Precision, double Recall, double F1, double RPrecision, double ExclusiveViolationRate,
         Dictionary<(int First, int Second), (int Images, int FirstTrue, int SecondTrue)> Violations) ImageLevelMetrics(
-        float[] pooled, IReadOnlyList<IReadOnlyList<int>> imageTags, float[] tagEmbeddings, int dim, LogitScaling scaling,
+        ImageTagLogits logits, IReadOnlyList<IReadOnlyList<int>> imageTags,
         float[] thresholds, TagStatistics trainingStatistics, ExclusiveTagGroups exclusiveGroups, Device device,
         IReadOnlyList<BooruSites>? imageSites = null)
     {
@@ -385,7 +400,6 @@ public static class TagRankingEvaluator
         var trainable = Enumerable.Range(0, vocabularySize).Select(t => trainingStatistics.Positives[t].Length > 0).ToArray();
 
         using var _ = no_grad();
-        using var tags = tensor(tagEmbeddings, [vocabularySize, dim]).to(device);
         using var thresholdTensor = tensor(thresholds).to(device);
         using var trainableTensor = tensor(trainable.Select(b => b ? 1f : 0f).ToArray()).to(device);
 
@@ -400,8 +414,7 @@ public static class TagRankingEvaluator
         {
             using var scope = NewDisposeScope();
             var count = Math.Min(chunk, imageCount - start);
-            var images = tensor(pooled.AsSpan(start * dim, count * dim).ToArray(), [count, dim]).to(device);
-            var probabilities = (images.matmul(tags.t()) * scaling.Scale + scaling.Bias).sigmoid() * trainableTensor;
+            var probabilities = logits.Rows(start, count, device).sigmoid() * trainableTensor;
             var reported = probabilities >= thresholdTensor;
             if (imageSites is not null && trainingStatistics.TagSites is { } siteCoverage)
             {

@@ -61,11 +61,18 @@ public sealed class ConvNeXtBlock : Module<Tensor, Tensor>
 
     public override Tensor forward(Tensor input)
     {
-        var x = Depthwise.forward(input);
-        x = Norm.forward(x);
-        x = PointwiseExpand.forward(x);
+        // TorchSharp frees an intermediate only when its dispose scope ends, not when it goes out of use as Python's
+        // refcounting would, so without this scope every block's six intermediates lived until the caller's scope
+        // ended: a 10-image forward at 512px held ~7.4GB, and the evaluator ran the A4000 out of memory on gold
+        // batches of 16. Autograd keeps its own references to what backward needs, so training is unaffected.
+        using var scope = NewDisposeScope();
+        // In the input's dtype (MixedPrecision): bf16 when ImageTower.ComputeType says so.
+        var x = MixedPrecision.Conv(Depthwise, input);
+        x = MixedPrecision.Norm(Norm, x);
+        x = MixedPrecision.Conv(PointwiseExpand, x);
         x = functional.gelu(x);
-        x = PointwiseProject.forward(x);
-        return input + (LayerScale * x);
+        x = MixedPrecision.Conv(PointwiseProject, x);
+        var layerScale = LayerScale.dtype == input.dtype ? (Tensor)LayerScale : LayerScale.to_type(input.dtype);
+        return scope.MoveToOuter(input + (layerScale * x));
     }
 }

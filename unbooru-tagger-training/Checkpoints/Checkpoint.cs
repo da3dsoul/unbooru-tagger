@@ -59,6 +59,8 @@ public static class Checkpoint
             LocalizationFromFusedOnly = config.LocalizationFromFusedOnly
         };
         imageTower.LocalizationSkippedLaterals = config.LocalizationSkippedLaterals;
+        imageTower.ClassificationPoolingTemperature = config.ClassificationPoolingTemperature;
+        imageTower.ClassificationPoolingSchedule = config.ClassificationPoolingSchedule;
         imageTower.load(Path.Combine(directory, ImageTowerFileName));
 
         var vocabulary = TagVocabulary.Load(Path.Combine(directory, VocabularyFileName));

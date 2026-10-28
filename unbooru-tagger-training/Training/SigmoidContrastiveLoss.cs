@@ -41,13 +41,22 @@ public static class SigmoidContrastiveLoss
     /// Normalized by the batch's total positive weight rather than by every pair: with
     /// almost every pair zero-weight or focal-damped, a per-pair mean would shrink the
     /// gradient toward nothing as the vocabulary grows.
+    ///
+    /// <see cref="PairTargets.LogitOffsets"/>, if any, are added to the logits here (<see cref="ContextPrior"/>).
     /// </summary>
     public static Tensor ComputeWeighted(
         Tensor imageEmbeddings, Tensor tagEmbeddings, PairTargets targets, LogitScaleBias? scaling,
         float negativeGamma, float negativeClip)
     {
-        var rawLogits = imageEmbeddings.matmul(tagEmbeddings.t());
+        return ComputeWeightedScores(imageEmbeddings.matmul(tagEmbeddings.t()), targets, scaling, negativeGamma, negativeClip);
+    }
+
+    /// <summary><see cref="ComputeWeighted"/> from [batch, vocabulary] raw scores (before <paramref name="scaling"/>), for scores not from one pooled embedding (<see cref="Model.ClassificationPooling"/>).</summary>
+    public static Tensor ComputeWeightedScores(Tensor rawLogits, PairTargets targets, LogitScaleBias? scaling, float negativeGamma, float negativeClip)
+    {
         var logits = scaling?.forward(rawLogits) ?? rawLogits;
+        if (targets.LogitOffsets is not null)
+            logits = logits + targets.LogitOffsets;
         return PairLoss(logits, targets.Labels, targets.Weights, targets.FocalMask, negativeGamma, negativeClip).sum()
             / Math.Max(1f, targets.PositiveWeightSum);
     }

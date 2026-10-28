@@ -221,6 +221,19 @@ public static class TrainCommandHandler
             imageTower.LocalizationSkippedLaterals = skipped;
             AnsiConsole.MarkupLineInterpolated($"Localization map: leaving out the {skipped} coarsest fused lateral(s); {imageTower.FusedStages - skipped} kept.");
         }
+        if (targetOptions.Bf16Compute)
+        {
+            imageTower.ComputeType = ScalarType.BFloat16;
+            AnsiConsole.MarkupLine("Image tower computes in bfloat16 (fp32 weights, gradients and outputs).");
+        }
+        // Pooling just being turned on: its anneal (if any) counts from the step the run resumes at, below.
+        var poolingTurnedOn = targetOptions.ClassificationPoolingTemperature is > 0 && imageTower.ClassificationPoolingTemperature <= 0;
+        if (targetOptions.ClassificationPoolingTemperature is { } poolingTemperature && poolingTemperature != imageTower.ClassificationPoolingTemperature)
+        {
+            imageTower.ClassificationPoolingTemperature = poolingTemperature;
+            if (poolingTemperature <= 0)
+                imageTower.ClassificationPoolingSchedule = null;
+        }
 
         exclusiveGroups = ExclusiveTagGroups.Parse(exclusiveGroups.SourceText, vocabulary);
         if (ratingRows is not null)
@@ -277,7 +290,7 @@ public static class TrainCommandHandler
             AnsiConsole.MarkupLine("[yellow]No training image carries any tag -- falling back to rare-tag sampling.[/]");
         var tagCentricSampler = targetOptions.TagCentricSampling && anyAnchorTag
             ? new TagCentricBatchSampler(statistics, targetOptions.PositivesPerAnchor, targetOptions.HardNegativesPerAnchor,
-                contextNegativesPerAnchor: targetOptions.ContextNegativesPerAnchor)
+                contextNegativesPerAnchor: targetOptions.ContextNegativesPerAnchor) { FocusShare = targetOptions.FocusShare }
             : null;
         AnsiConsole.MarkupLineInterpolated(
             $"{statistics.ContextSources.Count(c => c.Length > 0)} tags have context sources (P(tag|source) in [[{targetOptions.ImpliedThreshold}, {targetOptions.MissingThreshold})); {targetOptions.ContextNegativesPerAnchor} context negative(s) per anchor, trained {(targetOptions.ContextNegativeWeight > 0 ? $"at full strength, weight {targetOptions.ContextNegativeWeight}, for localizable tags" : "as unverified negatives")}.");
@@ -292,9 +305,57 @@ public static class TrainCommandHandler
         var localizability = TagLocalizability.Load(targetOptions.LocalizableTagsPath ?? Path.Combine(checkpointDir, TagLocalizability.FileName));
         localizability.Save(Path.Combine(checkpointDir, TagLocalizability.FileName));
         var localizable = vocabulary.Records.Select(r => localizability.IsLocalizable(r.Tag)).ToArray();
+        // Classification pooling: localizable tags are scored from the map's cells (ClassificationPooling).
+        var classificationPooledRowArray = imageTower.ClassificationPoolingTemperature > 0
+            ? Enumerable.Range(0, localizable.Length).Where(t => localizable[t]).Select(t => (long)t).ToArray()
+            : [];
+        using var classificationPooledRows = tensor(classificationPooledRowArray, device: device);
+        if (imageTower.ClassificationPoolingTemperature > 0)
+        {
+            if (!targetOptions.DeliberateTargets)
+                throw new ArgumentException("--classification-pooling-temperature needs --targets deliberate.");
+            AnsiConsole.MarkupLineInterpolated(
+                $"Classification pooling: {classificationPooledRows.shape[0]:N0} localizable tags scored by a log-sum-exp over a {ClassificationPooling.Grid}x{ClassificationPooling.Grid} grid of the map's cells at temperature {imageTower.ClassificationPoolingTemperature} (trained each step on the batch's positives, full-strength negatives and {targetOptions.ClassificationPoolingMinedNegatives} highest-scoring negatives per image); the rest from the averaged embedding.");
+        }
+        ContextPrior? contextPrior = null;
+        if (targetOptions.ContextPriorWeight > 0 && targetOptions.DeliberateTargets)
+        {
+            contextPrior = ContextPrior.Build(statistics,
+                vocabulary.Records.Select(r => ContextRelianceEvaluator.IsContextSource(r.Tag)).ToArray(),
+                vocabulary.Records.Select((r, i) => localizable[i] && ContextRelianceEvaluator.IsGeneralTag(r.Tag)).ToArray(),
+                targetOptions.ContextPriorWeight);
+            AnsiConsole.MarkupLineInterpolated(
+                $"Context prior: weight {targetOptions.ContextPriorWeight}, {contextPrior.PairCount:N0} (source, tag) offsets from {contextPrior.SourceCount:N0} characters/artists/series; training logits only.");
+        }
         var pairWeightBuilder = new PairWeightBuilder(statistics, exclusiveGroups, targetOptions.CertainNegativeWeight,
             exhaustiveRows: ratings is not null ? ratingRows : null, contextNegativeWeight: targetOptions.ContextNegativeWeight,
-            contextNegativeTags: localizable);
+            contextNegativeTags: localizable, contextPrior: contextPrior, hardNegativeSourceWeight: targetOptions.HardNegativeSourceWeight);
+        if (targetOptions.HardNegativeSourceWeight > 0)
+            AnsiConsole.MarkupLineInterpolated(
+                $"Hard-negative sources: {statistics.HardNegativeSources.Where((h, t) => h.Length > 0 && localizable[t]).Count():N0} localizable tags have them; an image with a source but not the tag is a full-strength negative, weight {targetOptions.HardNegativeSourceWeight}.");
+
+        // Focus tags: the ones the latest epoch evaluation found answered from context, re-picked
+        // after every epoch evaluation (FocusTags).
+        var focusEligible = vocabulary.Records.Select((r, i) => localizable[i] && ContextRelianceEvaluator.IsGeneralTag(r.Tag)).ToArray();
+        IReadOnlySet<int> focusSet = new HashSet<int>();
+        string? RefreshFocus()
+        {
+            if (targetOptions.FocusShare <= 0 || tagCentricSampler is null)
+                return null;
+            var focus = FocusTags.Load(checkpointDir, EvaluationReportFileName, EvaluateCommandHandler.LocalizationReportFileName, vocabulary, focusEligible);
+            tagCentricSampler.Focus = focus.Rows;
+            focusSet = tagCentricSampler.Focus.ToHashSet();
+            var shown = string.Join(", ", focusSet.Take(12).Select(t => vocabulary.Records[t].Tag)) + (focusSet.Count > 12 ? ", ..." : "");
+            return Markup.Escape($"focus: {focusSet.Count} tags answered from context get {targetOptions.FocusShare:P0} of the anchors{(focusSet.Count > 0 ? $" ({shown})" : "; none until an epoch evaluation picks some")}");
+        }
+
+        if (targetOptions.FocusShare > 0 && tagCentricSampler is null)
+            throw new ArgumentException("--focus-share draws anchors for tag-centric sampling; it needs --sampling tag-centric.");
+        if (RefreshFocus() is { } focusMessage)
+            AnsiConsole.MarkupLine(char.ToUpperInvariant(focusMessage[0]) + focusMessage[1..] + "; re-picked after every epoch evaluation.");
+        if (targetOptions.MosaicClassificationWeight > 0 && targetOptions.MosaicsPerStep <= 0)
+            throw new ArgumentException("--mosaic-classification-weight classifies mosaic tiles; it needs --mosaics-per-step > 0.");
+        var mosaicTileSize = targetOptions.MosaicFullSizeTiles ? resolvedInputSize : resolvedInputSize / 2;
 
         // Crop consistency trains only tags the classifier is already good at (CropTeacherGate),
         // starting from the last epoch's evaluation and refreshed after every epoch.
@@ -312,7 +373,7 @@ public static class TrainCommandHandler
             if (batchSize < Mosaic.TilesPerMosaic)
                 throw new ArgumentException($"--mosaics-per-step needs at least {Mosaic.TilesPerMosaic} images per batch (--batch-size {batchSize}).");
             AnsiConsole.MarkupLineInterpolated(
-                $"Mosaic: {Math.Min(targetOptions.MosaicsPerStep, batchSize / Mosaic.TilesPerMosaic)} canvas(es) of four half-size batch images per step, weight {targetOptions.MosaicWeight} x the localization weight.");
+                $"Mosaic: {Math.Min(targetOptions.MosaicsPerStep, batchSize / Mosaic.TilesPerMosaic)} canvas(es) of four {(targetOptions.MosaicFullSizeTiles ? "full-size" : "half-size")} batch images per step, weight {targetOptions.MosaicWeight} x the localization weight{(targetOptions.MosaicClassificationWeight > 0 ? $", each tile also classified (weight {targetOptions.MosaicClassificationWeight})" : "")}.");
         }
 
         var earlyStopping = new EarlyStopping(earlyStoppingPatience);
@@ -363,6 +424,18 @@ public static class TrainCommandHandler
 
         // Global step the run resumes at; the loss history and snapshot evaluations are cut back to it.
         var resumedGlobalStep = (long)startEpoch * stepsPerEpoch + resumedStepsInEpoch;
+        if (targetOptions.ClassificationPoolingTemperature is > 0 and var poolingTarget)
+            imageTower.ClassificationPoolingSchedule = targetOptions.ClassificationPoolingAnnealSteps > 0 && targetOptions.ClassificationPoolingStartTemperature is > 0 and var poolingStart
+                ? new ClassificationPooling.Schedule(
+                    poolingTurnedOn || imageTower.ClassificationPoolingSchedule is null ? resumedGlobalStep : imageTower.ClassificationPoolingSchedule.StartStep,
+                    poolingStart, poolingTarget, targetOptions.ClassificationPoolingAnnealSteps)
+                : null;
+        if (imageTower.ClassificationPoolingSchedule is { } poolingSchedule)
+        {
+            imageTower.ClassificationPoolingTemperature = poolingSchedule.At(resumedGlobalStep);
+            AnsiConsole.MarkupLineInterpolated(
+                $"Classification pooling temperature annealed from {poolingSchedule.StartTemperature} to {poolingSchedule.TargetTemperature} over {poolingSchedule.AnnealSteps:N0} steps from step {poolingSchedule.StartStep:N0}: {imageTower.ClassificationPoolingTemperature:0.###} now.");
+        }
         var snapshotEvery = targetOptions.EvaluationCommand is not null && validationIndices.Count > 0 ? Math.Max(0, targetOptions.SnapshotEvaluationSteps) : 0;
         if (targetOptions.SnapshotEvaluationSteps > 0 && snapshotEvery == 0)
             AnsiConsole.MarkupLine("[yellow]--snapshot-evaluation-steps needs --evaluation-command and a validation split: no snapshot evaluations.[/]");
@@ -429,6 +502,7 @@ public static class TrainCommandHandler
                     cropTrusted = tensor(cropGate.Trusted.Select(t => t ? 1f : 0f).ToArray(), device: device);
                     dashboard.Log(Markup.Escape($"crop consistency: {cropGate.TrustedCount} tags now trusted as teachers (held-out AP >= {targetOptions.CropTeacherMinAveragePrecision})"));
                 }
+                if (RefreshFocus() is { } focusMessage) dashboard.Log(focusMessage);
                 dashboard.EvaluationFinished(result.Epoch - 1, result.Report, result.Ratings);
                 if (EvaluationPoint.Read(result.Directory, (long)result.Epoch * stepsPerEpoch, endOfEpoch: true) is { } epochPoint)
                     dashboard.AddEvaluationPoint(epochPoint);
@@ -488,6 +562,9 @@ public static class TrainCommandHandler
 
         void TrainingLoop()
         {
+            var profiler = StepProfiler.FromEnvironment(checkpointDir);
+            // The stem's first parameter: its gradient is the last backward() computes.
+            var profiledParameter = profiler is not null ? imageTower.parameters().First() : null;
             for (var epoch = startEpoch; epoch < epochs; epoch++)
             {
                 var stepStart = epoch == startEpoch ? resumedStepsInEpoch : 0;
@@ -496,6 +573,7 @@ public static class TrainCommandHandler
                 var epochClock = System.Diagnostics.Stopwatch.StartNew();
                 for (var step = stepStart; step < stepsPerEpoch; step++)
                 {
+                    profiler?.StepStarted();
                     // Every tensor allocated in a step (pooled/spatial embeddings, the full
                     // tagTower forward pass over the whole vocabulary, each `loss +=`
                     // reassignment's intermediate) is native/CUDA memory that .NET's GC does
@@ -503,6 +581,8 @@ public static class TrainCommandHandler
                     // until VRAM is exhausted; the scope frees them all once `lossValue` has
                     // been extracted as a plain float below.
                     using var stepScope = NewDisposeScope();
+                    if (imageTower.ClassificationPoolingSchedule is { } schedule)
+                        imageTower.ClassificationPoolingTemperature = schedule.At((long)epoch * stepsPerEpoch + step);
 
                     SampledImage[]? sampled;
                     IReadOnlyList<int> globalBatchIndices;
@@ -526,6 +606,7 @@ public static class TrainCommandHandler
                     }
 
                     using var pixelBatch = rawPixelBatch.to(device);
+                    profiler?.Mark("load batch", pixelBatch);
 
                     // Crop consistency's extra forward runs first, without gradients, keeping only
                     // the crops' pooled embeddings ([B, D]). Run after the main forward, its
@@ -551,14 +632,28 @@ public static class TrainCommandHandler
                             cropPooled = zeros([pixelBatch.shape[0], pooledCrops.shape[1]], device: device)
                                 .index_copy(0, selected, pooledCrops).MoveToOuterDisposeScope();
                         }
+                        profiler?.Mark("crop teacher forward", cropPooled);
                     }
 
                     // Classification pools the full map; the localization losses below use
-                    // the localization map (the same tensor unless LocalizationFromFusedOnly).
-                    var (spatial, localizationMap) = imageTower.ForwardMaps(pixelBatch);
-                    var spatialMask = SpatialMask.Build(boxes, resolvedInputSize, spatial.shape[2], spatial.shape[3], device);
-                    var pooled = ImageTower.MaskedPool(spatial, spatialMask);
+                    // the localization map (the same tensor unless LocalizationFromFusedOnly). Unless
+                    // something below needs the full map itself, ForwardPooled computes its masked
+                    // pool without building it ([batch, 512, 128, 128] per add at 512px).
+                    var needsFullMap = imageTower.ClassificationPoolingTemperature > 0 || targetOptions.MosaicClassificationWeight > 0;
+                    var mapSize = resolvedInputSize / imageTower.OutputStride;
+                    var spatialMask = SpatialMask.Build(boxes, resolvedInputSize, mapSize, mapSize, device);
+                    Tensor? spatial = null;
+                    Tensor localizationMap, pooled;
+                    if (needsFullMap)
+                    {
+                        (spatial, localizationMap) = imageTower.ForwardMaps(pixelBatch);
+                        pooled = ImageTower.MaskedPool(spatial, spatialMask);
+                    }
+                    else
+                        (pooled, localizationMap) = imageTower.ForwardPooled(pixelBatch, spatialMask);
+                    profiler?.Mark("forward", pooled);
                     var tagEmbeddings = tagTower.forward(allTagIndices);
+                    profiler?.Mark("tag tower forward", tagEmbeddings);
 
                     var batchTagRows = globalBatchIndices.Select(g => imageTagRows[g]).ToList();
                     using var labels = BatchLabelBuilder.Build(batchTagRows, vocabulary.Records.Count).to(device);
@@ -566,6 +661,7 @@ public static class TrainCommandHandler
                         ? pairWeightBuilder.Build(batchTagRows, sampled, imageSites is not null ? globalBatchIndices.Select(g => imageSites[g]).ToArray() : null)
                         : null;
                     using var targets = cpuTargets?.To(device);
+                    profiler?.Mark("targets (CPU) + upload", targets?.Weights ?? labels);
 
                     // Gradient accumulation: with gradientAccumulationSteps == 1 this is
                     // exactly the old zero_grad/backward/step-every-micro-batch behavior
@@ -602,14 +698,27 @@ public static class TrainCommandHandler
                             localizationTagChunkSize, localizedGradientScale, spatialMask, logitScaleBias);
                     }
 
-                    var loss = targets is not null
-                        ? SigmoidContrastiveLoss.ComputeWeighted(pooled, tagEmbeddings, targets, logitScaleBias, targetOptions.NegativeGamma, targetOptions.NegativeClip)
-                        : SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels, logitScaleBias);
+                    Tensor loss;
+                    if (targets is not null && imageTower.ClassificationPoolingTemperature > 0)
+                    {
+                        var (cells, validCells) = ClassificationPooling.Cells(spatial!, spatialMask);
+                        using var trainedRows = ClassificationPooling.TrainedRows(cells, validCells, tagEmbeddings, classificationPooledRowArray, cpuTargets!,
+                            imageTower.ClassificationPoolingTemperature, targetOptions.ClassificationPoolingMinedNegatives);
+                        loss = SigmoidContrastiveLoss.ComputeWeightedScores(
+                            ClassificationPooling.RawScores(pooled, cells, validCells, tagEmbeddings, trainedRows, imageTower.ClassificationPoolingTemperature),
+                            targets, logitScaleBias, targetOptions.NegativeGamma, targetOptions.NegativeClip);
+                    }
+                    else
+                        loss = targets is not null
+                            ? SigmoidContrastiveLoss.ComputeWeighted(pooled, tagEmbeddings, targets, logitScaleBias, targetOptions.NegativeGamma, targetOptions.NegativeClip)
+                            : SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels, logitScaleBias);
+                    profiler?.Mark("tag loss", loss);
                     // The whole-image tag term alone, for the dashboard's loss breakdown.
                     var tagLoss = loss;
                     Tensor? sparseLocalized = null;
                     Tensor? cropTerm = null;
                     Tensor? mosaicTerm = null;
+                    Tensor? tileClassificationTerm = null;
 
                     // Deliberate targets: the per-location loss only on pairs where "where is
                     // it?" has an answer (LocalizationPairSelector) -- ~100 pairs per image
@@ -621,12 +730,14 @@ public static class TrainCommandHandler
                             wholeImageLogits = pooled.matmul(tagEmbeddings.t()).cpu().data<float>().ToArray();
                         using var pairs = LocalizationPairSelector.Select(cpuTargets, wholeImageLogits, localizable, targetOptions.LocalizationMinedNegatives);
                         using var devicePairs = pairs.To(device);
+                        profiler?.Mark("localization pair selection", devicePairs.TagRows);
                         var localized = SigmoidContrastiveLoss.ComputeLocalizedPairs(
                             localizationMap, tagEmbeddings, devicePairs, (float)localizationTemperature, spatialMask, logitScaleBias,
                             targetOptions.NegativeGamma, targetOptions.NegativeClip,
                             targetOptions.LocalizationBackgroundWeight, targetOptions.LocalizationBackgroundFraction);
                         loss += localizationWeight * localized;
                         sparseLocalized = localized;
+                        profiler?.Mark("localization loss", loss);
 
                         // Crop consistency: the classifier, shown a crop without gradients, says
                         // whether each positive tag is inside that window; the localization map
@@ -653,15 +764,28 @@ public static class TrainCommandHandler
 
                         // Mosaic: four of the batch's images at half size on one canvas; each tile is
                         // a bag of its own, and the other tiles' tags must not light up in it (Mosaic).
+                        // Their own pass, not rows of the batch's: measured on the B70, one forward+backward of
+                        // 12 images ran ~5% slower than one of 10 plus one of 2 (241 vs 230 ms/step).
                         var tileImages = targetOptions.MosaicsPerStep > 0
-                            ? Mosaic.PickTiles((int)pixelBatch.shape[0], targetOptions.MosaicsPerStep, mosaicRandom)
+                            ? Mosaic.PickTiles((int)pixelBatch.shape[0], targetOptions.MosaicsPerStep, mosaicRandom, sampled, focusSet)
                             : [];
                         if (tileImages.Length > 0)
                         {
-                            var canvases = Mosaic.Compose(pixelBatch, tileImages, resolvedInputSize);
-                            var (_, mosaicMap) = imageTower.ForwardMaps(canvases);
-                            var tileBoxes = tileImages.Select((image, k) => Mosaic.TileBox(boxes[image], k % Mosaic.TilesPerMosaic, resolvedInputSize)).ToArray();
-                            using var tileMask = SpatialMask.Build(tileBoxes, resolvedInputSize, mosaicMap.shape[2], mosaicMap.shape[3], device);
+                            var canvases = Mosaic.Compose(pixelBatch, tileImages, resolvedInputSize, mosaicTileSize);
+                            profiler?.Mark("mosaic compose", canvases);
+                            Tensor? mosaicSpatial = null;
+                            Tensor mosaicMap;
+                            if (needsFullMap)
+                                (mosaicSpatial, mosaicMap) = imageTower.ForwardMaps(canvases);
+                            else
+                            {
+                                // Only the canvases' localization map is used; their pooled rows aren't.
+                                using var canvasMask = ones(canvases.shape[0], 1, canvases.shape[2] / imageTower.OutputStride, canvases.shape[3] / imageTower.OutputStride, device: device);
+                                (_, mosaicMap) = imageTower.ForwardPooled(canvases, canvasMask);
+                            }
+                            profiler?.Mark("mosaic forward", mosaicMap);
+                            var tileBoxes = tileImages.Select((image, k) => Mosaic.TileBox(boxes[image], k % Mosaic.TilesPerMosaic, resolvedInputSize, mosaicTileSize)).ToArray();
+                            using var tileMask = SpatialMask.Build(tileBoxes, 2 * mosaicTileSize, mosaicMap.shape[2], mosaicMap.shape[3], device);
                             using var cpuTilePairs = Mosaic.TilePairs(pairs, cpuTargets, tileImages);
                             using var tilePairs = cpuTilePairs.To(device);
                             using var canvasOfTile = tensor(Enumerable.Range(0, tileImages.Length).Select(k => (long)(k / Mosaic.TilesPerMosaic)).ToArray(), device: device);
@@ -669,6 +793,24 @@ public static class TrainCommandHandler
                                 mosaicMap.index_select(0, canvasOfTile), tagEmbeddings, tilePairs, (float)localizationTemperature, tileMask, logitScaleBias,
                                 targetOptions.NegativeGamma, targetOptions.NegativeClip);
                             loss += localizationWeight * targetOptions.MosaicWeight * mosaicTerm;
+                            profiler?.Mark("mosaic loss", loss);
+
+                            // Each tile classified from the canvas's full map pooled over it, on its
+                            // image's own targets: the neighbouring tiles are in view of the deeper
+                            // layers, so only the tile's own pixels give the right answer.
+                            if (targetOptions.MosaicClassificationWeight > 0)
+                            {
+                                // needsFullMap: mosaicSpatial is set.
+                                using var tileSpatialMask = mosaicSpatial!.shape[2] == mosaicMap.shape[2]
+                                    ? tileMask.alias()
+                                    : SpatialMask.Build(tileBoxes, 2 * mosaicTileSize, mosaicSpatial.shape[2], mosaicSpatial.shape[3], device);
+                                var tilePooled = ImageTower.MaskedPool(mosaicSpatial.index_select(0, canvasOfTile), tileSpatialMask);
+                                using var cpuTileTargets = Mosaic.TileTargets(cpuTargets, tileImages);
+                                using var tileTargets = cpuTileTargets.To(device);
+                                tileClassificationTerm = SigmoidContrastiveLoss.ComputeWeighted(
+                                    tilePooled, tagEmbeddings, tileTargets, logitScaleBias, targetOptions.NegativeGamma, targetOptions.NegativeClip);
+                                loss += targetOptions.MosaicClassificationWeight * tileClassificationTerm;
+                            }
                         }
                     }
 
@@ -693,6 +835,7 @@ public static class TrainCommandHandler
                     // summing gradientAccumulationSteps independently-normalized micro-batch
                     // gradients, which would be gradientAccumulationSteps times too large.
                     (loss / gradientAccumulationSteps).backward();
+                    profiler?.Mark("backward", profiledParameter?.grad);
 
                     if (GradientAccumulator.ShouldStep(step, gradientAccumulationSteps, stepsPerEpoch))
                     {
@@ -708,6 +851,7 @@ public static class TrainCommandHandler
 
                         optimizer.step();
                         logitScaleBiasOptimizer.step();
+                        profiler?.Mark("optimizer step", profiledParameter);
                     }
 
                     // Unscaled -- reports the real loss magnitude every micro-batch (matching
@@ -740,7 +884,10 @@ public static class TrainCommandHandler
                     var currentRate = targetOptions.CosineSchedule
                         ? LearningRateSchedule.At((long)epoch * stepsPerEpoch + step, (long)epochs * stepsPerEpoch, learningRate, targetOptions.WarmupSteps)
                         : learningRate;
-                    dashboard.StepCompleted(step + 1, lossValue, tagLoss.item<float>(), localizationShown, currentRate, stepMs - waitMs, waitMs);
+                    var tagShown = tagLoss.item<float>();
+                    if (tileClassificationTerm is not null)
+                        tagShown += targetOptions.MosaicClassificationWeight * tileClassificationTerm.item<float>();
+                    dashboard.StepCompleted(step + 1, lossValue, tagShown, localizationShown, currentRate, stepMs - waitMs, waitMs);
                     if (targetOptions.CropConsistencyWeight > 0)
                         dashboard.CropTeacher(cropGate.TrustedCount, croppedImages / (double)((stepsThisProcess + 1L) * batchSize));
 
@@ -788,6 +935,9 @@ public static class TrainCommandHandler
                         }
                     }
 
+                    profiler?.Mark("bookkeeping (losses, dashboard, saves)");
+                    if (profiler?.StepFinished() == true)
+                        dashboard.Log(Markup.Escape($"step profile written to {Path.Combine(checkpointDir, "step_profile.txt")}"));
                     if (stopping)
                     {
                         dashboard.Finished(reachedMaxSteps ? $"stopped after --max-steps {targetOptions.MaxSteps}" : "stopped by Ctrl+C, checkpoint saved");
@@ -837,9 +987,9 @@ public static class TrainCommandHandler
                         : validationIndices;
                     var validationBatchCount = Math.Max(1, (int)Math.Ceiling(heldOut.Count / (double)batchSize));
                     dashboard.EvaluationStarted();
-                    var (validationLoss, heldOutPooled) = Evaluate(
+                    var (validationLoss, heldOutPooled, heldOutScores) = Evaluate(
                         imageTower, tagTower, logitScaleBias, loadBatch, imageTagRows, heldOut, allTagIndices, vocabulary.Records.Count, device, batchSize, resolvedInputSize,
-                        readWindow: readWindow,
+                        readWindow: readWindow, classificationPooledRows: classificationPooledRows,
                         onBatchComplete: batchesDone =>
                             dashboard.PhaseProgress($"end of epoch {epoch + 1}: embedding held-out images (batches)", batchesDone, validationBatchCount));
 
@@ -847,7 +997,7 @@ public static class TrainCommandHandler
                     var report = EvaluateRankings(
                         heldOutPooled, heldOut.Select(i => imageTagRows[i]).ToList(), tagTower, allTagIndices, logitScaleBias,
                         vocabulary, statistics, exclusiveGroups, device, validationSplitSeed,
-                        imageSites is not null ? heldOut.Select(i => imageSites[i]).ToArray() : null);
+                        imageSites is not null ? heldOut.Select(i => imageSites[i]).ToArray() : null, heldOutScores);
                     var ratingReport = ratings is not null && ratingRows is not null
                         ? EvaluateRatings(heldOutPooled, heldOut.Select(i => ratings[i]).ToList(), tagTower, allTagIndices, logitScaleBias, ratingRows, imageTower.EmbeddingDim)
                         : null;
@@ -864,6 +1014,10 @@ public static class TrainCommandHandler
                             tagEmbeddingArray = embeddingsNow.cpu().data<float>().ToArray();
                         var localization = new LocalizationEvaluator(
                                 imageTower, tagEmbeddingArray, imageTower.EmbeddingDim, logitScaleBias.ToLogitScaling(), readWindow, resolvedInputSize, device)
+                            {
+                                MapScoreTemperature = localizationWeight > 0 ? (float)localizationTemperature : null,
+                                ClassificationPooledTags = localizable,
+                            }
                             .Evaluate(vocabulary, imageTagRows, heldOut, gold, localizability, seed: validationSplitSeed, labelFreeChecks: false);
                         EvaluateCommandHandler.WriteLocalizationReport(checkpointDir, localization);
                         ArchiveEpochReports(checkpointDir, epoch + 1);
@@ -883,6 +1037,7 @@ public static class TrainCommandHandler
                         cropTrusted = tensor(cropGate.Trusted.Select(t => t ? 1f : 0f).ToArray(), device: device);
                         dashboard.Log(Markup.Escape($"crop consistency: {cropGate.TrustedCount} tags now trusted as teachers (held-out AP >= {targetOptions.CropTeacherMinAveragePrecision})"));
                     }
+                    if (RefreshFocus() is { } focusMessage) dashboard.Log(focusMessage);
                     dashboard.EvaluationFinished(epoch, report, ratingReport);
                     if (EvaluationPoint.Read(Path.Combine(checkpointDir, "history", $"epoch-{epoch + 1}"), (long)(epoch + 1) * stepsPerEpoch, endOfEpoch: true) is { } epochPoint)
                         dashboard.AddEvaluationPoint(epochPoint);
@@ -977,16 +1132,23 @@ public static class TrainCommandHandler
     internal static EvaluationReport EvaluateRankings(
         float[] heldOutPooled, IReadOnlyList<IReadOnlyList<int>> heldOutTags, TagTower tagTower, Tensor allTagIndices, LogitScaleBias logitScaleBias,
         TagVocabulary vocabulary, TagStatistics statistics, ExclusiveTagGroups exclusiveGroups, Device device, int seed,
-        IReadOnlyList<BooruSites>? heldOutSites = null)
+        IReadOnlyList<BooruSites>? heldOutSites = null, float[]? heldOutScores = null)
     {
+        using var logits = HeldOutLogits(heldOutPooled, heldOutScores, heldOutTags.Count, tagTower, allTagIndices, logitScaleBias);
+        return TagRankingEvaluator.Evaluate(logits, heldOutTags, vocabulary, statistics, exclusiveGroups, device, seed: seed, imageSites: heldOutSites);
+    }
+
+    /// <summary>The evaluators' logits: <paramref name="heldOutScores"/> (raw [images × tags]) when the classifier pools per tag, else from the pooled embeddings.</summary>
+    internal static ImageTagLogits HeldOutLogits(
+        float[] heldOutPooled, float[]? heldOutScores, int imageCount, TagTower tagTower, Tensor allTagIndices, LogitScaleBias logitScaleBias)
+    {
+        if (heldOutScores is not null)
+            return ImageTagLogits.Dense(heldOutScores, imageCount, logitScaleBias.ToLogitScaling());
         float[] tagEmbeddings;
         using (no_grad())
         using (var embeddings = tagTower.forward(allTagIndices))
             tagEmbeddings = embeddings.cpu().data<float>().ToArray();
-
-        return TagRankingEvaluator.Evaluate(
-            heldOutPooled, heldOutTags, tagEmbeddings, (int)(tagEmbeddings.Length / vocabulary.Records.Count), logitScaleBias.ToLogitScaling(),
-            vocabulary, statistics, exclusiveGroups, device, seed: seed, imageSites: heldOutSites);
+        return ImageTagLogits.Linear(heldOutPooled, tagEmbeddings, (int)(tagEmbeddings.Length / allTagIndices.shape[0]), logitScaleBias.ToLogitScaling());
     }
 
     internal const string EvaluationReportFileName = "evaluation_report.json";
@@ -1056,7 +1218,8 @@ public static class TrainCommandHandler
                 ? $" | context reliance: recall gap {c.MacroRecallGap:+0.0%;-0.0%} ({c.RecallGapTags} tags), false-positive gap {c.MacroFalsePositiveGap:+0.0%;-0.0%} ({c.FalsePositiveGapTags} tags)"
                 : ""));
 
-    internal static (double Loss, float[] Pooled) Evaluate(
+    /// <param name="classificationPooledRows">With <see cref="ImageTower.ClassificationPoolingTemperature"/> &gt; 0, the rows scored per tag (<see cref="ClassificationPooling"/>); the result then also carries every image's raw scores for every tag.</param>
+    internal static (double Loss, float[] Pooled, float[]? Scores) Evaluate(
         ImageTower imageTower,
         TagTower tagTower,
         LogitScaleBias logitScaleBias,
@@ -1069,9 +1232,12 @@ public static class TrainCommandHandler
         int batchSize,
         int inputSize,
         Action<int>? onBatchComplete = null,
-        Func<IReadOnlyList<int>, EncodedImage[]>? readWindow = null)
+        Func<IReadOnlyList<int>, EncodedImage[]>? readWindow = null,
+        Tensor? classificationPooledRows = null)
     {
         using var _ = no_grad();
+        var perTag = imageTower.ClassificationPoolingTemperature > 0 && classificationPooledRows is not null;
+        var scoresAll = perTag ? new float[(long)validationIndices.Count * vocabularySize] : null;
 
         // Same background, offset-sorted loading as training when the data comes from a
         // cache. Validation order doesn't matter (embeddings are written back by position),
@@ -1123,6 +1289,12 @@ public static class TrainCommandHandler
             using var labels = BatchLabelBuilder.Build(batchTagRows, vocabularySize).to(device);
             using var loss = SigmoidContrastiveLoss.Compute(pooled, tagEmbeddings, labels, logitScaleBias);
             pooled.cpu().data<float>().ToArray().CopyTo(pooledAll, offset * imageTower.EmbeddingDim);
+            if (scoresAll is not null)
+            {
+                var (cells, validCells) = ClassificationPooling.Cells(spatial, spatialMask);
+                using var scores = ClassificationPooling.RawScores(pooled, cells, validCells, tagEmbeddings, classificationPooledRows!, imageTower.ClassificationPoolingTemperature);
+                scores.cpu().data<float>().ToArray().CopyTo(scoresAll, (long)offset * vocabularySize);
+            }
 
             totalLoss += loss.item<float>() * chunk.Count;
             totalCount += chunk.Count;
@@ -1131,7 +1303,7 @@ public static class TrainCommandHandler
             onBatchComplete?.Invoke(batchesDone);
         }
 
-        return (totalLoss / totalCount, pooledAll);
+        return (totalLoss / totalCount, pooledAll, scoresAll);
     }
 
     internal static (Tensor Pixels, IReadOnlyList<LetterboxBox> Boxes) LoadCacheBatch(PreprocessedDatasetCacheReader cache, IReadOnlyList<int> indices, int inputSize)

@@ -21,30 +21,65 @@ public static class Mosaic
     /// <summary>
     /// Distinct batch images for up to <paramref name="mosaics"/> mosaics, four per mosaic in
     /// tile order (top-left, top-right, bottom-left, bottom-right); fewer mosaics if the
-    /// batch is too small.
+    /// batch is too small. Images drawn for a <paramref name="focus"/> anchor go first, grouped by
+    /// anchor, so its positives and context negatives share a canvas: "the gloves are on that
+    /// tile, not on her".
     /// </summary>
-    public static int[] PickTiles(int batchSize, int mosaics, Random random)
+    /// <param name="sampled">Why each batch image is there, in batch order; null = pick at random.</param>
+    public static int[] PickTiles(int batchSize, int mosaics, Random random, IReadOnlyList<SampledImage>? sampled = null, IReadOnlySet<int>? focus = null)
     {
         var count = Math.Min(mosaics, batchSize / TilesPerMosaic) * TilesPerMosaic;
-        return Enumerable.Range(0, batchSize).OrderBy(_ => random.Next()).Take(count).ToArray();
+        IEnumerable<int> order = Enumerable.Range(0, batchSize).OrderBy(_ => random.Next()).ToList();
+        if (sampled is not null && focus is { Count: > 0 })
+            order = order.OrderBy(i => focus.Contains(sampled[i].AnchorTag) ? 0 : 1)
+                .ThenBy(i => focus.Contains(sampled[i].AnchorTag) ? sampled[i].AnchorTag : 0)
+                .ThenBy(i => sampled[i].IsHardNegative ? 1 : 0);
+        // Each canvas's tiles in random places, so a group's positives don't always sit top-left.
+        return order.Take(count).Chunk(TilesPerMosaic).SelectMany(tiles => tiles.OrderBy(_ => random.Next())).ToArray();
     }
 
-    /// <summary>Where an image's content lands on the canvas as tile <paramref name="tile"/> (0-3, row-major).</summary>
-    public static LetterboxBox TileBox(LetterboxBox content, int tile, int inputSize)
+    /// <summary>
+    /// Where an image's content lands on the canvas as tile <paramref name="tile"/> (0-3, row-major),
+    /// each tile <paramref name="tileSize"/> pixels square (half the input size, or all of it).
+    /// </summary>
+    public static LetterboxBox TileBox(LetterboxBox content, int tile, int inputSize, int? tileSize = null)
     {
-        var half = inputSize / 2;
-        var (offsetX, offsetY) = (tile % 2 * half, tile / 2 * half);
-        return new LetterboxBox(offsetX + content.X / 2, offsetY + content.Y / 2, Math.Max(1, content.Width / 2), Math.Max(1, content.Height / 2));
+        var size = tileSize ?? inputSize / 2;
+        var (offsetX, offsetY) = (tile % 2 * size, tile / 2 * size);
+        return new LetterboxBox(offsetX + content.X * size / inputSize, offsetY + content.Y * size / inputSize,
+            Math.Max(1, content.Width * size / inputSize), Math.Max(1, content.Height * size / inputSize));
     }
 
-    /// <summary>[mosaics, 3, size, size] canvases from <paramref name="pixels"/> ([batch, 3, size, size]), each image 2x2 average-pooled into its tile.</summary>
-    public static Tensor Compose(Tensor pixels, int[] tileImages, int inputSize)
+    /// <summary>
+    /// [mosaics, 3, 2·tile, 2·tile] canvases from <paramref name="pixels"/> ([batch, 3, size, size]): each
+    /// image 2x2 average-pooled into its tile (<paramref name="tileSize"/> = half the input, the default),
+    /// or at full size on a canvas twice the input's side.
+    /// </summary>
+    public static Tensor Compose(Tensor pixels, int[] tileImages, int inputSize, int? tileSize = null)
     {
         var mosaics = tileImages.Length / TilesPerMosaic;
-        var half = inputSize / 2;
-        var small = nn.functional.avg_pool2d(pixels.index_select(0, tensor(tileImages.Select(i => (long)i).ToArray(), device: pixels.device)), 2);
-        // [M*4, 3, h, h] -> [M, 2 rows, 2 cols, 3, h, h] -> [M, 3, 2 rows, h, 2 cols, h] -> [M, 3, size, size]
-        return small.reshape([mosaics, 2, 2, 3, half, half]).permute(0, 3, 1, 4, 2, 5).reshape([mosaics, 3, inputSize, inputSize]);
+        var size = tileSize ?? inputSize / 2;
+        if (size != inputSize && size * 2 != inputSize)
+            throw new ArgumentException($"A tile is half the input size or all of it, not {size} of {inputSize}.", nameof(tileSize));
+        var selected = pixels.index_select(0, tensor(tileImages.Select(i => (long)i).ToArray(), device: pixels.device));
+        var tiles = size == inputSize ? selected : nn.functional.avg_pool2d(selected, 2);
+        // [M*4, 3, t, t] -> [M, 2 rows, 2 cols, 3, t, t] -> [M, 3, 2 rows, t, 2 cols, t] -> [M, 3, 2t, 2t]
+        return tiles.reshape([mosaics, 2, 2, 3, size, size]).permute(0, 3, 1, 4, 2, 5).reshape([mosaics, 3, 2 * size, 2 * size]);
+    }
+
+    /// <summary>
+    /// The tiles' whole-image targets, for classifying each tile from the canvas's full map pooled over
+    /// it: each tile image's own row of <paramref name="targets"/> (CPU). The row already labels the
+    /// other tiles' tags (a context negative's "no gloves" at full strength), and the canvas's deeper
+    /// layers see the neighbouring tiles, so a tile is only right if it answers from its own pixels.
+    /// </summary>
+    public static PairTargets TileTargets(PairTargets targets, int[] tileImages)
+    {
+        using var rows = tensor(tileImages.Select(i => (long)i).ToArray());
+        var labels = targets.Labels.index_select(0, rows);
+        var weights = targets.Weights.index_select(0, rows);
+        var positiveWeightSum = (weights * labels.gt(0)).sum().item<float>();
+        return new PairTargets(labels, weights, targets.FocalMask.index_select(0, rows), positiveWeightSum, targets.LogitOffsets?.index_select(0, rows));
     }
 
     /// <summary>

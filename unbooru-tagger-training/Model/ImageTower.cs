@@ -87,6 +87,24 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
 
     private int _localizationSkippedLaterals;
 
+    /// <summary>
+    /// Above 0, localizable tags' whole-image scores are a log-sum-exp over a grid of the full map's cells at this
+    /// temperature (raw dot-product units) instead of the dot product with the averaged embedding
+    /// (<see cref="ClassificationPooling"/>); 0 = the averaged embedding for every tag. Not a weight change: it
+    /// can be switched when resuming, and evaluation must score the same way.
+    /// </summary>
+    public float ClassificationPoolingTemperature { get; set; }
+
+    /// <summary>
+    /// The dtype the trunk, projection and laterals compute in (<see cref="MixedPrecision"/>); null = the weights'
+    /// own (fp32). The weights stay fp32 either way and both maps come out fp32, so everything downstream (tag scores,
+    /// losses, pooling) is unchanged. Not a weight change: it can be switched when resuming.
+    /// </summary>
+    public ScalarType? ComputeType { get; set; }
+
+    /// <summary>How training anneals <see cref="ClassificationPoolingTemperature"/>; null = held fixed.</summary>
+    public ClassificationPooling.Schedule? ClassificationPoolingSchedule { get; set; }
+
     /// <summary>Input pixels per spatial-map cell: the stem's stride, x2 per downsampling stage, /2 per fused stage.</summary>
     public int OutputStride { get; }
 
@@ -170,30 +188,102 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
     /// </summary>
     public (Tensor Spatial, Tensor Localization) ForwardMaps(Tensor input)
     {
-        var x = Stem.forward(input);
-        var stageOutputs = new Tensor[StageChannels.Length];
-        var nextStage = 0;
-        for (var i = 0; i < Layers.Count; i++)
-        {
-            x = Layers[i].forward(x);
-            if (nextStage < _stageEnds.Length && i == _stageEnds[nextStage])
-                stageOutputs[nextStage++] = x;
-        }
+        // As in ConvNeXtBlock.forward: block and stage outputs and upsampled maps are freed here, not by the caller.
+        using var scope = NewDisposeScope();
+        var stageOutputs = Trunk(input, out var x);
+        var (spatial, localization) = FusedChain(stageOutputs, x);
+        var same = ReferenceEquals(localization, spatial);
+        spatial = ToFloat32(spatial);
+        localization = same ? spatial : ToFloat32(localization);
+        scope.MoveToOuter(spatial);
+        if (!ReferenceEquals(localization, spatial))
+            scope.MoveToOuter(localization);
+        return (spatial, localization);
+    }
 
-        var spatial = Projection.forward(x);
+    /// <summary>The full map and the localization map from the trunk's outputs (<see cref="ForwardMaps"/>).</summary>
+    private (Tensor Spatial, Tensor Localization) FusedChain(Tensor[] stageOutputs, Tensor last)
+    {
+        var spatial = MixedPrecision.Conv(Projection, last);
         Tensor? localization = null;
         for (var k = 1; k <= FusedStages; k++)
         {
-            var lateral = Laterals[k - 1].forward(stageOutputs[StageChannels.Length - 1 - k]);
+            var lateral = MixedPrecision.Conv(Laterals[k - 1], stageOutputs[StageChannels.Length - 1 - k]);
             spatial = Upsample(spatial, lateral) + lateral;
             if (LocalizationFromFusedOnly && k > LocalizationSkippedLaterals)
                 localization = localization is null ? lateral : Upsample(localization, lateral) + lateral;
         }
-
         return (spatial, localization ?? spatial);
+    }
 
-        static Tensor Upsample(Tensor map, Tensor like) =>
-            functional.interpolate(map, size: [like.shape[2], like.shape[3]], mode: InterpolationMode.Nearest);
+    private static Tensor ToFloat32(Tensor map) => map.dtype == ScalarType.Float32 ? map : map.to_type(ScalarType.Float32);
+
+    private static Tensor Upsample(Tensor map, Tensor like) =>
+        functional.interpolate(map, size: [like.shape[2], like.shape[3]], mode: InterpolationMode.Nearest);
+
+    /// <summary>Stem and stages: each stage's output, and the last one in <paramref name="last"/>.</summary>
+    private Tensor[] Trunk(Tensor input, out Tensor last)
+    {
+        var x = MixedPrecision.Conv(Stem, ComputeType is { } computeType && computeType != input.dtype ? input.to_type(computeType) : input);
+        var stageOutputs = new Tensor[StageChannels.Length];
+        var nextStage = 0;
+        for (var i = 0; i < Layers.Count; i++)
+        {
+            x = MixedPrecision.Layer(Layers[i], x);
+            if (nextStage < _stageEnds.Length && i == _stageEnds[nextStage])
+                stageOutputs[nextStage++] = x;
+        }
+        last = x;
+        return stageOutputs;
+    }
+
+    /// <summary>
+    /// <c>MaskedPool(ForwardMaps(input).Spatial, mask)</c> and the localization map, without building the full map.
+    /// The full map is the coarsest projection plus each fused lateral, nearest-upsampled 2x per level to the finest
+    /// grid; training only ever pools it, and at 512px it is [batch, 512, 128, 128] for every one of those adds, in
+    /// both passes. Nearest upsampling by an exact factor repeats each value over a block, so the masked sum over the
+    /// fine grid is each level's map times the mask summed over its blocks, added up over the levels. Falls back to
+    /// <see cref="ForwardMaps"/> when the localization map is the full map or a level isn't an exact 2x.
+    /// </summary>
+    /// <param name="mask">[batch, 1, height, width] at the full map's resolution, as for <see cref="MaskedPool"/>.</param>
+    public (Tensor Pooled, Tensor Localization) ForwardPooled(Tensor input, Tensor mask)
+    {
+        using var scope = NewDisposeScope();
+        var stageOutputs = Trunk(input, out var x);
+        // Level k (0 = the projection of the last stage, k > 0 = lateral k) is upsampled 2^(FusedStages - k) times.
+        Tensor LevelInput(int k) => k == 0 ? x : stageOutputs[StageChannels.Length - 1 - k];
+        var exact = LocalizationFromFusedOnly && Enumerable.Range(0, FusedStages + 1).All(k =>
+            LevelInput(k).shape[2] << (FusedStages - k) == mask.shape[2] && LevelInput(k).shape[3] << (FusedStages - k) == mask.shape[3]);
+
+        Tensor pooled, localization;
+        if (exact)
+        {
+            Tensor? weightedSum = null;
+            Tensor? fused = null;
+            for (var k = 0; k <= FusedStages; k++)
+            {
+                // Back to fp32 before the sums over up to 128x128 cells.
+                var map = ToFloat32(k == 0 ? MixedPrecision.Conv(Projection, x) : MixedPrecision.Conv(Laterals[k - 1], LevelInput(k)));
+                if (k > LocalizationSkippedLaterals)
+                    fused = fused is null ? map : Upsample(fused, map) + map;
+                var factor = 1L << (FusedStages - k);
+                var blockMask = factor == 1 ? mask : functional.avg_pool2d(mask, factor) * (factor * factor);
+                var term = (map * blockMask).sum([2, 3]);
+                weightedSum = weightedSum is null ? term : weightedSum + term;
+            }
+            pooled = weightedSum! / mask.sum([2, 3]).clamp_min(1e-6);
+            localization = fused!;
+        }
+        else
+        {
+            var (spatial, fullLocalization) = FusedChain(stageOutputs, x);
+            pooled = MaskedPool(ToFloat32(spatial), mask);
+            localization = ToFloat32(fullLocalization);
+        }
+
+        scope.MoveToOuter(pooled);
+        scope.MoveToOuter(localization);
+        return (pooled, localization);
     }
 
     /// <summary>

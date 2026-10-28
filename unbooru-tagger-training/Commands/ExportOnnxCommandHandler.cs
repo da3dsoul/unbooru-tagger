@@ -15,6 +15,10 @@ public static class ExportOnnxCommandHandler
     public static int Run(string checkpointDir, string modelDir)
     {
         var (imageTower, config, vocabulary, embeddings, logitScaleBias) = Checkpoint.Load(checkpointDir);
+        // Inference scores from the averaged embedding only; a per-tag pooled classifier would be scored wrong.
+        if (config.ClassificationPoolingTemperature > 0)
+            throw new NotSupportedException(
+                $"This checkpoint scores localizable tags per tag (classification pooling temperature {config.ClassificationPoolingTemperature}), which the ONNX bundle and inference don't support yet.");
 
         Directory.CreateDirectory(modelDir);
         ImageTowerOnnxExporter.Export(imageTower, Path.Combine(modelDir, ModelBundle.ImageEncoderFileName), config.InputSize);

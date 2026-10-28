@@ -142,7 +142,7 @@ public sealed class TagStatistics
                 return;
             }
 
-            var random = new Random(HashCode.Combine(seed, s));
+            var random = new Random(DeterministicSeed.For(seed, s));
             var sampleCount = Math.Min(samplesPerTag, images.Length);
             var tally = new Dictionary<int, int>();
             for (var i = 0; i < sampleCount; i++)

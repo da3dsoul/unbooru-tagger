@@ -43,6 +43,13 @@ public sealed record GoldResult(string Name, int Pairs, int GoldInstances, doubl
 /// <param name="TeacherTags">The same per tag.</param>
 /// <param name="Occlusion">Occlusion check on the gold set, overall, per stratum and per size bucket (<see cref="OcclusionResult"/>); empty without a gold set.</param>
 /// <param name="OcclusionTags">The same per tag.</param>
+/// <param name="MapOcclusion">
+/// The occlusion check again with localizable tags scored from the localization map instead of the pooled
+/// embedding (<see cref="LocalizationEvaluator.MapScoreTemperature"/>): the tag's per-location logits pooled
+/// by a temperature log-sum-exp over the image's content, as the localization loss pools them. Each location
+/// sees only part of the image, so this asks whether a map-scored classifier would answer from the object.
+/// </param>
+/// <param name="MapOcclusionTags">The same per tag.</param>
 /// <param name="Gold">Gold-set results overall ("all") and per stratum ("clean", "messy").</param>
 /// <param name="GoldTags">Gold-set results per tag, worst pointing first.</param>
 public sealed record LocalizationReport(
@@ -55,7 +62,9 @@ public sealed record LocalizationReport(
     IReadOnlyList<TeacherResult>? Teacher = null,
     IReadOnlyList<TeacherResult>? TeacherTags = null,
     IReadOnlyList<OcclusionResult>? Occlusion = null,
-    IReadOnlyList<OcclusionResult>? OcclusionTags = null);
+    IReadOnlyList<OcclusionResult>? OcclusionTags = null,
+    IReadOnlyList<OcclusionResult>? MapOcclusion = null,
+    IReadOnlyList<OcclusionResult>? MapOcclusionTags = null);
 
 /// <summary>
 /// Does a whole-image call depend on the object itself? For each gold pair the classifier finds
@@ -110,6 +119,13 @@ public sealed class LocalizationEvaluator(
     int inputSize,
     Device device)
 {
+    /// <summary>
+    /// With a value, the occlusion check is repeated with localizable tags scored from the localization map at
+    /// this log-sum-exp temperature (<see cref="LocalizationReport.MapOcclusion"/>); training's
+    /// --localization-temperature is the natural choice.
+    /// </summary>
+    public float? MapScoreTemperature { get; init; }
+
     // One instance per person — on a solo image, exactly one box is right.
     public static readonly string[] OncePerPersonTags = ["blush", "necktie", "hat", "choker", "scarf", "glasses", "headphones", "halo"];
 
@@ -165,7 +181,11 @@ public sealed class LocalizationEvaluator(
 
         var (goldSummary, goldTags) = gold is { Count: > 0 } ? EvaluateGold(gold, rowOf) : ([], []);
         var (teacherSummary, teacherTags) = gold is { Count: > 0 } ? EvaluateTeacher(gold, rowOf, random) : ([], []);
-        var (occlusionSummary, occlusionTags) = gold is { Count: > 0 } ? EvaluateOcclusion(gold, rowOf, random) : ([], []);
+        var (occlusionSummary, occlusionTags) = gold is { Count: > 0 } ? EvaluateOcclusion(gold, rowOf, random, (pixels, _) => Forward(pixels).PooledScore, _ => true) : ([], []);
+        // Its own random source: the pooled check and everything after it see the same draws as before.
+        var (mapOcclusionSummary, mapOcclusionTags) = gold is { Count: > 0 } && MapScoreTemperature is { } temperature
+            ? EvaluateOcclusion(gold, rowOf, new Random(seed + 1), (pixels, boxes) => MapScorer(pixels, boxes, temperature), t => localizable[t])
+            : ([], []);
 
         // The label-free checks cost thousands of extra forward passes; training's per-epoch
         // evaluation skips them and scores only the gold set (labelFreeChecks: false).
@@ -192,7 +212,8 @@ public sealed class LocalizationEvaluator(
             soloPairs, soloSingle,
             goldTags,
             teacherSummary, teacherTags,
-            occlusionSummary, occlusionTags);
+            occlusionSummary, occlusionTags,
+            mapOcclusionSummary, mapOcclusionTags);
     }
 
     /// <summary>Running totals for one tag or stratum.</summary>
@@ -488,8 +509,11 @@ public sealed class LocalizationEvaluator(
     /// <summary>Margin (input pixels) added around each blanked gold box, so its edges and the outline around it go too.</summary>
     public const int OcclusionMargin = 4;
 
+    /// <param name="score">Scores a batch of images (with their content boxes): (image, tag) → confidence.</param>
+    /// <param name="eligible">Which tag rows to check.</param>
     private (List<OcclusionResult> Summary, List<OcclusionResult> Tags) EvaluateOcclusion(
-        IReadOnlyList<GoldImage> gold, IReadOnlyDictionary<string, int> rowOf, Random random)
+        IReadOnlyList<GoldImage> gold, IReadOnlyDictionary<string, int> rowOf, Random random,
+        Func<Tensor, LetterboxBox[], Func<int, int, float>> score, Func<int, bool> eligible)
     {
         var perTag = new Dictionary<string, OcclusionTally>();
         var perStratum = new Dictionary<string, OcclusionTally> { ["all"] = new() };
@@ -498,7 +522,7 @@ public sealed class LocalizationEvaluator(
         {
             using var scope = NewDisposeScope();
             var (pixels, boxes) = Load(chunk.Select(g => g.CacheIndex).ToArray());
-            var (fullScore, _) = Forward(pixels);
+            var fullScore = score(pixels, boxes);
             var pixelArray = pixels.cpu().data<float>().ToArray();
 
             // (image, tag, full-image confidence, object blank, control blank) for every pair to score.
@@ -507,7 +531,7 @@ public sealed class LocalizationEvaluator(
             {
                 var image = chunk[i];
                 var content = new[] { boxes[i].X, boxes[i].Y, boxes[i].Width, boxes[i].Height };
-                foreach (var tag in image.Targets.Where(t => !image.NotVisible.Contains(t) && rowOf.ContainsKey(t)).Distinct())
+                foreach (var tag in image.Targets.Where(t => !image.NotVisible.Contains(t) && rowOf.TryGetValue(t, out var row) && eligible(row)).Distinct())
                 {
                     var instances = image.Instances.Where(x => x.Tag == tag).ToList();
                     if (!instances.Any(x => x.Kind != GoldKind.Ignore))
@@ -536,12 +560,13 @@ public sealed class LocalizationEvaluator(
                     Blank(variants.AsSpan((2 * k + 1) * floats, floats), batch[k].Control, inputSize);
                 }
 
-                var (score, _) = Forward(tensor(variants, [batch.Length * 2, 3, inputSize, inputSize]).to(device));
+                var variantBoxes = batch.SelectMany(p => new[] { boxes[p.Image], boxes[p.Image] }).ToArray();
+                var variantScore = score(tensor(variants, [batch.Length * 2, 3, inputSize, inputSize]).to(device), variantBoxes);
                 for (var k = 0; k < batch.Length; k++)
                 {
                     var (imageIndex, tag, full, _, _) = batch[k];
-                    var occluded = score(2 * k, rowOf[tag]);
-                    var control = score(2 * k + 1, rowOf[tag]);
+                    var occluded = variantScore(2 * k, rowOf[tag]);
+                    var control = variantScore(2 * k + 1, rowOf[tag]);
                     var image = chunk[imageIndex];
                     foreach (var key in new[] { image.Stratum, SizeBucket(tag, image.Instances.Where(x => x.Tag == tag).ToList()) })
                         (perStratum.TryGetValue(key, out var t) ? t : perStratum[key] = new()).Add(full, occluded, control);
@@ -767,7 +792,13 @@ public sealed class LocalizationEvaluator(
         return (tensor(pixels, [indices.Count, 3, inputSize, inputSize]).to(device), boxes);
     }
 
-    /// <summary>Spatial map plus a whole-image scorer (masked pooling, as training and inference pool).</summary>
+    /// <summary>
+    /// Rows the classifier scores per tag (<see cref="ClassificationPooling"/>), when the tower's
+    /// <see cref="ImageTower.ClassificationPoolingTemperature"/> is above 0; the rest use the averaged embedding.
+    /// </summary>
+    public IReadOnlyList<bool>? ClassificationPooledTags { get; init; }
+
+    /// <summary>Spatial map plus a whole-image scorer (pooled as training pools).</summary>
     private (Func<int, int, float> PooledScore, Tensor Spatial) Forward(Tensor pixels)
     {
         using var _ = no_grad();
@@ -775,8 +806,64 @@ public sealed class LocalizationEvaluator(
         var (spatial, localization) = imageTower.ForwardMaps(pixels);
         var spatialCpu = localization.cpu();
         var pooled = spatial.cpu().mean([2, 3]).data<float>().ToArray();
-        return ((image, tag) => Sigmoid(scaling.Apply(Dot(pooled.AsSpan(image * dim, dim), tagEmbeddings.AsSpan(tag * dim, dim)))), spatialCpu);
+        var temperature = imageTower.ClassificationPoolingTemperature;
+        if (temperature <= 0 || ClassificationPooledTags is not { } perTag)
+            return ((image, tag) => Sigmoid(scaling.Apply(Dot(pooled.AsSpan(image * dim, dim), tagEmbeddings.AsSpan(tag * dim, dim)))), spatialCpu);
+
+        // [B, D, cells], the whole canvas counted as content, as the averaged score here is, so a plain average per
+        // cell (masking with ones would copy the full map, which ran the A4000 out of memory on gold batches).
+        var cells = nn.functional.adaptive_avg_pool2d(spatial, [ClassificationPooling.Grid, ClassificationPooling.Grid]).flatten(2).cpu();
+        var cellCount = (int)cells.shape[2];
+        var cellValues = cells.data<float>().ToArray();
+        return ((image, tag) =>
+        {
+            var embedding = tagEmbeddings.AsSpan(tag * dim, dim);
+            if (!perTag[tag])
+                return Sigmoid(scaling.Apply(Dot(pooled.AsSpan(image * dim, dim), embedding)));
+            // T · (logsumexp over cells of cell·tag / T − log n), as ClassificationPooling.RawScores.
+            var dots = new double[cellCount];
+            var max = double.NegativeInfinity;
+            for (var c = 0; c < cellCount; c++)
+            {
+                double sum = 0;
+                for (var d = 0; d < dim; d++)
+                    sum += cellValues[((long)image * dim + d) * cellCount + c] * embedding[d];
+                dots[c] = sum / temperature;
+                max = Math.Max(max, dots[c]);
+            }
+            var total = dots.Sum(x => Math.Exp(x - max));
+            return Sigmoid(scaling.Apply((float)(temperature * (max + Math.Log(total) - Math.Log(cellCount)))));
+        }, spatialCpu);
     }
+
+    /// <summary>
+    /// A scorer reading tags off the localization map: per-location logits over the image's content, pooled by a
+    /// log-sum-exp at <paramref name="temperature"/> (as <see cref="SigmoidContrastiveLoss.ComputeLocalizedPairs"/>
+    /// pools them), then the learned scaling. The map stays on the device; each call scores one pair.
+    /// </summary>
+    private Func<int, int, float> MapScorer(Tensor pixels, LetterboxBox[] boxes, float temperature)
+    {
+        Tensor localization, valid;
+        using (no_grad())
+        {
+            localization = imageTower.ForwardMaps(pixels).Localization;
+            var (height, width) = (localization.shape[2], localization.shape[3]);
+            localization = localization.reshape([localization.shape[0], dim, height * width]);
+            valid = SpatialMask.Build(boxes, inputSize, height, width, device).reshape([localization.shape[0], height * width]).gt(0);
+        }
+
+        _deviceTags ??= tensor(tagEmbeddings, [tagEmbeddings.Length / dim, dim]).to(device).DetachFromDisposeScope();
+        return (image, tag) =>
+        {
+            using var scope = NewDisposeScope();
+            using var _ = no_grad();
+            var logits = (_deviceTags[tag].matmul(localization[image]) / temperature).masked_fill(valid[image].logical_not(), float.NegativeInfinity);
+            var pooled = temperature * (logits.logsumexp(0) - valid[image].sum().to_type(ScalarType.Float32).log());
+            return Sigmoid(scaling.Apply(pooled.item<float>()));
+        };
+    }
+
+    private Tensor? _deviceTags;
 
     private float[][][,] Heatmaps(IReadOnlyList<int> indices, int[][] tagsPerImage, out LetterboxBox[] boxes)
     {

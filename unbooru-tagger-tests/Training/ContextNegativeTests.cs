@@ -149,4 +149,20 @@ public class ContextNegativeTests
         Assert.Contains(1, sloppy.ImpliedBy[0]);
         Assert.DoesNotContain(0, sloppy.ContextSources[1]);
     }
+
+    [Fact]
+    public void Weights_WithAHardNegativeSourceWeight_TrainImagesWithASourceButNotTheTagAtFullStrength()
+    {
+        var statistics = Statistics();
+        Assert.Contains(2, statistics.HardNegativeSources[1]); // hair color: on 30 of 50 hat images, 10 without
+        var builder = new PairWeightBuilder(statistics, ExclusiveTagGroups.Empty, hardNegativeSourceWeight: 2f, contextNegativeTags: [false, true, false, false]);
+        using var targets = builder.Build([[2], [3], [1, 2]]);
+        var (labels, weights, focal) = (targets.Labels.data<float>().ToArray(), targets.Weights.data<float>().ToArray(), targets.FocalMask.data<float>().ToArray());
+        Assert.Equal((-1f, 2f, 0f), (labels[1], weights[1], focal[1]));         // hair color, no hat: full strength
+        Assert.Equal((-1f, 1f, 1f), (labels[4 + 1], weights[4 + 1], focal[4 + 1])); // unrelated image: still unverified
+        Assert.Equal((1f, 1f), (labels[8 + 1], weights[8 + 1]));                // a positive stays a positive
+
+        using var ineligible = new PairWeightBuilder(statistics, ExclusiveTagGroups.Empty, hardNegativeSourceWeight: 2f, contextNegativeTags: [false, false, false, false]).Build([[2]]);
+        Assert.Equal(1f, ineligible.FocalMask.data<float>().ToArray()[1]);
+    }
 }

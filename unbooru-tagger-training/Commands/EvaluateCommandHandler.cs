@@ -22,7 +22,7 @@ public static class EvaluateCommandHandler
     public static int Run(
         string checkpointDir, string cacheDir, double validationFraction, int maxImages, int batchSize,
         string? exclusiveTagsPath, string? outDir, int worstTagsToShow, string? embeddingsCachePath = null,
-        string? goldPath = null, int localizationSamples = 300)
+        string? goldPath = null, int localizationSamples = 300, float mapScoreTemperature = 0.25f, IReadOnlyList<string>? dumpTags = null)
     {
         var device = DeviceSelector.Best();
         using var cacheReader = new PreprocessedDatasetCacheReader(cacheDir);
@@ -69,6 +69,16 @@ public static class EvaluateCommandHandler
         var tagTower = TagTower.CreateFullyTrainable(
             Enumerable.Range(0, embeddings.RowCount).Select(i => embeddings.GetRow(i).ToArray()).ToArray(), config.EmbeddingDim, device);
         using var allTagIndices = tensor(Enumerable.Range(0, vocabulary.Records.Count).Select(i => (long)i).ToArray(), device: device);
+        // A classifier that pools localizable tags per tag (ClassificationPooling) is scored the same way.
+        var localizability = TagLocalizability.Load(Path.Combine(checkpointDir, TagLocalizability.FileName));
+        using var classificationPooledRows = tensor(
+            imageTower.ClassificationPoolingTemperature > 0
+                ? vocabulary.Records.Where(r => localizability.IsLocalizable(r.Tag)).Select(r => (long)r.RowIndex).Order().ToArray()
+                : [],
+            device: device);
+        if (imageTower.ClassificationPoolingTemperature > 0)
+            AnsiConsole.MarkupLineInterpolated(
+                $"Classification pooling: {classificationPooledRows.shape[0]:N0} localizable tags scored per tag at temperature {imageTower.ClassificationPoolingTemperature}.");
 
         EvaluationReport? report = null;
         RatingReport? ratingReport = null;
@@ -78,7 +88,9 @@ public static class EvaluateCommandHandler
             {
                 var batches = Math.Max(1, (int)Math.Ceiling(heldOut.Count / (double)batchSize));
                 var task = ctx.AddTask($"Embedding {heldOut.Count} held-out images", maxValue: batches);
-                var pooled = TryLoadEmbeddings(embeddingsCachePath, heldOut.Count * config.EmbeddingDim, checkpointDir);
+                // Per-tag scores aren't cached; only the pooled embeddings are.
+                var pooled = imageTower.ClassificationPoolingTemperature > 0 ? null : TryLoadEmbeddings(embeddingsCachePath, heldOut.Count * config.EmbeddingDim, checkpointDir);
+                float[]? scores = null;
                 if (pooled is not null)
                 {
                     task.Value = batches;
@@ -86,12 +98,12 @@ public static class EvaluateCommandHandler
                 }
                 else
                 {
-                    (var loss, pooled) = TrainCommandHandler.Evaluate(
+                    (var loss, pooled, scores) = TrainCommandHandler.Evaluate(
                         imageTower, tagTower, logitScaleBias,
                         indices => TrainCommandHandler.LoadCacheBatch(cacheReader, indices, cacheReader.InputSize),
                         imageTagRows, heldOut, allTagIndices, vocabulary.Records.Count, device, batchSize, cacheReader.InputSize,
                         onBatchComplete: done => task.Value = done,
-                        readWindow: ids => cacheReader.ReadEncoded(ids));
+                        readWindow: ids => cacheReader.ReadEncoded(ids), classificationPooledRows: classificationPooledRows);
                     AnsiConsole.MarkupLineInterpolated($"mean validation loss (old metric) {loss:G4}");
                     if (embeddingsCachePath is not null)
                         SaveEmbeddings(embeddingsCachePath, pooled);
@@ -101,8 +113,15 @@ public static class EvaluateCommandHandler
                 report = TrainCommandHandler.EvaluateRankings(
                     pooled, heldOut.Select(i => imageTagRows[i]).ToList(), tagTower, allTagIndices, logitScaleBias,
                     vocabulary, statistics, exclusiveGroups, device, seed,
-                    imageSites is not null ? heldOut.Select(i => imageSites[i]).ToArray() : null);
+                    imageSites is not null ? heldOut.Select(i => imageSites[i]).ToArray() : null, scores);
                 rankingTask.Value = 1;
+
+                if (dumpTags is { Count: > 0 })
+                {
+                    using var logits = TrainCommandHandler.HeldOutLogits(pooled, scores, heldOut.Count, tagTower, allTagIndices, logitScaleBias);
+                    DumpScores(Path.Combine(outDir ?? checkpointDir, ScoresFileName), dumpTags, logits, vocabulary, heldOut, imageTagRows, report.Tags,
+                        imageSites is not null ? heldOut.Select(i => imageSites[i]).ToArray() : null);
+                }
 
                 if (ratingRows is not null && ratings is not null)
                     ratingReport = TrainCommandHandler.EvaluateRatings(
@@ -120,9 +139,12 @@ public static class EvaluateCommandHandler
             var tagEmbeddingArray = Enumerable.Range(0, embeddings.RowCount).SelectMany(i => embeddings.GetRow(i).ToArray()).ToArray();
             var evaluator = new LocalizationEvaluator(
                 imageTower, tagEmbeddingArray, config.EmbeddingDim, logitScaleBias.ToLogitScaling(),
-                ids => cacheReader.ReadEncoded(ids), cacheReader.InputSize, device);
+                ids => cacheReader.ReadEncoded(ids), cacheReader.InputSize, device)
+            {
+                MapScoreTemperature = mapScoreTemperature > 0 ? mapScoreTemperature : null,
+                ClassificationPooledTags = vocabulary.Records.OrderBy(r => r.RowIndex).Select(r => localizability.IsLocalizable(r.Tag)).ToArray(),
+            };
             var gold = goldPath is not null ? LocalizationEvaluator.LoadGold(goldPath) : null;
-            var localizability = TagLocalizability.Load(Path.Combine(checkpointDir, TagLocalizability.FileName));
             localization = evaluator.Evaluate(vocabulary, imageTagRows, heldOut, gold, localizability, Math.Max(localizationSamples, 1), seed);
             WriteLocalizationReport(outputDirectory, localization);
         }
@@ -149,6 +171,8 @@ public static class EvaluateCommandHandler
                 AnsiConsole.MarkupLine(DescribeTeacher(t));
             foreach (var o in localization.Occlusion ?? [])
                 AnsiConsole.MarkupLine(DescribeOcclusion(o));
+            foreach (var o in localization.MapOcclusion ?? [])
+                AnsiConsole.MarkupLine(DescribeOcclusion(o with { Name = $"scored from the map, {o.Name}" }));
         }
         if (report!.ContextReliance is { } context)
         {
@@ -194,6 +218,45 @@ public static class EvaluateCommandHandler
         var values = new float[expectedLength];
         Buffer.BlockCopy(bytes, 0, values, 0, bytes.Length);
         return values;
+    }
+
+    internal const string ScoresFileName = "scores.jsonl";
+
+    /// <summary>
+    /// One JSON line per held-out image: its cache row, sites, tags, and the probability of each of
+    /// <paramref name="tags"/>, with each tag's calibrated threshold in a first header line. For
+    /// looking at one tag's false positives and misses directly.
+    /// </summary>
+    private static void DumpScores(
+        string path, IReadOnlyList<string> tags, ImageTagLogits logits,
+        TagVocabulary vocabulary, IReadOnlyList<int> heldOut, IReadOnlyList<IReadOnlyList<int>> imageTagRows,
+        IReadOnlyList<TagEvaluation> evaluated, IReadOnlyList<BooruSites>? sites)
+    {
+        var rows = new List<(string Tag, int Row)>();
+        foreach (var tag in tags)
+            if (vocabulary.TryGet(tag, out var record))
+                rows.Add((tag, record.RowIndex));
+            else
+                AnsiConsole.MarkupLineInterpolated($"[yellow]--dump-scores: '{tag}' isn't in the vocabulary.[/]");
+
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        using var writer = new StreamWriter(path);
+        var thresholds = rows.ToDictionary(r => r.Tag, r => (double?)evaluated.FirstOrDefault(e => e.Tag == r.Tag)?.Threshold);
+        writer.WriteLine(System.Text.Json.JsonSerializer.Serialize(new { thresholds }));
+        for (var i = 0; i < heldOut.Count; i++)
+        {
+            var scores = new Dictionary<string, float>();
+            foreach (var (tag, row) in rows)
+                scores[tag] = logits.Probability(i, row);
+            writer.WriteLine(System.Text.Json.JsonSerializer.Serialize(new
+            {
+                cacheIndex = heldOut[i],
+                sites = sites?[i].ToString(),
+                tags = imageTagRows[heldOut[i]].Select(r => vocabulary.GetByRowIndex(r).Tag),
+                scores,
+            }));
+        }
+        AnsiConsole.MarkupLineInterpolated($"Wrote {heldOut.Count:N0} images' scores for {rows.Count} tag(s) to '{path}'.");
     }
 
     private static void SaveEmbeddings(string path, float[] values)

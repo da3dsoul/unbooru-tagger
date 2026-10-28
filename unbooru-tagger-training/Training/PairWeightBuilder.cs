@@ -9,15 +9,17 @@ namespace UnbooruTagger.Training.Training;
 /// <param name="Weights">How much the pair counts: 0 drops it from the loss entirely.</param>
 /// <param name="FocalMask">1 for an unverified negative (damped by the asymmetric focal term), 0 for a positive or a certain negative (plain full-strength BCE).</param>
 /// <param name="PositiveWeightSum">Sum of <paramref name="Weights"/> over positive pairs — the loss normalizer.</param>
-public sealed record PairTargets(Tensor Labels, Tensor Weights, Tensor FocalMask, float PositiveWeightSum) : IDisposable
+/// <param name="LogitOffsets">Optional: added to the whole-image logits in the loss only (<see cref="ContextPrior"/>).</param>
+public sealed record PairTargets(Tensor Labels, Tensor Weights, Tensor FocalMask, float PositiveWeightSum, Tensor? LogitOffsets = null) : IDisposable
 {
-    public PairTargets To(Device device) => new(Labels.to(device), Weights.to(device), FocalMask.to(device), PositiveWeightSum);
+    public PairTargets To(Device device) => new(Labels.to(device), Weights.to(device), FocalMask.to(device), PositiveWeightSum, LogitOffsets?.to(device));
 
     public void Dispose()
     {
         Labels.Dispose();
         Weights.Dispose();
         FocalMask.Dispose();
+        LogitOffsets?.Dispose();
     }
 }
 
@@ -34,6 +36,14 @@ public sealed record PairTargets(Tensor Labels, Tensor Weights, Tensor FocalMask
 /// focal-damped — a confident "no" here costs nothing, an uncertain one only a little.</item>
 /// <item><b>Anchor hard negative</b>: the image was sampled as a hard negative for this tag
 /// (<see cref="TagCentricBatchSampler"/>). Full-strength, <c>certainNegativeWeight</c>.</item>
+/// <item><b>Hard-negative source</b> (only with <c>hardNegativeSourceWeight</c> &gt; 0): the image
+/// carries one of the tag's <see cref="TagStatistics.HardNegativeSources"/> (a tag that often comes
+/// with it, whose images the crawler found often lack it) but not the tag. The same evidence that
+/// makes a sampled anchor hard negative certain, applied to every pair in the batch instead of
+/// only the anchor's: unverified negatives are focal-damped, so a wrong "yes" at p = 0.6 is pushed
+/// down about 12x less than a missed "yes" is pushed up, and the tags near a plausible one
+/// (gloves on an outfit that often has them) were barely corrected. Full-strength, at this weight;
+/// only for <c>contextNegativeTags</c>, for the same reason as context negatives.</item>
 /// <item><b>Likely missing</b>: the tag is usually implied by one the image does carry
 /// (<see cref="TagStatistics.ImpliedBy"/>). Weight 0 — don't punish the model for
 /// predicting a tag the tagger probably forgot.</item>
@@ -60,6 +70,7 @@ public sealed record PairTargets(Tensor Labels, Tensor Weights, Tensor FocalMask
 /// Weight 0 — there's nothing to learn, and its row would otherwise only ever be pushed
 /// down.</item>
 /// </list>
+/// With a <c>contextPrior</c>, the targets also carry its per-pair logit offsets.
 /// </summary>
 public sealed class PairWeightBuilder(
     TagStatistics statistics,
@@ -67,7 +78,9 @@ public sealed class PairWeightBuilder(
     float certainNegativeWeight = 1f,
     IReadOnlyList<int>? exhaustiveRows = null,
     float contextNegativeWeight = 0f,
-    IReadOnlyList<bool>? contextNegativeTags = null)
+    IReadOnlyList<bool>? contextNegativeTags = null,
+    ContextPrior? contextPrior = null,
+    float hardNegativeSourceWeight = 0f)
 {
     public int VocabularySize => statistics.VocabularySize;
 
@@ -78,6 +91,19 @@ public sealed class PairWeightBuilder(
 
     /// <summary>For a source tag s, the tags it is a context source for (the inverse of <see cref="TagStatistics.ContextSources"/>).</summary>
     private readonly int[][] _contextTargets = contextNegativeWeight > 0 ? InvertContextSources(statistics, contextNegativeTags) : [];
+
+    /// <summary>For a tag s, the tags it is a hard-negative source for (the inverse of <see cref="TagStatistics.HardNegativeSources"/>).</summary>
+    private readonly int[][] _hardNegativeTargets = hardNegativeSourceWeight > 0 ? Invert(statistics.HardNegativeSources, statistics.VocabularySize, contextNegativeTags) : [];
+
+    private static int[][] Invert(int[][] sources, int vocabularySize, IReadOnlyList<bool>? eligible)
+    {
+        var targets = Enumerable.Range(0, vocabularySize).Select(_ => new List<int>()).ToArray();
+        for (var t = 0; t < sources.Length; t++)
+            if (eligible is null || (t < eligible.Count && eligible[t]))
+                foreach (var s in sources[t])
+                targets[s].Add(t);
+        return targets.Select(l => l.ToArray()).ToArray();
+    }
 
     private static int[][] InvertContextSources(TagStatistics statistics, IReadOnlyList<bool>? eligible)
     {
@@ -111,6 +137,15 @@ public sealed class PairWeightBuilder(
 
             if (sampled is not null && sampled[i].IsHardNegative)
                 SetCertainNegative(offset + sampled[i].AnchorTag);
+
+            if (_hardNegativeTargets.Length > 0)
+                foreach (var s in tags)
+                    if ((uint)s < (uint)vocabularySize)
+                        foreach (var t in _hardNegativeTargets[s])
+                        {
+                            weights[offset + t] = Math.Max(weights[offset + t], hardNegativeSourceWeight);
+                            focal[offset + t] = 0f;
+                        }
 
             foreach (var s in tags)
             {
@@ -170,7 +205,15 @@ public sealed class PairWeightBuilder(
         }
 
         var shape = new long[] { imageTagRows.Count, vocabularySize };
-        return new PairTargets(tensor(labels, shape), tensor(weights, shape), tensor(focal, shape), positiveWeightSum);
+        Tensor? offsets = null;
+        if (contextPrior is not null)
+        {
+            var values = new float[count];
+            for (var i = 0; i < imageTagRows.Count; i++)
+                contextPrior.Fill(imageTagRows[i], values.AsSpan(i * vocabularySize, vocabularySize));
+            offsets = tensor(values, shape);
+        }
+        return new PairTargets(tensor(labels, shape), tensor(weights, shape), tensor(focal, shape), positiveWeightSum, offsets);
 
         void SetCertainNegative(int index)
         {

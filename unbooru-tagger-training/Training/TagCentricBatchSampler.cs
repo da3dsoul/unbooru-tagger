@@ -60,16 +60,40 @@ public sealed class TagCentricBatchSampler
 
     public int AnchorTagCount => _anchorTags.Length;
 
+    /// <summary>
+    /// Tags to draw <see cref="FocusShare"/> of the anchors from (<see cref="FocusTags"/>), each with
+    /// as many context negatives as positives. Replaced after each epoch evaluation; tags with no
+    /// training image are skipped.
+    /// </summary>
+    public int[] Focus
+    {
+        get => _focus;
+        set => _focus = value.Where(t => (uint)t < (uint)_statistics.VocabularySize && _statistics.Positives[t].Length > 0).ToArray();
+    }
+
+    private int[] _focus = [];
+
+    /// <summary>Fraction of anchors drawn from <see cref="Focus"/> (0 = uniform over every tag).</summary>
+    public double FocusShare { get; init; }
+
     public SampledImage[] SampleBatch(int batchSize)
     {
         var batch = new List<SampledImage>(batchSize);
+        var focus = _focus;
         while (batch.Count < batchSize)
         {
-            var anchor = _anchorTags[_random.Next(_anchorTags.Length)];
+            var focused = focus.Length > 0 && _random.NextDouble() < FocusShare;
+            var anchor = focused ? focus[_random.Next(focus.Length)] : _anchorTags[_random.Next(_anchorTags.Length)];
             var positives = _statistics.Positives[anchor];
 
             for (var i = 0; i < _positivesPerAnchor && batch.Count < batchSize; i++)
                 batch.Add(new SampledImage(positives[_random.Next(positives.Length)], anchor, IsHardNegative: false));
+
+            // A focus anchor's context negatives come right after its positives, before the hard negatives.
+            var contextNegatives = focused ? Math.Max(_contextNegativesPerAnchor, _positivesPerAnchor) : 0;
+            for (var i = 0; i < contextNegatives && batch.Count < batchSize; i++)
+                if (_statistics.SampleContextNegative(anchor, _random) is int image)
+                    batch.Add(new SampledImage(image, anchor, IsHardNegative: false, IsContextNegative: true));
 
             for (var i = 0; i < _hardNegativesPerAnchor && batch.Count < batchSize; i++)
             {
@@ -80,7 +104,7 @@ public sealed class TagCentricBatchSampler
             }
 
             // Only tags that have context sources get these (most tags have none).
-            for (var i = 0; i < _contextNegativesPerAnchor && batch.Count < batchSize; i++)
+            for (var i = 0; !focused && i < _contextNegativesPerAnchor && batch.Count < batchSize; i++)
                 if (_statistics.SampleContextNegative(anchor, _random) is int image)
                     batch.Add(new SampledImage(image, anchor, IsHardNegative: false, IsContextNegative: true));
         }

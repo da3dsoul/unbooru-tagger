@@ -68,6 +68,16 @@ public static class ContextRelianceEvaluator
         TagVocabulary vocabulary, TagStatistics trainingStatistics, float[] thresholds, Device device,
         int minPerSide = 10, int samplesPerSource = 512, int seed = 0, IReadOnlyList<BooruSites>? imageSites = null)
     {
+        using var logits = ImageTagLogits.Linear(pooled, tagEmbeddings, dim, scaling);
+        return Evaluate(logits, imageTags, vocabulary, trainingStatistics, thresholds, device, minPerSide, samplesPerSource, seed, imageSites);
+    }
+
+    /// <param name="logits">Every held-out image's logits for every tag (<see cref="ImageTagLogits"/>).</param>
+    public static ContextRelianceReport Evaluate(
+        ImageTagLogits logits, IReadOnlyList<IReadOnlyList<int>> imageTags,
+        TagVocabulary vocabulary, TagStatistics trainingStatistics, float[] thresholds, Device device,
+        int minPerSide = 10, int samplesPerSource = 512, int seed = 0, IReadOnlyList<BooruSites>? imageSites = null)
+    {
         var imageCount = imageTags.Count;
         var vocabularySize = trainingStatistics.VocabularySize;
         var isSource = new bool[vocabularySize];
@@ -88,22 +98,17 @@ public static class ContextRelianceEvaluator
         // [tag][band] counts: positives, positives reported, negatives, negatives reported.
         var counts = new int[vocabularySize][];
         using (no_grad())
-        using (var images = tensor(pooled, [imageCount, dim]).to(device))
         {
             var block = Math.Max(1, 32_000_000 / Math.Max(1, imageCount));
             for (var start = 0; start < measured.Count; start += block)
             {
                 using var scope = NewDisposeScope();
                 var tags = measured.Skip(start).Take(block).ToArray();
-                var rows = new float[tags.Length * dim];
                 var cut = new float[tags.Length];
                 for (var j = 0; j < tags.Length; j++)
-                {
-                    Array.Copy(tagEmbeddings, tags[j] * dim, rows, j * dim, dim);
                     cut[j] = thresholds[tags[j]];
-                }
 
-                var probabilities = (images.matmul(tensor(rows, [tags.Length, dim]).to(device).t()) * scaling.Scale + scaling.Bias).sigmoid();
+                var probabilities = logits.Columns(tags, device).sigmoid();
                 var reported = (probabilities >= tensor(cut).to(device)).cpu().data<bool>().ToArray();
                 Parallel.For(0, tags.Length, j =>
                 {
@@ -193,7 +198,7 @@ public static class ContextRelianceEvaluator
             var images = trainingStatistics.Positives[s];
             if (images.Length == 0)
                 return;
-            var random = new Random(HashCode.Combine(seed, s));
+            var random = new Random(DeterministicSeed.For(seed, s));
             var sample = images.Length <= samplesPerSource ? images : images.OrderBy(_ => random.Next()).Take(samplesPerSource).ToArray();
             var tally = new Dictionary<int, int>();
             foreach (var image in sample)

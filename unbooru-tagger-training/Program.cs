@@ -93,6 +93,11 @@ var contextNegativeWeightOption = new Option<float>("--context-negative-weight")
     Description = "Deliberate targets: train context negatives (an image with a tag that usually comes with tag t, but without t) as full-strength negatives with this weight, instead of focal-damped unverified ones. Applies to every such pair in a batch, not just sampled ones, for localizable tags only (whole-image tags like 1girl are often just untagged). 0 = unverified (the original behavior).",
     DefaultValueFactory = _ => 0f
 };
+var contextPriorWeightOption = new Option<float>("--context-prior-weight")
+{
+    Description = "Deliberate targets: context-prior debiasing. During training only, add this times logit(prior) - logit(base rate) to localizable general tags' whole-image logits, where the prior is the highest P(tag | character/artist/series) over the image's own tags. Context then explains what it can, and the image tower learns the tag from the object. 0 = off.",
+    DefaultValueFactory = _ => 0f
+};
 var exclusiveTagsOption = new Option<string?>("--exclusive-tags")
 {
     Description = "File of mutually exclusive tag groups (one comma-separated group per line, e.g. 'solo, multiple_girls'). Omit to reuse the checkpoint's saved copy, or the built-in people-count/rating groups."
@@ -156,6 +161,47 @@ var mosaicWeightOption = new Option<float>("--mosaic-weight")
 {
     Description = "Mosaic loss weight, relative to --localization-weight.",
     DefaultValueFactory = _ => 1f
+};
+var mosaicClassificationWeightOption = new Option<float>("--mosaic-classification-weight")
+{
+    Description = "Also classify each mosaic tile: the canvas's full feature map pooled over the tile, trained on that image's own tags. The canvas's deeper layers see the other tiles, so a tile is right only if it answers from its own pixels. Weight relative to the whole-image tag loss; 0 = mosaics train localization only.",
+    DefaultValueFactory = _ => 0f
+};
+var mosaicFullSizeOption = new Option<bool>("--mosaic-full-size")
+{
+    Description = "Mosaic tiles at the input size on a canvas twice as wide, instead of shrunk 2x (about 4x a mosaic's cost; small objects stay their real size)."
+};
+var focusShareOption = new Option<double>("--focus-share")
+{
+    Description = "Fraction of batch anchors drawn from tags the latest epoch evaluation found answered from context instead of the object (context gaps >= 20 pts, or still called with the object blanked >= 90%), each with as many context negatives as positives and grouped on one mosaic. Re-picked after every epoch evaluation; needs tag-centric sampling. 0 = off.",
+    DefaultValueFactory = _ => 0
+};
+var hardNegativeSourceWeightOption = new Option<float>("--hard-negative-source-weight")
+{
+    Description = "Deliberate targets: train every (image, tag) pair where the image carries one of the tag's hard-negative sources (a tag that often comes with it, whose images often lack it) but not the tag as a full-strength negative with this weight, not only the anchors' sampled hard negatives. Unverified negatives are focal-damped, so a wrong \"yes\" there is nearly free. Localizable tags only; 0 = off.",
+    DefaultValueFactory = _ => 0f
+};
+var classificationPoolingOption = new Option<float?>("--classification-pooling-temperature")
+{
+    Description = "Score localizable tags by a log-sum-exp over a 16x16 grid of the full map's cells at this temperature (dot-product units, like --localization-temperature), instead of the dot product with the averaged embedding, so one clear region can carry a small object's score. Saved in model_config.json and used by evaluate; 0 = averaged; omitted keeps the checkpoint's setting. Not exported to ONNX yet."
+};
+var classificationPoolingStartOption = new Option<float?>("--classification-pooling-start-temperature")
+{
+    Description = "With --classification-pooling-anneal-steps, anneal the pooling temperature log-linearly from this down to --classification-pooling-temperature, from the step pooling was turned on. A high temperature is the averaged embedding, so a run switched to pooling starts where it was. Saved in model_config.json; a resume continues it."
+};
+var classificationPoolingAnnealOption = new Option<int>("--classification-pooling-anneal-steps")
+{
+    Description = "Global steps to anneal the pooling temperature over (see --classification-pooling-start-temperature).",
+    DefaultValueFactory = _ => 0
+};
+var bf16Option = new Option<bool>("--bf16")
+{
+    Description = "Run the image tower in bfloat16: weights, gradients, the optimizer and checkpoints stay fp32 (ImageTower.ComputeType). Not saved with the checkpoint: pass it on every resume.",
+};
+var classificationPoolingMinedOption = new Option<int>("--classification-pooling-mined-negatives")
+{
+    Description = "Per image, the highest-scoring negatives trained on their pooled score each step, besides positives and full-strength negatives; the rest train on the averaged score.",
+    DefaultValueFactory = _ => 64
 };
 var trainGoldOption = new Option<string?>("--gold")
 {
@@ -243,6 +289,7 @@ trainCommand.Options.Add(impliedThresholdOption);
 trainCommand.Options.Add(missingThresholdOption);
 trainCommand.Options.Add(contextNegativesPerAnchorOption);
 trainCommand.Options.Add(contextNegativeWeightOption);
+trainCommand.Options.Add(contextPriorWeightOption);
 trainCommand.Options.Add(exclusiveTagsOption);
 trainCommand.Options.Add(validationMaxImagesOption);
 trainCommand.Options.Add(ioParallelismOption);
@@ -268,6 +315,15 @@ trainCommand.Options.Add(cropTeacherMinApOption);
 trainCommand.Options.Add(cropTeacherConfidenceOption);
 trainCommand.Options.Add(mosaicsPerStepOption);
 trainCommand.Options.Add(mosaicWeightOption);
+trainCommand.Options.Add(mosaicClassificationWeightOption);
+trainCommand.Options.Add(mosaicFullSizeOption);
+trainCommand.Options.Add(focusShareOption);
+trainCommand.Options.Add(hardNegativeSourceWeightOption);
+trainCommand.Options.Add(classificationPoolingOption);
+trainCommand.Options.Add(classificationPoolingStartOption);
+trainCommand.Options.Add(classificationPoolingAnnealOption);
+trainCommand.Options.Add(classificationPoolingMinedOption);
+trainCommand.Options.Add(bf16Option);
 trainCommand.Options.Add(cropTeacherMinPositivesOption);
 trainCommand.Options.Add(localizationMapOption);
 trainCommand.Options.Add(localizableTagsOption);
@@ -303,6 +359,7 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         MissingThreshold: parseResult.GetRequiredValue(missingThresholdOption),
         ContextNegativesPerAnchor: parseResult.GetRequiredValue(contextNegativesPerAnchorOption),
         ContextNegativeWeight: parseResult.GetRequiredValue(contextNegativeWeightOption),
+        ContextPriorWeight: parseResult.GetRequiredValue(contextPriorWeightOption),
         ExclusiveTagsPath: parseResult.GetValue(exclusiveTagsOption),
         ValidationMaxImages: parseResult.GetRequiredValue(validationMaxImagesOption),
         Ratings: !parseResult.GetValue(noRatingsOption),
@@ -317,6 +374,15 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         CropTeacherMinPositives: parseResult.GetRequiredValue(cropTeacherMinPositivesOption),
         MosaicsPerStep: parseResult.GetRequiredValue(mosaicsPerStepOption),
         MosaicWeight: parseResult.GetRequiredValue(mosaicWeightOption),
+        MosaicClassificationWeight: parseResult.GetRequiredValue(mosaicClassificationWeightOption),
+        MosaicFullSizeTiles: parseResult.GetValue(mosaicFullSizeOption),
+        FocusShare: parseResult.GetRequiredValue(focusShareOption),
+        HardNegativeSourceWeight: parseResult.GetRequiredValue(hardNegativeSourceWeightOption),
+        ClassificationPoolingTemperature: parseResult.GetValue(classificationPoolingOption),
+        ClassificationPoolingStartTemperature: parseResult.GetValue(classificationPoolingStartOption),
+        ClassificationPoolingAnnealSteps: parseResult.GetValue(classificationPoolingAnnealOption),
+        ClassificationPoolingMinedNegatives: parseResult.GetValue(classificationPoolingMinedOption),
+        Bf16Compute: parseResult.GetValue(bf16Option),
         LocalizationFromFusedOnly: parseResult.GetValue(localizationMapOption) switch { "fused" or "local" => true, "full" => false, _ => null },
         LocalizationSkippedLaterals: parseResult.GetValue(localizationMapOption) switch { "local" => 1, "fused" or "full" => 0, _ => null },
         LocalizableTagsPath: parseResult.GetValue(localizableTagsOption),
@@ -412,6 +478,11 @@ var localizationSamplesOption = new Option<int>("--localization-samples")
     Description = "Held-out images used for the label-free localization checks (deletion, crop consistency, two-character, solo counts). 0 skips them.",
     DefaultValueFactory = _ => 300
 };
+var mapScoreTemperatureOption = new Option<float>("--map-score-temperature")
+{
+    Description = "With --gold: also run the occlusion check with localizable tags scored from the localization map, pooled by a log-sum-exp at this temperature (match training's --localization-temperature). 0 skips it.",
+    DefaultValueFactory = _ => 0.25f
+};
 var worstTagsOption = new Option<int>("--show") { Description = "How many worst tags to list", DefaultValueFactory = _ => 25 };
 
 var evaluateCommand = new Command("evaluate", "Measure a checkpoint's held-out per-tag ranking quality (AP vs. each tag's hard negatives, image-level precision/recall) and calibrate per-tag thresholds");
@@ -426,6 +497,14 @@ evaluateCommand.Options.Add(worstTagsOption);
 evaluateCommand.Options.Add(embeddingsCacheOption);
 evaluateCommand.Options.Add(goldOption);
 evaluateCommand.Options.Add(localizationSamplesOption);
+evaluateCommand.Options.Add(mapScoreTemperatureOption);
+var dumpScoresOption = new Option<string[]>("--dump-scores")
+{
+    Description = "Also write scores.jsonl: every held-out image's tags and its probability for each of these tags (comma-separated or repeated), to look at one tag's false positives and misses",
+    DefaultValueFactory = _ => [],
+    AllowMultipleArgumentsPerToken = true
+};
+evaluateCommand.Options.Add(dumpScoresOption);
 evaluateCommand.SetAction(parseResult => EvaluateCommandHandler.Run(
     parseResult.GetRequiredValue(checkpointDirOption),
     parseResult.GetRequiredValue(evaluateCacheDirOption),
@@ -437,7 +516,9 @@ evaluateCommand.SetAction(parseResult => EvaluateCommandHandler.Run(
     parseResult.GetRequiredValue(worstTagsOption),
     parseResult.GetValue(embeddingsCacheOption),
     parseResult.GetValue(goldOption),
-    parseResult.GetRequiredValue(localizationSamplesOption)));
+    parseResult.GetRequiredValue(localizationSamplesOption),
+    parseResult.GetRequiredValue(mapScoreTemperatureOption),
+    parseResult.GetValue(dumpScoresOption)?.SelectMany(v => v.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).ToList()));
 
 var chartsEpochsOption = new Option<int>("--epochs") { Description = "The run's --epochs, for the step axis and epoch markers", DefaultValueFactory = _ => 6 };
 var chartsReferenceOption = new Option<string[]>("--reference")
@@ -470,9 +551,38 @@ chartsCommand.SetAction(parseResult => ChartsCommandHandler.Run(
     parseResult.GetRequiredValue(chartsWidthOption),
     parseResult.GetRequiredValue(chartsHeightOption)));
 
+var benchmarkBatchOption = new Option<int>("--batch-size") { DefaultValueFactory = _ => 12 };
+var benchmarkInputOption = new Option<int>("--input-size") { DefaultValueFactory = _ => 512 };
+var benchmarkIterationsOption = new Option<int>("--iterations") { DefaultValueFactory = _ => 30 };
+var benchmarkLayoutsOption = new Option<string[]>("--layouts")
+{
+    Description = "Memory layouts to time: nchw, nhwc-input (channels-last input), nhwc-all (input and conv weights), bf16 (whole tower in bfloat16), bf16-mixed (fp32 weights, bfloat16 compute: train --bf16).",
+    DefaultValueFactory = _ => ["nchw", "nhwc-input", "nhwc-all"],
+    AllowMultipleArgumentsPerToken = true,
+    CustomParser = r => r.Tokens.SelectMany(t => t.Value.Split(',', StringSplitOptions.RemoveEmptyEntries)).ToArray()
+};
+var benchmarkTowerCommand = new Command("benchmark-tower", "Time run 4's image tower forward+backward on random input per memory layout (for tuning the training step).");
+benchmarkTowerCommand.Options.Add(benchmarkBatchOption);
+benchmarkTowerCommand.Options.Add(benchmarkInputOption);
+benchmarkTowerCommand.Options.Add(benchmarkIterationsOption);
+benchmarkTowerCommand.Options.Add(benchmarkLayoutsOption);
+var benchmarkComponentsOption = new Option<bool>("--components") { Description = "Time each op of one block per stage instead of the whole tower." };
+benchmarkTowerCommand.Options.Add(benchmarkComponentsOption);
+benchmarkTowerCommand.SetAction(parseResult => parseResult.GetValue(benchmarkComponentsOption)
+    ? BenchmarkTowerCommandHandler.RunComponents(
+        parseResult.GetRequiredValue(benchmarkBatchOption),
+        parseResult.GetRequiredValue(benchmarkInputOption),
+        parseResult.GetRequiredValue(benchmarkIterationsOption))
+    : BenchmarkTowerCommandHandler.Run(
+        parseResult.GetRequiredValue(benchmarkBatchOption),
+        parseResult.GetRequiredValue(benchmarkInputOption),
+        parseResult.GetRequiredValue(benchmarkIterationsOption),
+        parseResult.GetRequiredValue(benchmarkLayoutsOption)));
+
 var rootCommand = new RootCommand("unbooru-tagger training CLI")
 {
     trainCommand,
+    benchmarkTowerCommand,
     addTagCommand,
     exportOnnxCommand,
     evaluateCommand,
