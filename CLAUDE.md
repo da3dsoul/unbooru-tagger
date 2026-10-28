@@ -307,6 +307,43 @@ built the corpus around:
   `EvaluationReport.ExclusiveViolations` (which exclusive pairs fire together, and which side is
   true). That breakdown showed `solo, no_humans` was a wrong default rule (a lone creature or
   robot is tagged both), so `ExclusiveTagGroups.DefaultText` no longer has it.
+- **Context-shortcut experiments (run 4, all off by default, none adopted).** Following the
+  user's diagnosis that the remaining problem is *classifying* tags like gloves, not localizing
+  them, each was A/B tested from run 4 at step 271,754 for 6,000 steps (control: mAP 0.572,
+  still called with the object blanked 87%):
+  - `--negative-gamma 2` (was 4) **was adopted** from ~275K: mAP 0.577, image precision
+    19.7% → 22.8%, still called 87% → 74%, exclusive violations 8.3% → 12%. Cross-site checks
+    put forgotten labels for gloves/hat/earrings at ~3% (~1% of their negatives), so a strong
+    focal damping protected few true positives.
+  - Context prior (`ContextPrior`, `--context-prior-weight`): a product of experts with
+    P(tag | character/artist/series). It closed the gaps only by suppressing calls; mAP -2 to -4.
+  - Focus anchors, tile classification, full-size mosaics (`FocusTags`, `--focus-share`,
+    `--mosaic-classification-weight`, `--mosaic-full-size`): small gains; full size cost 1.4 pts.
+  - Per-tag classification pooling (`ClassificationPooling`, `--classification-pooling-*`): a
+    log-sum-exp over a 16x16 cell grid instead of the average, annealed from temperature 8 to
+    0.25. Still-called 52% vs run 4's 72%, but mAP 0.567 vs 0.586 at 290K and gloves AP no better
+    (0.349 vs 0.367). The evaluator's pooled path was checked (temperature 1000 equals the
+    average), so the loss came from training. The ONNX exporter refuses pooled checkpoints.
+
+  Run 4 on its own kept improving occlusion (still called 79% at 280K → 56% at 310K) while mAP
+  rose. Gloves AP stayed ~0.35 in every arm.
+- **TorchSharp memory and determinism.** TorchSharp frees a tensor when its dispose scope
+  ends, not when it goes out of use, so `ConvNeXtBlock.forward` and the tower's forwards open
+  their own scopes; before that, a forward held every intermediate until the caller's scope ended
+  (gold scoring 13.2 GB on the A4000, now 4.9). Seeds used to come from `HashCode.Combine`, which
+  .NET randomizes per process, so evaluating one checkpoint twice gave different numbers;
+  `DeterministicSeed` (SplitMix64) replaces it. `manual_seed` doesn't seed the XPU generator.
+- **Faster step and bf16 (run 4).** Profiling (`UNBOORU_PROFILE_STEPS`, `benchmark-tower`) put
+  88% of a step in the tower's forward and backward, limited by memory bandwidth:
+  elementwise ops run at about a fifth of the B70's bandwidth, and the matrix multiplies use
+  a small fraction of its compute. That is why int8 wouldn't help. `ImageTower.ForwardPooled`
+  pools the full map without building it (each fused level times the mask sum-pooled to its
+  grid; exact for 2x nearest upsampling), about 2%. Running mosaic canvases in the batch's own
+  forward was slower on the B70, so they keep a second pass. Channels-last made no difference.
+  `--bf16` (`ImageTower.ComputeType`, `MixedPrecision`) runs the tower in bfloat16 from fp32
+  weights cast per call, with fp32 outputs, gradients and checkpoints: 223 → 199 ms/step, and a
+  6,000-step A/B kept mAP (0.576 vs 0.575) and gold pointing (32.3% vs 32.6%). Run 4 uses it from
+  step 359,388. It isn't saved in the checkpoint.
 
 ## Localization — implemented: heatmap, and (beyond the original scope) approximate boxes
 - **Heatmap** (`TagScorer.Heatmap`; `unbooru-tagger-inference heatmap`

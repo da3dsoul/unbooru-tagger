@@ -654,6 +654,26 @@ untagged.
   evaluation; every epoch's reports are archived in `history/epoch-N/`.
 - `--max-steps N` stops after N steps and saves (for short comparison runs).
 
+**Experiments against the context shortcut (off by default, not adopted).** Each
+was A/B tested from a run 4 checkpoint over 6,000-20,000 steps; the numbers are in
+`CLAUDE.md`.
+- `--context-prior-weight`: during training, adds this times logit(P(tag |
+  character/artist/series)) - logit(base rate) to localizable tags' logits, so
+  context explains what it can. It closed the context gaps only by suppressing
+  calls, and cost 2-4 pts of mAP.
+- `--focus-share`: a fraction of each batch's anchors drawn from tags the last
+  evaluation found answered from context, with as many context negatives as
+  positives. Small gains.
+- `--mosaic-classification-weight`, `--mosaic-full-size`: also classify each
+  mosaic tile from its own region of the canvas; full-size tiles instead of
+  half-size ones. Small gains; full size cost 1.4 pts of mAP.
+- `--classification-pooling-temperature` (with `--classification-pooling-start-temperature`,
+  `--classification-pooling-anneal-steps` and `--classification-pooling-mined-negatives`):
+  scores localizable tags by a log-sum-exp over a 16x16 grid of the map's cells
+  instead of the averaged embedding. Fewer tags called with the object blanked,
+  but lower mAP and no better on object tags such as gloves. Saved in
+  `model_config.json`; `export-onnx` refuses a checkpoint that uses it.
+
 **Status panel.** In a terminal, `train` shows a full-width panel: phase,
 epoch and whole-run progress with time left and finish times, speed, loss
 (this step and a 1,000-step mean), learning rate, checkpoints, the last
@@ -841,6 +861,31 @@ the C++ ABI matches, so no native rebuild is needed.
 convolutions (`OneDnnPrecision`), matching cuDNN's default on CUDA. That took the ConvNeXt-T
 tower from 203 to 138 ms/step. An XPU out-of-memory aborts the process rather than throwing a
 .NET exception, so you resume from the last checkpoint.
+
+**bfloat16 (`--bf16`).** The image tower computes in bfloat16 while its weights,
+gradients, optimizer state, checkpoints and output maps stay fp32. TorchSharp has
+no autocast, so the weights are cast to bf16 in each call (`MixedPrecision`).
+The tower is limited by memory bandwidth, so halving the bytes it moves is most
+of the gain. On the B70, a forward and backward pass of the ConvNeXt-T tower
+(12 images at 512px) went from 204 to 164 ms, and a run 4 step from 223 to 199
+ms; a 6,000-step A/B kept mAP and gold pointing level. The flag isn't saved in
+the checkpoint, so pass it on every resume. Removing it goes back to fp32 with
+the same checkpoint.
+
+**Measuring speed.** `benchmark-tower` times the tower's forward and backward
+pass on random input, per variant (`--layouts nchw,bf16-mixed`), or per op of
+one block per stage (`--components`). Weights and input are created on the CPU
+because `manual_seed` doesn't seed the XPU's generator, so every variant gets the
+same values and the outputs can be compared. `UNBOORU_PROFILE_STEPS=N` makes
+`train` time each phase of N steps (after 50 warm-up steps) and write
+`step_profile.txt` to the checkpoint directory. The B70 is power-limited and its
+clock varies between about 2.2 and 2.8 GHz, so compare variants by alternating
+them back to back.
+
+**Host memory.** Keep free RAM on the training machine. When the host ran out of
+memory, the trainer slowed to about 3 s/step and stayed there: the GPU sat
+mostly idle while the copy engine was about as busy as the compute engine. A
+graceful stop (Ctrl+C) and resume restored normal speed.
 
 ### Offloading epoch evaluation (`--evaluation-command`)
 
