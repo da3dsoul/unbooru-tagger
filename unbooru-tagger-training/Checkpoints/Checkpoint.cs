@@ -16,6 +16,10 @@ namespace UnbooruTagger.Training.Checkpoints;
 public static class Checkpoint
 {
     private const string ImageTowerFileName = "image_tower.dat";
+    private const string GlimpseTowerFileName = "glimpse_tower.dat";
+
+    /// <summary>Whether <paramref name="directory"/>'s checkpoint has a separate glimpse tower (<see cref="ImageTower.GlimpseTower"/>).</summary>
+    public static bool HasGlimpseTower(string directory) => File.Exists(Path.Combine(directory, GlimpseTowerFileName));
     private const string ConfigFileName = "model_config.json";
     private const string VocabularyFileName = "tag_vocabulary.json";
     private const string EmbeddingsFileName = "tag_embeddings.bin";
@@ -35,6 +39,7 @@ public static class Checkpoint
     {
         Directory.CreateDirectory(directory);
         imageTower.save(Path.Combine(directory, ImageTowerFileName));
+        imageTower.GlimpseTower?.save(Path.Combine(directory, GlimpseTowerFileName));
         File.WriteAllText(Path.Combine(directory, ConfigFileName), JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }));
         vocabulary.Save(Path.Combine(directory, VocabularyFileName));
         embeddings.Save(Path.Combine(directory, EmbeddingsFileName));
@@ -54,14 +59,31 @@ public static class Checkpoint
         var config = JsonSerializer.Deserialize<ModelConfig>(File.ReadAllText(Path.Combine(directory, ConfigFileName)))
                      ?? throw new InvalidDataException($"'{directory}' does not contain a valid model config.");
 
-        var imageTower = new ImageTower(config.EmbeddingDim, config.StemChannels, config.StageChannels, config.BlocksPerStage, device, config.FusedStages)
+        var imageTower = new ImageTower(config.EmbeddingDim, config.StemChannels, config.StageChannels, config.BlocksPerStage, device, config.FusedStages, config.ClassificationGlimpses)
         {
             LocalizationFromFusedOnly = config.LocalizationFromFusedOnly
         };
         imageTower.LocalizationSkippedLaterals = config.LocalizationSkippedLaterals;
         imageTower.ClassificationPoolingTemperature = config.ClassificationPoolingTemperature;
         imageTower.ClassificationPoolingSchedule = config.ClassificationPoolingSchedule;
+        imageTower.ClassificationPoolingTopK = config.ClassificationPoolingTopK;
+        imageTower.ClassificationPoolingBottomWeight = config.ClassificationPoolingBottomWeight;
+        imageTower.GlimpsePoolZooms = config.GlimpsePoolZooms;
+        imageTower.GlimpsePoolMinZoom = config.GlimpsePoolMinZoom;
+        imageTower.GlimpseObjectDims = config.GlimpseObjectDims;
+        imageTower.GlimpseContextMean = config.GlimpseContextMean;
+        imageTower.GlimpseCount = config.GlimpseCount;
         imageTower.load(Path.Combine(directory, ImageTowerFileName));
+        if (HasGlimpseTower(directory))
+        {
+            var glimpseTower = new ImageTower(config.EmbeddingDim, config.StemChannels, config.StageChannels, config.BlocksPerStage, device, config.FusedStages)
+            {
+                LocalizationFromFusedOnly = config.LocalizationFromFusedOnly,
+                LocalizationSkippedLaterals = config.LocalizationSkippedLaterals,
+            };
+            glimpseTower.load(Path.Combine(directory, GlimpseTowerFileName));
+            imageTower.GlimpseTower = glimpseTower;
+        }
 
         var vocabulary = TagVocabulary.Load(Path.Combine(directory, VocabularyFileName));
         var embeddings = TagEmbeddingStore.Load(Path.Combine(directory, EmbeddingsFileName));

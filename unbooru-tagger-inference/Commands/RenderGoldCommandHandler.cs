@@ -1,5 +1,6 @@
 using System.Text.Json;
 using SkiaSharp;
+using UnbooruTagger.Core.Encoding;
 using UnbooruTagger.Core.Runtime;
 using UnbooruTagger.Core.Scoring;
 
@@ -16,6 +17,13 @@ namespace UnbooruTagger.Inference.Commands;
 /// its confidence and its boxes, in image pixels), which gold/compare.html draws on a canvas over
 /// the plain image with one list entry per box, so overlapping boxes can be told apart. The PNGs
 /// are then only written with <c>--png</c>.
+///
+/// <c>--scores</c> takes the gold pairs' scores from <c>evaluate --dump-occlusion</c>'s occlusion_pairs.jsonl (its
+/// unblanked "Full" score) instead of the bundle, for a checkpoint the bundle can't score (glimpses, exported with
+/// <c>export-onnx --ignore-pooling</c>): the bundle still draws the boxes. Only those pairs' tags are drawn, even with <c>--all-tags</c>.
+///
+/// Each tag in <see cref="BoxesFileName"/> carries its calibrated threshold. <c>--min-confidence</c> keeps the gold set's tags
+/// down to that confidence instead of their thresholds, so compare.html's cutoff slider can lower the cutoff live.
 /// </summary>
 public static class RenderGoldCommandHandler
 {
@@ -24,82 +32,143 @@ public static class RenderGoldCommandHandler
 
     public static int Run(
         string goldPath, string outputDirectory, string? modelDir, float? threshold,
-        float boxThreshold, float boxPercentile, float minHeatmapRange, float minBoxFraction, int maxBoxesPerTag, bool allTags = false, bool png = false)
+        float boxThreshold, float boxPercentile, float minHeatmapRange, float minBoxFraction, int maxBoxesPerTag, bool allTags = false, bool png = false,
+        string? scoresPath = null, float? minConfidence = null, InferenceDevice device = InferenceDevice.Cpu, int batchSize = 16)
     {
         var goldDirectory = Path.GetDirectoryName(Path.GetFullPath(goldPath))!;
         using var document = JsonDocument.Parse(File.ReadAllText(goldPath));
-        using var model = modelDir is not null ? ModelBundle.Load(modelDir) : null;
+        using var model = modelDir is not null ? ModelBundle.Load(modelDir, device: device) : null;
+        var encodeTime = new System.Diagnostics.Stopwatch();
+        var boxTime = new System.Diagnostics.Stopwatch();
         Directory.CreateDirectory(outputDirectory);
+        var scores = scoresPath is not null ? LoadScores(scoresPath) : null;
 
         var count = 0;
         var boxes = new Dictionary<string, object>();
         var writePng = model is null || png;
-        foreach (var image in document.RootElement.GetProperty("images").EnumerateArray())
+        var images = document.RootElement.GetProperty("images").EnumerateArray()
+            .Where(i => !(i.TryGetProperty("excluded", out var excluded) && excluded.ValueKind == JsonValueKind.True))
+            .ToList();
+        // The model runs batchSize images at a time; everything after it is per image.
+        foreach (var chunk in images.Chunk(Math.Max(1, batchSize)))
         {
-            if (image.TryGetProperty("excluded", out var excluded) && excluded.ValueKind == JsonValueKind.True)
-                continue;
-
-            var index = image.GetProperty("cacheIndex").GetInt32();
-            var imagePath = Path.Combine(goldDirectory, image.GetProperty("file").GetString()!);
-            using var original = SKBitmap.Decode(imagePath)
-                ?? throw new InvalidDataException($"Could not decode '{imagePath}'.");
-
-            var gold = image.GetProperty("instances").EnumerateArray()
-                .Select(i =>
-                {
-                    var kind = i.TryGetProperty("kind", out var k) ? k.GetString() : null;
-                    var tag = i.GetProperty("tag").GetString()!;
-                    return (Tag: kind switch { "group" => $"{tag} [group]", "ignore" => $"{tag} [unsure]", _ => tag },
-                        Box: i.GetProperty("box").EnumerateArray().Select(v => (int)Math.Round(v.GetDouble())).ToArray());
-                })
-                .GroupBy(i => i.Tag)
-                .Select(g => new TagDetection(g.Key, 1f, g.Select(i => new BoundingBox(i.Box[0], i.Box[1], i.Box[2], i.Box[3], 1f)).ToList()))
-                .ToList();
-            using var goldRender = writePng ? DetectCommandHandler.RenderBoxes(original, gold, showConfidence: false) : null;
-
-            SKBitmap? output = null;
-            if (model is not null)
+            var bitmaps = new List<SKBitmap>();
+            try
             {
-                var detections = DetectCommandHandler.Detect(model, imagePath, threshold, boxThreshold, boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag);
-                if (!allTags)
+                foreach (var image in chunk)
                 {
-                    // Only the tags the gold set boxes on this image, so both panels answer the same question.
-                    var targets = image.GetProperty("targets").EnumerateArray().Select(t => t.GetString()!).ToHashSet(StringComparer.Ordinal);
-                    detections = detections.Where(d => targets.Contains(d.Tag) || targets.Contains(d.Tag.Replace(' ', '_'))).ToList();
+                    var path = Path.Combine(goldDirectory, image.GetProperty("file").GetString()!);
+                    bitmaps.Add(SKBitmap.Decode(path) ?? throw new InvalidDataException($"Could not decode '{path}'."));
                 }
-                boxes[index.ToString()] = detections.Select(d => new
+                IReadOnlyList<ImageEncoding>? encodings = null;
+                if (model is not null)
                 {
-                    tag = d.Tag,
-                    confidence = d.Confidence,
-                    boxes = d.Boxes.Select(b => new[] { b.X, b.Y, b.Width, b.Height, b.Confidence }),
-                });
-                if (writePng)
+                    encodeTime.Start();
+                    encodings = model.ImageEncoder.EncodeBatch(bitmaps.Select(b => ImagePreprocessing.Normalize(b, model.ImageEncoder.InputSize)).ToList());
+                    encodeTime.Stop();
+                }
+                // Heatmaps and boxes are CPU work per image, so the batch's images run in parallel.
+                var detected = new List<TagDetection>[chunk.Length];
+                if (model is not null)
                 {
-                    using var modelRender = DetectCommandHandler.RenderBoxes(original, detections);
-                    output = SideBySide(($"gold ({StratumOf(image)})", goldRender!), ($"model ({ModelName(modelDir!)})", modelRender));
+                    boxTime.Start();
+                    Parallel.For(0, chunk.Length, c =>
+                    {
+                        // Only the tags the gold set boxes on this image, so both panels answer the same question. Scored only for
+                        // those: down to a low floor, every vocabulary row would cost a heatmap.
+                        var targets = allTags ? null
+                            : chunk[c].GetProperty("targets").EnumerateArray().Select(t => t.GetString()!.Replace(' ', '_')).ToHashSet(StringComparer.Ordinal);
+                        detected[c] = DetectCommandHandler.Detect(
+                            model, encodings![c], DetectCommandHandler.RefinementGuide.From(bitmaps[c]), minConfidence ?? threshold, boxThreshold,
+                            boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag, scores?.GetValueOrDefault(chunk[c].GetProperty("cacheIndex").GetInt32()),
+                            targets);
+                    });
+                    boxTime.Stop();
+                }
+
+                for (var c = 0; c < chunk.Length; c++)
+                {
+                    var image = chunk[c];
+                    var index = image.GetProperty("cacheIndex").GetInt32();
+                    var original = bitmaps[c];
+
+                    var gold = image.GetProperty("instances").EnumerateArray()
+                        .Select(i =>
+                        {
+                            var kind = i.TryGetProperty("kind", out var k) ? k.GetString() : null;
+                            var tag = i.GetProperty("tag").GetString()!;
+                            return (Tag: kind switch { "group" => $"{tag} [group]", "ignore" => $"{tag} [unsure]", _ => tag },
+                                Box: i.GetProperty("box").EnumerateArray().Select(v => (int)Math.Round(v.GetDouble())).ToArray());
+                        })
+                        .GroupBy(i => i.Tag)
+                        .Select(g => new TagDetection(g.Key, 1f, g.Select(i => new BoundingBox(i.Box[0], i.Box[1], i.Box[2], i.Box[3], 1f)).ToList()))
+                        .ToList();
+                    using var goldRender = writePng ? DetectCommandHandler.RenderBoxes(original, gold, showConfidence: false) : null;
+
+                    SKBitmap? output = null;
+                    if (model is not null)
+                    {
+                        var detections = detected[c];
+                        boxes[index.ToString()] = detections.Select(d => new
+                        {
+                            tag = d.Tag,
+                            confidence = d.Confidence,
+                            threshold = model.Vocabulary.TryGet(d.Tag, out var record) ? model.ThresholdFor(record.RowIndex, threshold) : (float?)null,
+                            boxes = d.Boxes.Select(b => new[] { b.X, b.Y, b.Width, b.Height, b.Confidence }),
+                        });
+                        if (writePng)
+                        {
+                            // A PNG can't move its cutoff, so it keeps the tags' thresholds.
+                            using var modelRender = DetectCommandHandler.RenderBoxes(original, minConfidence is null ? detections
+                                : detections.Where(d => !model.Vocabulary.TryGet(d.Tag, out var r) || d.Confidence >= model.ThresholdFor(r.RowIndex, threshold)).ToList());
+                            output = SideBySide(($"gold ({StratumOf(image)})", goldRender!), ($"model ({ModelName(modelDir!)})", modelRender));
+                        }
+                    }
+                    else
+                    {
+                        output = SideBySide(($"gold ({StratumOf(image)})", goldRender!));
+                    }
+
+                    if (output is not null)
+                    {
+                        using (output)
+                        using (var encoded = SKImage.FromBitmap(output).Encode(SKEncodedImageFormat.Png, 100))
+                        using (var stream = File.Create(Path.Combine(outputDirectory, $"{index}.png")))
+                            encoded.SaveTo(stream);
+                    }
+                    count++;
                 }
             }
-            else
+            finally
             {
-                output = SideBySide(($"gold ({StratumOf(image)})", goldRender!));
+                foreach (var bitmap in bitmaps)
+                    bitmap.Dispose();
             }
-
-            if (output is not null)
-            {
-                using (output)
-                using (var encoded = SKImage.FromBitmap(output).Encode(SKEncodedImageFormat.Png, 100))
-                using (var stream = File.Create(Path.Combine(outputDirectory, $"{index}.png")))
-                    encoded.SaveTo(stream);
-            }
-            count++;
         }
 
         if (model is not null)
             File.WriteAllText(Path.Combine(outputDirectory, BoxesFileName), JsonSerializer.Serialize(new { model = ModelName(modelDir!), images = boxes }));
+        if (model is not null)
+            Console.WriteLine($"Model {encodeTime.Elapsed.TotalSeconds:F1}s, heatmaps and boxes {boxTime.Elapsed.TotalSeconds:F1}s, over {count} images.");
         Console.WriteLine(writePng
             ? $"Rendered {count} images to '{outputDirectory}'."
             : $"Wrote {count} images' boxes to '{Path.Combine(outputDirectory, BoxesFileName)}'.");
         return 0;
+    }
+
+    /// <summary>Per gold image (cache index), each pair's unblanked score from an occlusion_pairs.jsonl.</summary>
+    private static Dictionary<int, Dictionary<string, float>> LoadScores(string path)
+    {
+        var scores = new Dictionary<int, Dictionary<string, float>>();
+        foreach (var line in File.ReadLines(path).Where(l => l.Length > 0))
+        {
+            using var pair = JsonDocument.Parse(line);
+            var index = pair.RootElement.GetProperty("CacheIndex").GetInt32();
+            if (!scores.TryGetValue(index, out var tags))
+                scores[index] = tags = new Dictionary<string, float>(StringComparer.Ordinal);
+            tags[pair.RootElement.GetProperty("Tag").GetString()!.Replace(' ', '_')] = pair.RootElement.GetProperty("Full").GetSingle();
+        }
+        return scores;
     }
 
     private static string ModelName(string modelDir) => Path.GetFileName(Path.TrimEndingDirectorySeparator(modelDir));

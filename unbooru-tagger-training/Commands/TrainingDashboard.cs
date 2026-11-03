@@ -55,6 +55,10 @@ public sealed class TrainingDashboard
     private readonly SortedDictionary<long, EvaluationPoint> _points = new();
     private readonly SortedDictionary<long, DateTime> _runningSnapshots = new();
     private IReadOnlyList<(string Label, EvaluationPoint Point)> _chartReferences = [];
+    private IReadOnlyList<(string Label, string Directory)> _chartComparisonDirectories = [];
+    private IReadOnlyList<(string Label, TrainingSeries Run)> _chartComparisons = [];
+    private DateTime _chartComparisonsRead = DateTime.MinValue;
+    private static readonly TimeSpan ChartComparisonRefresh = TimeSpan.FromMinutes(10);
     private bool _graphicalCharts;
 
     private int _epoch;
@@ -152,7 +156,7 @@ public sealed class TrainingDashboard
             {
                 var p = _points.Values.Last();
                 text += Markup.Escape($" · evaluation at step {p.Step:N0}: mAP {p.MeanAveragePrecision:F3}, gold pointing {p.GoldPointing:P1}, " +
-                                      $"context gaps {p.RecallGap:P1} / {p.FalsePositiveGap:P1}, blanked still called {p.OccludedStillCalled:P1}");
+                                      $"context gaps {p.RecallGap:P1} / {p.FalsePositiveGap:P1}, labelled context negatives' log-odds past the threshold {p.LabelledAbsentLogit:F2} absent / {p.LabelledPresentLogit:F2} untagged, blanked still called {p.OccludedStillCalled:P1}, object effect {p.ObjectEffect:F2}");
             }
             return text;
         }
@@ -173,12 +177,21 @@ public sealed class TrainingDashboard
     /// <param name="stepInEpoch">Steps completed in the current epoch, including this one.</param>
     public void StepCompleted(int stepInEpoch, float loss, float tagLoss, float localizationLoss, double learningRate, double stepMs, double dataWaitMs)
     {
+        StepProgress(stepInEpoch, learningRate, stepMs, dataWaitMs);
+        StepLosses(stepInEpoch, loss, tagLoss, localizationLoss);
+    }
+
+    /// <summary>
+    /// A step done: its number, rate and timings, known without the device. Training reports these every step and the
+    /// losses (<see cref="StepLosses"/>) when it reads them back, every few steps, so the step counter moves smoothly.
+    /// </summary>
+    public void StepProgress(int stepInEpoch, double learningRate, double stepMs, double dataWaitMs)
+    {
         lock (_lock)
         {
             var now = _now();
             _stepInEpoch = stepInEpoch;
             _globalStep = (long)_epoch * _info.StepsPerEpoch + stepInEpoch;
-            (_loss, _tagLoss, _localizationLoss) = (loss, tagLoss, localizationLoss);
             _learningRate = learningRate;
             (_stepMs, _dataWaitMs) = (stepMs, dataWaitMs);
             _phase = "training";
@@ -189,13 +202,20 @@ public sealed class TrainingDashboard
             // Keep one sample older than the window so the rate always spans a full window.
             while (_rateSamples.Count > 2 && now - _rateSamples.ElementAt(1).Time >= RateWindow)
                 _rateSamples.Dequeue();
+        }
+    }
 
+    /// <summary>A step's losses, read back from the device (after its <see cref="StepProgress"/>).</summary>
+    public void StepLosses(int stepInEpoch, float loss, float tagLoss, float localizationLoss)
+    {
+        lock (_lock)
+        {
+            (_loss, _tagLoss, _localizationLoss) = (loss, tagLoss, localizationLoss);
             _recentLosses.Enqueue(loss);
             _recentLossSum += loss;
             if (_recentLosses.Count > RecentLossSteps)
                 _recentLossSum -= _recentLosses.Dequeue();
-
-            _lossHistory.Add(_globalStep, loss);
+            _lossHistory.Add((long)_epoch * _info.StepsPerEpoch + stepInEpoch, loss);
         }
     }
 
@@ -211,6 +231,17 @@ public sealed class TrainingDashboard
     {
         lock (_lock)
             _chartReferences = references;
+    }
+
+    /// <summary>Other runs' checkpoint directories, drawn as curves over this run's steps (<see cref="TrainingSeries.Comparisons"/>).</summary>
+    public void SetChartComparisons(IReadOnlyList<(string Label, string Directory)> directories)
+    {
+        lock (_lock)
+        {
+            _chartComparisonDirectories = directories;
+            _chartComparisons = [];
+            _chartComparisonsRead = DateTime.MinValue;
+        }
     }
 
     /// <summary>
@@ -232,11 +263,27 @@ public sealed class TrainingDashboard
     /// </summary>
     public (TrainingSeries Series, string Version) ChartData()
     {
+        IReadOnlyList<(string Label, string Directory)> directories;
+        lock (_lock)
+            directories = _chartComparisonDirectories.Count > 0 && _now() - _chartComparisonsRead >= ChartComparisonRefresh ? _chartComparisonDirectories : [];
+        if (directories.Count > 0)
+        {
+            // Read from disk outside the lock, so the training loop's updates never wait on it.
+            var read = directories.Select(d => (d.Label, TrainingSeries.Load(d.Directory, _info.Epochs))).ToList();
+            lock (_lock)
+            {
+                _chartComparisons = read;
+                _chartComparisonsRead = _now();
+            }
+        }
+
         lock (_lock)
         {
             var loss = _lossHistory.Copy();
-            var series = new TrainingSeries(_info.Title, loss, _points.Values.ToList(), _globalStep, _info.StepsPerEpoch, _info.Epochs, _chartReferences);
-            return (series, $"{_points.Count}|{(_points.Count > 0 ? _points.Keys.Last() : 0)}|{loss.Buckets.Count}|{_chartReferences.Count}");
+            var series = new TrainingSeries(_info.Title, loss, _points.Values.ToList(), _globalStep, _info.StepsPerEpoch, _info.Epochs, _chartReferences,
+                _chartComparisons);
+            var compared = string.Join(",", _chartComparisons.Select(c => $"{c.Run.Points.Count}/{c.Run.Loss.Buckets.Count}"));
+            return (series, $"{_points.Count}|{(_points.Count > 0 ? _points.Keys.Last() : 0)}|{loss.Buckets.Count}|{_chartReferences.Count}|{compared}");
         }
     }
 
@@ -499,17 +546,22 @@ public sealed class TrainingDashboard
         {
             ("held-out mAP", p => p.MeanAveragePrecision, false, Fraction),
             ("gold pointing", p => p.GoldPointing, false, Percent),
-            ("blanked object still called", p => p.OccludedStillCalled, true, Percent),
+            ("gold-small pointing", p => p.SmallGoldPointing, false, Percent),
+            ("exclusive-tag violations", p => p.ExclusiveViolations, true, Percent),
+            ("object effect (log-odds)", p => p.ObjectEffect, false, Fraction),
+            ("gold-small object effect", p => p.SmallObjectEffect, false, Fraction),
             ("context recall gap", p => p.RecallGap, true, Percent),
             ("context false-positive gap", p => p.FalsePositiveGap, true, Percent),
-            ("exclusive-tag violations", p => p.ExclusiveViolations, true, Percent),
+            ("absent objects (labelled)", p => p.LabelledAbsentLogit, true, Fraction),
+            ("untagged objects (labelled)", p => p.LabelledPresentLogit, false, Fraction),
         };
+        const int columns = 3;
         var grid = new Grid();
-        for (var c = 0; c < 3; c++)
-            grid.AddColumn(new GridColumn().PadRight(c < 2 ? 4 : 0));
+        for (var c = 0; c < columns; c++)
+            grid.AddColumn(new GridColumn().PadRight(c < columns - 1 ? 4 : 0));
         var charts = metrics.Select(m => Chart(m.Name, _points.Values.Select(p => ((double)p.Step, m.Value(p))).ToList(), m.LowerIsBetter, m.Format, Color.Green)).ToList();
-        for (var k = 0; k < charts.Count; k += 3)
-            grid.AddRow(charts.Skip(k).Take(3).ToArray());
+        for (var k = 0; k < charts.Count; k += columns)
+            grid.AddRow(charts.Skip(k).Take(columns).ToArray());
         yield return new Text("");
         yield return new Markup($"[grey]evaluations: {_points.Count:N0} ({_points.Values.Count(p => p.EndOfEpoch)} at epoch ends), by training step · ↓ = lower is better[/]");
         yield return grid;

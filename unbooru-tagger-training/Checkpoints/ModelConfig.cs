@@ -5,12 +5,12 @@ namespace UnbooruTagger.Training.Checkpoints;
 /// loading trained weights into it. <paramref name="FusedStages"/> defaults to 0 so a config
 /// written before multi-scale fusion existed still loads as the original layout.
 /// </summary>
-public sealed record ModelConfig(int EmbeddingDim, int InputSize, int StemChannels, int[] StageChannels, int[] BlocksPerStage, int FusedStages = 0, bool LocalizationFromFusedOnly = false, int LocalizationSkippedLaterals = 0, float ClassificationPoolingTemperature = 0, Model.ClassificationPooling.Schedule? ClassificationPoolingSchedule = null)
+public sealed record ModelConfig(int EmbeddingDim, int InputSize, int StemChannels, int[] StageChannels, int[] BlocksPerStage, int FusedStages = 0, bool LocalizationFromFusedOnly = false, int LocalizationSkippedLaterals = 0, float ClassificationPoolingTemperature = 0, Model.ClassificationPooling.Schedule? ClassificationPoolingSchedule = null, bool ClassificationGlimpses = false, int GlimpseCount = 16, int ClassificationPoolingTopK = 0, float ClassificationPoolingBottomWeight = 0, int GlimpsePoolZooms = 4, int GlimpsePoolMinZoom = 0, int GlimpseObjectDims = 0, float[]? GlimpseContextMean = null)
 {
     public static ModelConfig Default(int embeddingDim, int inputSize) =>
         new(embeddingDim, inputSize, 64, [64, 128, 256], [2, 2, 2]);
 
     /// <summary>The config that reconstructs <paramref name="tower"/> exactly — what a checkpoint must save (not <see cref="Default"/>, which is only right for the original layout).</summary>
     public static ModelConfig From(Model.ImageTower tower, int inputSize) =>
-        new(tower.EmbeddingDim, inputSize, tower.StemChannels, tower.StageChannels, tower.BlocksPerStage, tower.FusedStages, tower.LocalizationFromFusedOnly, tower.LocalizationSkippedLaterals, tower.ClassificationPoolingTemperature, tower.ClassificationPoolingSchedule);
+        new(tower.EmbeddingDim, inputSize, tower.StemChannels, tower.StageChannels, tower.BlocksPerStage, tower.FusedStages, tower.LocalizationFromFusedOnly, tower.LocalizationSkippedLaterals, tower.ClassificationPoolingTemperature, tower.ClassificationPoolingSchedule, tower.ClassificationGlimpses, tower.GlimpseCount, tower.ClassificationPoolingTopK, tower.ClassificationPoolingBottomWeight, tower.GlimpsePoolZooms, tower.GlimpsePoolMinZoom, tower.GlimpseObjectDims, tower.GlimpseContextMean);
 }

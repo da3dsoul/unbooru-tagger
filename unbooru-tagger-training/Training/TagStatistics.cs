@@ -1,4 +1,5 @@
 using UnbooruTagger.Core.Dataset;
+using UnbooruTagger.Core.Vocabulary;
 
 namespace UnbooruTagger.Training.Training;
 
@@ -23,7 +24,9 @@ namespace UnbooruTagger.Training.Training;
 /// <item><see cref="HardNegativeSources"/> — for a tag t, tags s that show up alongside t
 /// often (P(s|t) ≥ <c>hardNegativeMinRatio</c>) AND have plenty of images without t. Images
 /// with s but not t are the visually-confusable negatives the crawler deliberately
-/// collected (same definition as the crawler's <c>TagCooccurrenceIndex.FindHardNegativeSources</c>).</item>
+/// collected (same definition as the crawler's <c>TagCooccurrenceIndex.FindHardNegativeSources</c>).
+/// With tag families (<see cref="Families"/>), a tag's family ancestors are never its sources (a shoes image
+/// without boots is an unnamed kind, not a "no boots"), and its excluders come first (no_shoes for shoes).</item>
 /// </list>
 /// Co-occurrence is estimated from a bounded random sample of each tag's own images
 /// (<c>samplesPerTag</c>), not every image pair in the corpus: an exact pair count over
@@ -52,6 +55,9 @@ public sealed class TagStatistics
     /// <summary>Optional: which sites each image came from, and which sites use each tag (TagAgreement.LoadSiteCoverage).</summary>
     public IReadOnlyList<BooruSites>? ImageSites { get; private init; }
     public IReadOnlyList<BooruSites>? TagSites { get; private init; }
+
+    /// <summary>The reviewed tag families (<see cref="TagParentage"/>); empty without them.</summary>
+    public TagFamilies Families { get; private init; } = TagFamilies.Empty(0);
 
     /// <summary>
     /// True if no site <paramref name="image"/> came from uses <paramref name="tag"/>: it can
@@ -93,8 +99,10 @@ public sealed class TagStatistics
         IReadOnlyList<double>? tagRecall = null,
         double missingPosterior = 0.5,
         IReadOnlyList<BooruSites>? imageSites = null,
-        IReadOnlyList<BooruSites>? tagSites = null)
+        IReadOnlyList<BooruSites>? tagSites = null,
+        TagFamilies? families = null)
     {
+        families ??= TagFamilies.Empty(vocabularySize);
         // Without a separate missing threshold every implied pair is "likely missing" (the
         // original behavior) and there is no context band.
         var missing = missingThreshold ?? impliedThreshold;
@@ -167,15 +175,19 @@ public sealed class TagStatistics
 
             // conditional[t] holds P(s|t) for each s: "s shows up alongside t this often".
             // Counter-examples (images with s but without t) ≈ count(s) - P(s|t)·count(t).
-            hardNegativeSources[t] = conditional[t]
-                .Where(x => x.Ratio >= hardNegativeMinRatio)
+            // A family ancestor co-occurs with every kind of it (completion put it there), so it would always rank
+            // first; its images without t are unnamed kinds, not negatives. Excluders go first instead.
+            var ancestors = families.FamilyAncestors(t);
+            var excluders = families.Excluders(t).Where(s => counts[s] > 0).ToArray();
+            hardNegativeSources[t] = excluders.Concat(conditional[t]
+                .Where(x => x.Ratio >= hardNegativeMinRatio && !ancestors.Contains(x.Tag) && !excluders.Contains(x.Tag))
                 .Select(x => (x.Tag, x.Ratio, CounterExamples: counts[x.Tag] - x.Ratio * counts[t]))
                 .Where(x => x.CounterExamples >= hardNegativeMinCounterExamples)
                 .OrderByDescending(x => x.Ratio)
                 .ThenByDescending(x => x.CounterExamples)
                 .ThenBy(x => x.Tag)
                 .Take(maxHardNegativeSources)
-                .Select(x => x.Tag)
+                .Select(x => x.Tag))
                 .ToArray();
         });
 
@@ -201,6 +213,7 @@ public sealed class TagStatistics
         {
             ImageSites = imageSites,
             TagSites = tagSites,
+            Families = families,
         };
     }
 
@@ -255,6 +268,36 @@ public sealed class TagStatistics
     /// Null if the tag has no context sources or every attempt fails.
     /// </summary>
     // More attempts than hard negatives: a source can carry the tag up to 90% of the time.
+    /// <summary>
+    /// Two images of one of <paramref name="tag"/>'s <see cref="ContextSources"/>: one carrying the tag and one that is a context
+    /// negative for it (as <see cref="SampleContextNegative"/>); null if none is found in <paramref name="attempts"/> tries.
+    /// </summary>
+    public (int With, int Without)? SampleContextPair(int tag, Random random, int attempts = 64)
+    {
+        var sources = ContextSources[tag];
+        if (sources.Length == 0)
+            return null;
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            var sourceImages = Positives[sources[random.Next(sources.Length)]];
+            if (sourceImages.Length < 2)
+                continue;
+            int? with = null, without = null;
+            for (var tries = 0; tries < 32 && (with is null || without is null); tries++)
+            {
+                var image = sourceImages[random.Next(sourceImages.Length)];
+                if (HasTag(image, tag))
+                    with ??= image;
+                else if (!IsLikelyMissing(image, tag) && !IsSiteBlind(image, tag))
+                    without ??= image;
+            }
+            if (with is int w && without is int o)
+                return (w, o);
+        }
+
+        return null;
+    }
+
     public int? SampleContextNegative(int tag, Random random, int attempts = 64)
     {
         var sources = ContextSources[tag];
@@ -273,9 +316,14 @@ public sealed class TagStatistics
         return null;
     }
 
-    /// <summary>True if <paramref name="image"/> lacks <paramref name="tag"/> but carries some tag that nearly always implies it.</summary>
+    /// <summary>
+    /// True if <paramref name="image"/> lacks <paramref name="tag"/> but carries some tag that nearly always implies it,
+    /// or the tag is an unnamed kind of a family parent the image carries (<see cref="TagFamilies.IsUnknown"/>).
+    /// </summary>
     public bool IsLikelyMissing(int image, int tag)
     {
+        if (Families.IsUnknown(ImageTagRows[image], tag))
+            return true;
         foreach (var s in ImageTagRows[image])
         {
             if ((uint)s >= (uint)VocabularySize)

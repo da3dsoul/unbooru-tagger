@@ -30,22 +30,33 @@ public sealed class TagImplications
 
     public static TagImplications Empty(int vocabularySize) => new(Enumerable.Repeat(Array.Empty<int>(), vocabularySize).ToArray(), 0);
 
-    /// <summary>Loads <paramref name="path"/> against <paramref name="vocabulary"/>; rules whose tags aren't both in it are dropped. Missing file = no rules.</summary>
-    public static TagImplications Load(string path, TagVocabulary vocabulary)
+    /// <summary>
+    /// Loads <paramref name="path"/> against <paramref name="vocabulary"/>; rules whose tags aren't both in it are dropped. Missing file = no rules.
+    /// <paramref name="extraPairs"/> (the reviewed <see cref="TagParentage.CompletionPairs"/>) are added to Danbooru's rules, so chains
+    /// through both close: platform_boots → boots (Danbooru) → shoes (reviewed).
+    /// </summary>
+    public static TagImplications Load(string path, TagVocabulary vocabulary, IEnumerable<(string Antecedent, string Consequent)>? extraPairs = null) =>
+        FromRawPairs(LoadPairs(path).Concat(extraPairs ?? []), vocabulary);
+
+    /// <summary>The raw (antecedent, consequent) pairs in <paramref name="path"/>; none if it doesn't exist.</summary>
+    public static List<(string Antecedent, string Consequent)> LoadPairs(string path)
     {
         if (!File.Exists(path))
-            return Empty(vocabulary.Records.Count);
+            return [];
         using var document = JsonDocument.Parse(File.ReadAllText(path));
-        var pairs = document.RootElement.EnumerateArray()
-            .Select(e => (e.GetProperty("Antecedent").GetString()!, e.GetProperty("Consequent").GetString()!));
-        return FromRawPairs(pairs, vocabulary);
+        return document.RootElement.EnumerateArray()
+            .Select(e => (e.GetProperty("Antecedent").GetString()!, e.GetProperty("Consequent").GetString()!))
+            .ToList();
     }
+
+    /// <summary>Every row <paramref name="row"/> implies, directly or through a chain.</summary>
+    public IReadOnlyList<int> Implied(int row) => (uint)row < (uint)_impliedBy.Length ? _impliedBy[row] : [];
 
     public static TagImplications FromRawPairs(IEnumerable<(string Antecedent, string Consequent)> pairs, TagVocabulary vocabulary)
     {
         var rowByRaw = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var record in vocabulary.Records)
-            rowByRaw.TryAdd(Raw(record.Tag), record.RowIndex);
+            rowByRaw.TryAdd(RawName(record.Tag), record.RowIndex);
 
         var direct = new List<int>[vocabulary.Records.Count];
         var rules = 0;
@@ -117,7 +128,8 @@ public sealed class TagImplications
         return result;
     }
 
-    private static string Raw(string tag)
+    /// <summary>The booru name of a vocabulary identity: its category prefix (character:, series:, ...) stripped.</summary>
+    public static string RawName(string tag)
     {
         foreach (var prefix in Prefixes)
             if (tag.StartsWith(prefix, StringComparison.Ordinal))

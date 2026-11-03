@@ -61,6 +61,88 @@ public class ContextNegativeTests
     }
 
     [Fact]
+    public void ContextPairs_AreTwoImagesOfOneSource_WithAndWithoutTheTag()
+    {
+        var statistics = Statistics();
+        var random = new Random(4);
+        for (var i = 0; i < 100; i++)
+        {
+            var (with, without) = statistics.SampleContextPair(1, random)!.Value;
+            Assert.InRange(with, 0, 29);      // her, with the hat
+            Assert.InRange(without, 30, 39);  // her, without it
+        }
+        Assert.Null(statistics.SampleContextPair(3, random)); // no context sources
+
+        var sampler = new TagCentricBatchSampler(statistics, 2, 2, random: new Random(5)) { ContextPairsPerBatch = 2 };
+        var batch = sampler.SampleBatch(10);
+        var pairs = batch.Where(s => s.ContextPair >= 0).GroupBy(s => s.ContextPair).ToArray();
+        Assert.Equal(2, pairs.Length);               // every batch, at its start
+        Assert.All(batch.Take(4), s => Assert.True(s.ContextPair >= 0));
+        foreach (var pair in pairs)
+        {
+            Assert.Equal(2, pair.Count());
+            var with = pair.Single(s => !s.IsContextNegative);
+            var without = pair.Single(s => s.IsContextNegative);
+            Assert.Equal(with.AnchorTag, without.AnchorTag);
+            Assert.True(statistics.HasTag(with.Image, with.AnchorTag));
+            Assert.False(statistics.HasTag(without.Image, without.AnchorTag));
+            // One shared context source (for the hat: her, tag 0; hat is itself a source for her hair color, P = 30/50).
+            Assert.Contains(statistics.ContextSources[with.AnchorTag], source => statistics.HasTag(with.Image, source) && statistics.HasTag(without.Image, source));
+        }
+    }
+
+    // Priors over the corpus with tag 0 (her) and tag 3 (someone else, who never wears the hat) as character sources: her
+    // P(hat) = 0.75, theirs 0.
+    private static ContextPriorTable Priors(TagStatistics statistics) =>
+        ContextPriorTable.Build(statistics, [true, false, false, true], [false, true, false, false], minSourceImages: 5);
+
+    private static List<IReadOnlyList<int>> ExclusiveCorpus()
+    {
+        var images = Corpus();
+        for (var i = 0; i < 10; i++)
+            images.Add([3, 1]); // the someone-else who rarely wears it, with the hat: exclusive images 120-129
+        return images;
+    }
+
+    [Fact]
+    public void ExclusivePositives_HaveTheTag_OnACharacterWhoRarelyCarriesIt()
+    {
+        var statistics = TagStatistics.Build(ExclusiveCorpus(), 4, samplesPerTag: 1000, impliedThreshold: 0.6, hardNegativeMinCounterExamples: 5, missingThreshold: 0.9);
+        var sampler = new TagCentricBatchSampler(statistics, 2, 2, random: new Random(7))
+            { ExclusivePerBatch = 4, ContextPairTags = [1], ExclusivePriors = Priors(statistics) };
+        for (var i = 0; i < 100; i++)
+            Assert.InRange(sampler.ExclusivePositive(1)!.Value, 120, 129); // not her hats, nor hats with no known character
+
+        var batch = sampler.SampleBatch(10);
+        Assert.Equal([true, false, true, false], batch.Take(4).Select(s => s.IsContextNegative));
+        Assert.All(batch.Take(4), s => Assert.Equal(1, s.AnchorTag));
+        Assert.All(batch.Take(4).Where(s => s.IsContextNegative), s => Assert.InRange(s.Image, 30, 39));
+        Assert.All(batch.Take(4).Where(s => !s.IsContextNegative), s => Assert.InRange(s.Image, 120, 129));
+    }
+
+    [Fact]
+    public void FeatureSplitPairs_AreExclusivePositives_AndOptionallyContextNegatives_ByEachImagesPrior()
+    {
+        var statistics = TagStatistics.Build(ExclusiveCorpus(), 4, samplesPerTag: 1000, impliedThreshold: 0.6, hardNegativeMinCounterExamples: 5, missingThreshold: 0.9);
+        var priors = Priors(statistics);
+        // Her with the hat (prior 0.75: co-occurring), her without it (a context negative), a hat with no known character
+        // (no prior: left alone), the someone-else with the hat (prior 0: exclusive).
+        List<IReadOnlyList<int>> images = [[0, 1, 2], [0, 2], [1], [3, 1]];
+        using var targets = new PairWeightBuilder(statistics, ExclusiveTagGroups.Empty).Build(images);
+        bool[] splitTags = [false, true, false, false];
+        long positives = 0, exclusive = 0, negatives = 0;
+
+        var split = UnbooruTagger.Training.Commands.TrainCommandHandler.FeatureSplitPairs(targets, images, splitTags, priors, false, ref positives, ref exclusive, ref negatives)!.Value;
+        Assert.Equal([false, false, false, true], Enumerable.Range(0, 4).Select(i => split.Mask[i * 4 + 1]));
+        Assert.Equal((3L, 1L, 0L), (positives, exclusive, negatives));
+
+        var withNegatives = UnbooruTagger.Training.Commands.TrainCommandHandler.FeatureSplitPairs(targets, images, splitTags, priors, true, ref positives, ref exclusive, ref negatives)!.Value;
+        Assert.Equal([false, true, false, true], Enumerable.Range(0, 4).Select(i => withNegatives.Mask[i * 4 + 1]));
+        Assert.Equal(1L, negatives);
+        Assert.DoesNotContain(true, withNegatives.Mask.Where((_, at) => at % 4 != 1)); // only the split tags
+    }
+
+    [Fact]
     public void Weights_TrainContextNegativesAsUnverified_InsteadOfIgnoringThem()
     {
         var builder = new PairWeightBuilder(Statistics(), ExclusiveTagGroups.Empty);

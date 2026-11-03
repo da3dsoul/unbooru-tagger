@@ -1,3 +1,4 @@
+using UnbooruTagger.Training.Model;
 using UnbooruTagger.Training.Training;
 
 namespace UnbooruTagger.Tests.Training;
@@ -46,5 +47,18 @@ public class GoldScoringTests
         Assert.Equal(0, score.ScoredExtracted);
         Assert.Equal((1, 0), (score.RecallItems, score.RecalledItems));
         Assert.Null(score.CountError);
+    }
+
+    [Fact]
+    public void Covers_SmallObjectInsideAWindow_AndAWindowOnALargeObject()
+    {
+        var window = new GlimpseWindow(1, 100, 100, 64);
+
+        Assert.True(LocalizationEvaluator.Covers(window, [120, 120, 20, 20]));   // wholly inside
+        Assert.True(LocalizationEvaluator.Covers(window, [150, 110, 20, 20]));   // 14 of its 20px columns inside: 70%
+        Assert.False(LocalizationEvaluator.Covers(window, [160, 110, 20, 20]));  // 4 of 20 inside
+        Assert.True(LocalizationEvaluator.Covers(window, [0, 0, 400, 400]));     // the window lies on the object
+        Assert.False(LocalizationEvaluator.Covers(window, [140, 0, 400, 400]));  // 24 of the window's 64 columns on it: 38%
+        Assert.False(LocalizationEvaluator.Covers(window, [300, 300, 20, 20]));  // elsewhere
     }
 }

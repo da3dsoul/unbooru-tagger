@@ -33,6 +33,6 @@ public static class SpatialMask
         }
 
         var maskTensor = tensor(mask, [boxes.Count, 1, spatialHeight, spatialWidth]);
-        return device is null ? maskTensor : maskTensor.to(device);
+        return device is null ? maskTensor : maskTensor.Upload(device);
     }
 }

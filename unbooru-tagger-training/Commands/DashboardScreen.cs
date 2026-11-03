@@ -19,7 +19,9 @@ public sealed class DashboardScreen : IDisposable
     private readonly TrainingDashboard _dashboard;
     private readonly TextWriter _output;
     private readonly Func<(int Columns, int Rows)> _size;
-    private readonly (int Width, int Height) _cell;
+    private readonly Func<(int Width, int Height)> _cellSize;
+    private (int Width, int Height) _cell;
+    private (int Columns, int Rows)? _cellMeasuredAt;
     private readonly object _drawing = new();
     private readonly Timer _timer;
     private string? _chartKey;
@@ -28,15 +30,17 @@ public sealed class DashboardScreen : IDisposable
 
     /// <param name="output">Where to draw (default: the console).</param>
     /// <param name="size">The terminal's size in characters (default: the console window's).</param>
-    /// <param name="cell">A character cell in pixels (default: <see cref="TerminalGraphics.CellSize"/>).</param>
+    /// <param name="cell">A character cell in pixels (default: <see cref="TerminalGraphics.CellSize"/>, measured again whenever the
+    /// terminal's size changes: a trainer started in a detached tmux session can't measure it until a client attaches, and an
+    /// image drawn with the wrong cell height runs past the rows it was given).</param>
     /// <param name="refresh">Redraw interval; null draws only on <see cref="Draw"/> calls (tests).</param>
-    public DashboardScreen(TrainingDashboard dashboard, TextWriter? output = null, Func<(int, int)>? size = null, (int, int)? cell = null,
+    public DashboardScreen(TrainingDashboard dashboard, TextWriter? output = null, Func<(int, int)>? size = null, Func<(int, int)>? cell = null,
         TimeSpan? refresh = null)
     {
         _dashboard = dashboard;
         _output = output ?? Console.Out;
         _size = size ?? (() => (Console.WindowWidth, Console.WindowHeight));
-        _cell = cell ?? TerminalGraphics.CellSize();
+        _cellSize = cell ?? TerminalGraphics.CellSize;
         _dashboard.GraphicalCharts = true;
         // Alternate screen (the shell's scrollback is left as it was), cursor hidden, cleared.
         _output.Write("\u001b[?1049h\u001b[?25l\u001b[2J");
@@ -56,6 +60,11 @@ public sealed class DashboardScreen : IDisposable
             {
                 var (columns, rows) = _size();
                 (columns, rows) = (Math.Max(40, columns), Math.Max(10, rows));
+                if (_cellMeasuredAt != (columns, rows))
+                {
+                    _cell = _cellSize();
+                    _cellMeasuredAt = (columns, rows);
+                }
                 var panel = PanelLines(columns, rows);
                 var frame = new StringBuilder();
                 frame.Append("\u001b[?2026h"); // synchronized update: the terminal shows the frame at once
@@ -66,7 +75,7 @@ public sealed class DashboardScreen : IDisposable
                 var chartTop = panel.Count + 1;
                 var chartRows = rows - chartTop - 2;
                 var (series, version) = _dashboard.ChartData();
-                var key = $"{version}|{columns}x{rows}|{panel.Count}";
+                var key = $"{version}|{columns}x{rows}|{_cell.Width}x{_cell.Height}|{panel.Count}";
                 if (key != _chartKey)
                 {
                     // Erasing a row clears tmux's copy but leaves an old image's pixels in Konsole; only text

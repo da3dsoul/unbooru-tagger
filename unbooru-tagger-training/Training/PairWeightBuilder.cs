@@ -1,3 +1,4 @@
+using UnbooruTagger.Training.Model;
 using UnbooruTagger.Core.Dataset;
 using UnbooruTagger.Core.Vocabulary;
 using static TorchSharp.torch;
@@ -12,7 +13,7 @@ namespace UnbooruTagger.Training.Training;
 /// <param name="LogitOffsets">Optional: added to the whole-image logits in the loss only (<see cref="ContextPrior"/>).</param>
 public sealed record PairTargets(Tensor Labels, Tensor Weights, Tensor FocalMask, float PositiveWeightSum, Tensor? LogitOffsets = null) : IDisposable
 {
-    public PairTargets To(Device device) => new(Labels.to(device), Weights.to(device), FocalMask.to(device), PositiveWeightSum, LogitOffsets?.to(device));
+    public PairTargets To(Device device) => new(Labels.Upload(device), Weights.Upload(device), FocalMask.Upload(device), PositiveWeightSum, LogitOffsets?.Upload(device));
 
     public void Dispose()
     {
@@ -47,6 +48,8 @@ public sealed record PairTargets(Tensor Labels, Tensor Weights, Tensor FocalMask
 /// <item><b>Likely missing</b>: the tag is usually implied by one the image does carry
 /// (<see cref="TagStatistics.ImpliedBy"/>). Weight 0 — don't punish the model for
 /// predicting a tag the tagger probably forgot.</item>
+/// <item><b>Unnamed kind</b>: the image carries a family parent (<see cref="TagFamilies"/>: shoes) but no kind
+/// of it, so which kind (boots? sandals?) is unknown. Weight 0, like a likely-missing label.</item>
 /// <item><b>Context negative</b> (only with <c>contextNegativeWeight</c> &gt; 0): the image
 /// carries one of the tag's <see cref="TagStatistics.ContextSources"/> (a character who usually
 /// wears a hat) but not the tag, and it isn't likely missing. Full-strength,
@@ -56,7 +59,9 @@ public sealed record PairTargets(Tensor Labels, Tensor Weights, Tensor FocalMask
 /// like 1girl/2girls are often just untagged, and promoting their context negatives doubled
 /// the held-out people-count contradictions (1girl + 2girls both called) in the A/B.</item>
 /// <item><b>Exclusive</b>: the tag is mutually exclusive with one the image carries
-/// (<see cref="ExclusiveTagGroups"/>). A verified absence: full-strength, <c>certainNegativeWeight</c>.</item>
+/// (<see cref="ExclusiveTagGroups"/>), or ruled out by a reviewed excludes rule (<see cref="TagFamilies.ExcludedRows"/>:
+/// no_shoes → shoes and every kind of shoe, unless the image is tagged shoes). A verified absence: full-strength,
+/// <c>certainNegativeWeight</c> (an excludes rule's: <c>excludedNegativeWeight</c>, if higher).</item>
 /// <item><b>Exhaustively labeled</b>: <c>exhaustiveRows</c> (the cumulative rating labels)
 /// are known for every image, so their absence is a verified "no", never "likely missing".
 /// Without this, <c>rating:at_least_sensitive</c> (64% of images) was implied by common tags
@@ -65,7 +70,9 @@ public sealed record PairTargets(Tensor Labels, Tensor Weights, Tensor FocalMask
 /// <item><b>Site-blind</b>: no site the image came from uses the tag
 /// (<see cref="TagStatistics.IsSiteBlind"/>: Gelbooru's silver_hair on a Danbooru-only image).
 /// The image could never carry it, so the absence says nothing: weight 0.</item>
-/// <item><b>Positive</b>: weight 1, full-strength.</item>
+/// <item><b>Positive</b>: weight 1, full-strength; <c>outOfContextPositiveWeight</c> for a sampled out-of-context
+/// positive of its anchor (<see cref="SampledImage.IsOutOfContextPositive"/>: the object where its context rarely has it), and, with
+/// <c>outOfContextPriors</c>, for every eligible positive whose context prior is below <c>outOfContextMaxPrior</c>.</item>
 /// <item><b>Untrainable tag</b>: no training image carries it at all (stale vocabulary rows).
 /// Weight 0 — there's nothing to learn, and its row would otherwise only ever be pushed
 /// down.</item>
@@ -80,7 +87,12 @@ public sealed class PairWeightBuilder(
     float contextNegativeWeight = 0f,
     IReadOnlyList<bool>? contextNegativeTags = null,
     ContextPrior? contextPrior = null,
-    float hardNegativeSourceWeight = 0f)
+    float hardNegativeSourceWeight = 0f,
+    float outOfContextPositiveWeight = 0f,
+    float excludedNegativeWeight = 0f,
+    ContextPriorTable? outOfContextPriors = null,
+    IReadOnlyList<bool>? outOfContextTags = null,
+    float outOfContextMaxPrior = 0.3f)
 {
     public int VocabularySize => statistics.VocabularySize;
 
@@ -155,6 +167,11 @@ public sealed class PairWeightBuilder(
                     weights[offset + t] = 0f;
             }
 
+            if (!statistics.Families.IsEmpty)
+                foreach (var t in statistics.Families.UnknownRows(tags))
+                    if ((uint)t < (uint)vocabularySize)
+                        weights[offset + t] = 0f;
+
             if (_contextTargets.Length > 0)
                 foreach (var s in tags)
                 {
@@ -176,6 +193,14 @@ public sealed class PairWeightBuilder(
                     SetCertainNegative(offset + t);
             }
 
+            if (!statistics.Families.IsEmpty)
+                foreach (var t in statistics.Families.ExcludedRows(tags))
+                    if ((uint)t < (uint)vocabularySize)
+                    {
+                        SetCertainNegative(offset + t);
+                        weights[offset + t] = Math.Max(weights[offset + t], excludedNegativeWeight);
+                    }
+
             if (exhaustiveRows is not null)
                 foreach (var r in exhaustiveRows)
                     if ((uint)r < (uint)vocabularySize)
@@ -194,6 +219,13 @@ public sealed class PairWeightBuilder(
                 weights[offset + s] = 1f;
                 focal[offset + s] = 0f;
             }
+            if (outOfContextPositiveWeight > 0 && sampled is not null && sampled[i].IsOutOfContextPositive && labels[offset + sampled[i].AnchorTag] > 0)
+                weights[offset + sampled[i].AnchorTag] = outOfContextPositiveWeight;
+            // With a prior table, every eligible positive of the batch whose context rarely has it, not only the anchor's.
+            if (outOfContextPositiveWeight > 0 && outOfContextPriors is not null && outOfContextTags is not null)
+                foreach (var t in tags)
+                    if ((uint)t < (uint)vocabularySize && t < outOfContextTags.Count && outOfContextTags[t] && outOfContextPriors.Prior(tags, t) < outOfContextMaxPrior)
+                        weights[offset + t] = outOfContextPositiveWeight;
 
             for (var t = 0; t < vocabularySize; t++)
             {

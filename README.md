@@ -175,7 +175,11 @@ shows only the tags the gold set boxes on that image (`--all-tags` shows
 everything). `--png` also writes one PNG per gold image: the hand-checked
 boxes drawn exactly as `detect` draws, with the same per-tag colors, beside
 the model's boxes. Without `--model-dir` it writes PNGs of the gold boxes
-alone. Takes the same box options as `detect`.
+alone. Takes the same box options as `detect`. Each tag in `boxes.json` carries its
+calibrated threshold; `--min-confidence F` keeps the gold set's tags down to `F` instead
+of their thresholds, for a page that moves the cutoff live. The model runs `--batch-size`
+(16) images at a time on `--device` (Auto: CUDA when it loads); 289 images take ~25s on
+the A4000 against ~2 minutes on the CPU.
 
 Every command accepts `--model-dir` (default `./model`). `tag`, `tag-batch`
 and `detect` also accept `--threshold` for the minimum tag confidence to report.
@@ -627,7 +631,21 @@ still treated as a missing label. `evaluate` reports a per-tag context AP.
 not just the sampled ones, as a full-strength negative with this weight instead
 of a damped one, so "this character, therefore gloves" is no longer nearly free.
 It applies to localizable tags only: whole-image tags like `1girl` are often just
-untagged.
+untagged. Run 4 uses 3. Raising it to 6 didn't help: many of these images show
+the object without the tag, so a higher weight also trains visible objects as
+"no" (`CLAUDE.md` has the hand check).
+
+**Tag parentage.** `--tag-parentage <rules.json>` applies reviewed is-a,
+implies and excludes rules (the format the tag-parentage review page writes).
+- A kind completes its parent: `boots` adds `shoes`.
+- An image tagged with a parent but none of its kinds leaves the kinds
+  unknown rather than negative.
+- An excludes rule makes the tag a certain negative: `no_shoes` rules out
+  `shoes` and every kind of shoe.
+
+`evaluate` and the gold sets read labels the same way. The rules are saved
+into the checkpoint, so a resume without the option keeps them; `none` turns
+them off.
 
 **Localization options.**
 - `--localization-map fused` trains localization (and draws heatmaps) on the
@@ -673,6 +691,88 @@ was A/B tested from a run 4 checkpoint over 6,000-20,000 steps; the numbers are 
   instead of the averaged embedding. Fewer tags called with the object blanked,
   but lower mAP and no better on object tags such as gloves. Saved in
   `model_config.json`; `export-onnx` refuses a checkpoint that uses it.
+- `--out-of-context-share` (with `--out-of-context-max-prior`,
+  `--out-of-context-weight`, `--out-of-context-all`): positives whose context
+  prior is low, e.g. gloves on a character who rarely wears them, drawn for
+  anchors or weighted up. Narrowed the context gaps without raising the object
+  effect.
+- `--excluder-share` with `--excluded-negative-weight`: anchors on tags an
+  excludes rule rules out (gloves for `no_gloves`), with the excluders' images
+  as certain negatives. Mixed results.
+
+**Erased views (off by default; not adopted).** `--erasure-pairs-per-step N`
+trains the occlusion check directly. For up to N called localizable tags per
+step, it blanks the region the tag's own map points at, and a same-size region
+on another of the image's tags. The tag's score must then drop at least
+`--erasure-margin` (default 1) more for the object than for the control.
+- `--erasure-weight` (default 1) scales the loss.
+- `--erasure-loss hinge|negative|negative-only` (default `hinge`); `negative` makes the
+  object-blanked view a negative and the control-blanked one a positive;
+  `negative-only` drops the positive half (which raised every called score),
+  leaving the control-blanked view to `--erasure-anchor-weight` alone.
+- `--erasure-fill` (default `mean,noise`) sets what blanks are filled with,
+  one fill per pair.
+- `--erasure-every N` (default 1) runs it on every Nth step only.
+- `--erasure-anchor-weight W` (default 0 = off) also holds the control-blanked
+  score to the unblanked one. Without it the hinge, being relative, lets the
+  model learn that any filled patch lowers every score.
+
+Needs deliberate targets and `--localization-weight > 0`. Each pair adds two
+images to the mosaic canvases' forward pass. In the A/B, 1 pair at weight 0.25
+every 4th step looked nearly free at 6,000 steps, but by 12,000 it had learned
+the patch cue and cost 0.5 pts of mAP. With the anchor the cue is gone but
+mAP falls 2 pts; `CLAUDE.md` has the numbers.
+
+**Glimpse and window-label experiments (off by default; none adopted).** Tried
+on run 5 (and twins/pastes on run 4) in 2026-11; `CLAUDE.md` has the results.
+Pooling, saved in `model_config.json` (omitted keeps the checkpoint's setting):
+- `--classification-pooling-top-k K` pools localizable tags as the mean of the K
+  best windows; `--classification-pooling-bottom-weight W` adds W x the mean of
+  the K worst (WILDCAT).
+- `--glimpse-pool-zooms N` scores localizable tags from the first N zooms only
+  (3 leaves out 256px); `--glimpse-pool-min-zoom Z` leaves out zooms below Z.
+
+Training (all need `--classification-glimpses`):
+- `--glimpse-label-framing-floor N`: N windows per image always frame labelled
+  positives. `--glimpse-framed-positive-pooling`: a framed positive is scored
+  from its framing close windows only.
+- `--glimpse-proposal-detach-tags`: the proposal loss doesn't train the tag
+  embeddings.
+- `--separate-glimpse-tower` (with `--glimpse-tower-lr-scale`): glimpses get
+  their own copy of the tower (`glimpse_tower.dat`, used by `evaluate`).
+- `--context-pairs-per-batch N`, `--context-pair-weight`, `--context-pair-margin`:
+  pairs of one character's images with and without a localizable tag, and a
+  hinge on their pooled glimpse scores.
+- `--glimpse-feature-split` (`-weight`, `-negatives`, `--glimpse-exclusive-per-batch`):
+  Singh et al. 2020's feature split on the glimpse embedding;
+  `evaluate --glimpse-object-only` scores with the object half alone.
+- `--locality-negative-weight` (`--locality-per-pair`, `--locality-confidence-gate`,
+  `--locality-detach-scaling`, `--locality-min-observations`, `--locality-prior`):
+  a close window where one tag is confidently found is a "no" for tags rarely seen
+  together with it. `evaluate --locality-prior-out <file>` measures that table on a
+  trained map (`--locality-prior-images`).
+- `--mosaic-glimpse-weight W` (with `--mosaics-per-step`): glimpses on the mosaic
+  canvases; a tag's windows on other tiles are a "no", its own tile a "yes" bag.
+- `--twin-every N` (`--twin-weight`, `--twin-detach-scaling`): every Nth batch is
+  one image with a localizable tag and 9 "twins" without it whose tags overlap it
+  most (at most one character each); the half of its windows most like the twins'
+  are a "no". Without glimpses, only the batches change. `--twin-paste P`: P twins
+  get the positive's region at the tag's map peak pasted in (and carry the tag),
+  P others a region from elsewhere (certain negatives). `evaluate --twin-check
+  <out.jsonl>` measures how often the "no" windows hold the gold objects.
+- `--negative-loss hill` (Hill loss instead of ASL for unverified negatives) and
+  `--hard-negative-source-weight W` (every pair whose image carries a hard-negative
+  source of the tag but not the tag, as a full-strength negative): built, untested.
+
+`window-probe --checkpoint-dir <dir> --cache-dir <dir> --gold <gold.json>...
+--windows <dump dir>... --out-dir <dir>` is the glimpse sensor's ceiling test:
+on the images' windows from an `evaluate --dump-occlusion` run (one dump
+directory per gold file), it fine-tunes the glimpse path on windows labelled
+from the gold boxes, k-fold by image (`--folds`, `--steps`, `--images-per-step`,
+`--windows-per-image`, `--lr`), and dumps the held-out windows' scores as
+`evaluate --dump-occlusion` does. `soak-locality` runs the locality term's step
+and backward over and over on random input and prints device memory, to find a
+leak.
 
 **Status panel.** In a terminal, `train` shows a full-width panel: phase,
 epoch and whole-run progress with time left and finish times, speed, loss
@@ -680,9 +780,11 @@ epoch and whole-run progress with time left and finish times, speed, loss
 evaluation and recent events. Below that are line charts: the loss over the
 whole run (2,000-step means, saved to `loss_history.json` with each checkpoint
 so a resume keeps it), and, once evaluations exist, held-out mAP, gold
-pointing, "blanked object still called", the two context gaps and
-exclusive-tag violations at every epoch and snapshot evaluation (see
-`--snapshot-evaluation-steps` below), each with its latest change.
+and gold-small pointing (beside the loss, in the first row), exclusive-tag violations,
+the occlusion object effect (gold and gold-small), the two context gaps and the
+labelled context negatives' log-odds (absent and untagged) at every epoch and
+snapshot evaluation (see `--snapshot-evaluation-steps` below), each with its latest
+change. In a narrow panel the title drops "lower is better", then the change's step.
 
 In a terminal that shows Sixel images (Konsole, xterm, WezTerm, foot, or tmux
 3.4+ built with sixel, which tmux reports per client), those charts are real
@@ -690,7 +792,10 @@ graphics: the trainer switches to the alternate screen, keeps the panel in the
 top rows and draws the charts as one image below it, redrawn only when new data
 arrives or the window is resized. `--chart-reference label=dir` (repeatable)
 adds another run's evaluation as a dashed reference line on each chart, e.g.
-`--chart-reference v3-e1=context-check/v3-e1`. `--text-dashboard` keeps the
+`--chart-reference v3-e1=context-check/v3-e1`. `--chart-compare label=checkpoint-dir`
+(repeatable) draws another run's evaluations and loss as curves over this run's steps,
+as `charts --compare` does, re-read every 10 minutes: e.g.
+`--chart-compare "run 4=checkpoint-v4"` beside a fresh run testing a change. `--text-dashboard` keeps the
 all-text panel with braille line charts, which is also what other terminals get.
 With output redirected it prints a one-line summary every 5 minutes.
 
@@ -699,11 +804,19 @@ read it, so this works alongside a running training):
 
 ```sh
 dotnet run --project unbooru-tagger-training -- charts --checkpoint-dir <checkpoint> --watch \
-  [--png charts.png] [--reference label=report-dir ...]
+  [--png charts.png] [--reference label=report-dir ...] [--compare label=checkpoint-dir ...]
 ```
 
 `--watch` redraws whenever a checkpoint save or a finished evaluation changes
 the data; `--png` also (or, with output redirected, only) writes the image.
+`--compare` draws another run's evaluations and smoothed loss as curves over
+this run's steps (e.g. `--compare "run 4=checkpoint-v4"` beside a fresh run
+testing a change).
+
+`--validation-split-seed <n>` makes a fresh run hold out the same images as
+another: pass that run's `ValidationSplitSeed` from its `training_progress.json`.
+A fresh run otherwise picks a random split, and checks drawn from one run's
+held-out images (gold-small, `--context-check`) are then mostly training data.
 
 `--validation-max-images` caps how many held-out images that uses
 (default 0 = all). To measure any existing checkpoint the same way, and
@@ -729,15 +842,75 @@ images:
 With `--gold <gold.json>`, it also scores against hand-checked boxes:
 pointing accuracy, heatmap energy inside the boxes, and box
 precision/recall/count error. It also runs an **occlusion** check: blank a
-found tag's gold boxes and see whether the classifier still calls it,
-against a control that blanks the same sizes elsewhere.
+tag's gold boxes and see whether the classifier still calls it, against a
+control that blanks the same sizes elsewhere. Its main number is the
+**object effect**: the mean logit with the control blanked minus the logit
+with the object blanked, over every gold pair (higher means the object
+matters more). "Still called with the object blanked" counts only pairs found
+at p ≥ 0.5, so it is much noisier. The object effect is a difference, so a
+model that learned "any blank lowers scores" isn't caught by it: read it with
+the control drop (the score's fall with the control blanked), on a fill the
+model never trained with. Options:
+- `--gold-small <gold.json>` scores a second gold set into
+  `localization_report_small.json`.
+- `--dump-occlusion` writes each pair's scores to `occlusion_pairs.jsonl`
+  (`occlusion_pairs_small.jsonl` for gold-small).
+- `--occlusion-fill zero|mean|noise` (default `zero`) sets what blanked boxes
+  are filled with, to check that a gain isn't tied to one kind of blank.
+- `--dump-scores tag1,tag2,...` writes `scores.jsonl`: every held-out image's
+  tags and its probability for each listed tag, to look at one tag's false
+  positives and misses.
+- `--map-score-temperature T` also runs the check with localizable tags
+  scored from the localization map (off by default; it is slow).
 
-Two more checks of whether tags are found from the object or from context
+Whole-image scores in the gold checks are pooled over the image's content,
+not the letterbox bars, as in training. `evaluate` prints how long each phase
+took.
+
+More checks of whether tags are found from the object or from context
 go into `evaluation_report.json` and are printed by `evaluate`:
 - **Context reliance:** each held-out image's prior for a tag is the highest
   P(tag | its character/artist/series) in training. Recall and
   false-positive rate are compared across prior bands; gaps near 0 mean the
-  object is what's seen.
+  object is what's seen. Many of the high-prior "negatives" show the object
+  untagged, so the false-positive gap also rises as the model gets better at
+  finding untagged objects.
+- **Labelled context negatives** (`--context-check <file>`): high-prior
+  negatives checked by eye, each marked `absent` or `present` (visible but
+  untagged), as a JSON list of `{cacheIndex, tag, label}`. For the ones among
+  the held-out images it reports how often the tag is called (at its
+  calibrated threshold) where the object is absent (true context false
+  positives) and where it's visible, and the mean log-odds past the threshold
+  for each. The dashboard charts the mean log-odds, not the rates: about 200
+  pairs, called at thresholds recalibrated every evaluation, flip by points.
+
+**Glimpses** (`--classification-glimpses`, fresh runs only; off by default;
+run 5, `train-v5.sh`): localizable tags are scored from close looks the model
+chooses, so an object tag can't be read off the character. A proposal head on
+the whole-image embedding ranks what the image might hold; the localization
+map gives each suspect's peak; a glimpse sensor looks there at 32, 64, 128 and
+256px (64px views, a learned code per zoom); the views are pooled by a
+log-sum-exp at `--classification-pooling-temperature`. Training, `evaluate`
+and inference all choose the windows the same way.
+- `--glimpses-per-image` (16; run 5 uses 48): windows per image, saved in
+  `model_config.json` so evaluation looks as much as training did.
+- `--glimpse-proposal-weight` (1): the proposal head's loss, on every
+  localizable tag.
+- `--glimpse-unframed-positive-weight` (0): the glimpse loss's weight for a
+  labelled positive none of the chosen windows looks at closely.
+- `--glimpse-label-framing-steps` (0; run 5 uses 20,000): a fresh run's
+  warm-up, giving a share of the windows (half at step 0, none from this step)
+  to labelled positives while the map can't point yet.
+
+Not exported to ONNX. `evaluate --glimpse-grid` scores a fixed grid of 378
+windows instead (as the deleted first glimpse run did; about 6x a
+whole-image pass). `glimpse-frames --checkpoint-dir <dir> --cache-dir <dir>
+--gold gold/gold.json [--counts 16 32 48]` measures the window choice
+against the gold boxes on any checkpoint with a localization map. It
+reports how many gold tags the proposals rank highly, whether the sensor
+at a tag's peak holds its box, and how many tags each window budget frames.
+`evaluate --precision fp32|tf32|bf16` sets the tower's arithmetic for an
+evaluation (bf16 wasn't faster on the A4000).
 - **Exclusive violations:** which mutually exclusive pairs fired together,
   and which side the image actually carries. `--embeddings-cache <file>` saves held-out
 embeddings so re-evaluating the same checkpoint skips the slow embedding

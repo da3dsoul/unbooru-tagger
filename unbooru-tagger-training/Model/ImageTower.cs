@@ -36,6 +36,33 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
     public readonly Conv2d Projection;
     public readonly ModuleList<Conv2d> Laterals;
 
+    /// <summary>
+    /// With <see cref="ClassificationGlimpses"/>, one learned code per <see cref="Glimpses.Zooms"/> entry, added to a
+    /// glimpse's pooled embedding so a tag can tell a 32px window enlarged from a 256px one shrunk; null otherwise.
+    /// </summary>
+    public readonly Parameter? GlimpseZoomCodes;
+
+    /// <summary>
+    /// With <see cref="ClassificationGlimpses"/>, [D, D]: the whole-image proposal head (<see cref="Proposals"/>). Starts as
+    /// the identity. Null otherwise.
+    /// </summary>
+    public readonly Parameter? ProposalWeights;
+
+    /// <summary>
+    /// The whole-image embedding through the proposal head ([B, D]): its dot product with a localizable tag says whether the
+    /// image might hold that tag, from everything in view, context included. That only decides where the glimpses look
+    /// (<see cref="Glimpses.Propose"/>); the tag's score comes from the glimpses. A head of its own, so suspecting gloves
+    /// from the character doesn't pull the gloves embedding the glimpses are scored with towards the character.
+    /// </summary>
+    public Tensor Proposals(Tensor pooled) => pooled.matmul(ProposalWeights!.t());
+
+    /// <summary>
+    /// Localizable tags are scored from zoomed glimpses of the image (<see cref="Glimpses"/>) instead of the whole map, at
+    /// <see cref="ClassificationPoolingTemperature"/>. A weight change (it adds <see cref="GlimpseZoomCodes"/>), so it is
+    /// set when the tower is built: a fresh run, saved in the model config.
+    /// </summary>
+    public bool ClassificationGlimpses => GlimpseZoomCodes is not null;
+
     public int EmbeddingDim { get; }
     public int StemChannels { get; }
     public int[] StageChannels { get; }
@@ -96,14 +123,111 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
     public float ClassificationPoolingTemperature { get; set; }
 
     /// <summary>
+    /// Above 0, the pooled localizable tags' score is the mean of their <c>k</c> highest per-window (or per-cell) dots instead
+    /// of the log-sum-exp (<see cref="ClassificationPooling.Pool(Tensor, Tensor, float, int)"/>): only those windows get a
+    /// gradient, so a "yes" trains the windows that show the tag and a "no" the ones that fire for it. Not a weight change;
+    /// saved in the model config, and evaluation must score the same way.
+    /// </summary>
+    public int ClassificationPoolingTopK { get; set; }
+
+    /// <summary>
+    /// WILDCAT's negative evidence (Durand et al. 2017) with <see cref="ClassificationPoolingTopK"/>: this weight times the mean
+    /// of the k lowest windows' dots is added to the top-k mean, so a window where the tag clearly isn't counts too. 0 = off.
+    /// </summary>
+    public float ClassificationPoolingBottomWeight { get; set; }
+
+    /// <summary>
+    /// The glimpse zooms (<see cref="Glimpses.Zooms"/> indices below this) whose windows score localizable tags; the rest are
+    /// still chosen and embedded but don't pool. 3 leaves out the 256px window, which holds a quarter of the image and with it
+    /// the character (Saccader and GFNet keep their classifier to about a third of the image side). Saved in the model config.
+    /// </summary>
+    public int GlimpsePoolZooms { get; set; } = Glimpses.Zooms.Length;
+
+    /// <summary>
+    /// The smallest glimpse zoom (<see cref="Glimpses.Zooms"/> index) whose windows score localizable tags; 1 leaves out the 32px
+    /// window, whose embeddings held the least of any zoom on the gold set (2026-11-02 probes). Saved in the model config.
+    /// </summary>
+    public int GlimpsePoolMinZoom { get; set; }
+
+    /// <summary>
+    /// Singh et al. 2020's feature split on the glimpse embedding: its first this many dimensions are the object half, the rest
+    /// the context half. Where a localizable tag is a positive and the image carries none of its context sources (the
+    /// character/costume/artist usually seen with it: an exclusive image), training scores it with the context half held at its
+    /// running mean (<see cref="GlimpseContextMean"/>) and without gradient there, so the object half has to carry those calls.
+    /// 0 = off. Saved in the model config.
+    /// </summary>
+    public int GlimpseObjectDims { get; set; }
+
+    /// <summary>The context half's running mean over training glimpses (<see cref="GlimpseObjectDims"/>); saved in the model config.</summary>
+    public float[]? GlimpseContextMean { get; set; }
+
+    /// <summary>
+    /// Evaluation only, not saved: glimpses score with the context half replaced by <see cref="GlimpseContextMean"/>, as training
+    /// scores exclusive images, so a tag's call comes from the object half alone (a per-tag constant shift, which pooling keeps).
+    /// </summary>
+    public bool GlimpseObjectOnly { get; set; }
+
+    /// <summary>
+    /// A separate tower that embeds the glimpses (<see cref="Glimpses.Embed(ImageTower, Tensor, Tensor, GlimpseChoice, int)"/>)
+    /// in place of this one: same shape, its own weights (copied from this tower when first made, <see cref="CopyForGlimpses"/>),
+    /// its own optimizer and file (<c>glimpse_tower.dat</c>). The 2026-11-02 gold probes found every window's embedding near
+    /// its whole image's (cosine ~0.85) and objects such as gloves unreadable at any zoom, so this tests whether sharing the
+    /// 512px path's weights is what keeps a 64px crop from encoding its object (RA-CNN gives each scale its own parameters).
+    /// Not a registered submodule: <see cref="Module.parameters"/>, saving and the main optimizer leave it out. Null = glimpses
+    /// use this tower. The zoom codes and the proposal head stay here.
+    /// </summary>
+    public ImageTower? GlimpseTower { get; set; }
+
+    /// <summary>A new tower of this one's shape (no glimpse codes or proposal head) with a copy of its weights, for <see cref="GlimpseTower"/>.</summary>
+    public ImageTower CopyForGlimpses()
+    {
+        var device = Projection.weight!.device;
+        var copy = new ImageTower(EmbeddingDim, StemChannels, StageChannels, BlocksPerStage, device, FusedStages)
+        {
+            LocalizationFromFusedOnly = LocalizationFromFusedOnly,
+            LocalizationSkippedLaterals = LocalizationSkippedLaterals,
+        };
+        var source = named_parameters().ToDictionary(p => p.name, p => p.parameter);
+        using (no_grad())
+        {
+            foreach (var (name, parameter) in copy.named_parameters())
+                parameter.copy_(source[name]);
+            var buffers = named_buffers().ToDictionary(b => b.name, b => b.buffer);
+            foreach (var (name, buffer) in copy.named_buffers())
+                buffer.copy_(buffers[name]);
+        }
+        return copy;
+    }
+
+    /// <summary>
     /// The dtype the trunk, projection and laterals compute in (<see cref="MixedPrecision"/>); null = the weights'
     /// own (fp32). The weights stay fp32 either way and both maps come out fp32, so everything downstream (tag scores,
     /// losses, pooling) is unchanged. Not a weight change: it can be switched when resuming.
     /// </summary>
     public ScalarType? ComputeType { get; set; }
 
+    /// <summary>
+    /// Run the trunk channels-last (NHWC memory order, the same NCHW shapes and values): each ConvNeXt block's MLP then
+    /// reads its rows without a copy and its residual add is contiguous (<see cref="MixedPrecision.Norm"/> keeps the order).
+    /// The stage outputs the laterals and projection read are put back in NCHW order once, so the maps come out as before.
+    /// Not a weight change.
+    /// </summary>
+    public bool ChannelsLast { get; set; }
+
     /// <summary>How training anneals <see cref="ClassificationPoolingTemperature"/>; null = held fixed.</summary>
     public ClassificationPooling.Schedule? ClassificationPoolingSchedule { get; set; }
+
+    /// <summary>
+    /// With <see cref="ClassificationGlimpses"/>, the windows per image the model chooses to look at (<see cref="Glimpses.Propose"/>),
+    /// in training and evaluation alike. Not a weight change; saved with the checkpoint so evaluation looks as much as training did.
+    /// </summary>
+    public int GlimpseCount { get; set; } = 16;
+
+    /// <summary>
+    /// Evaluation only: score every window of the grid (<see cref="Glimpses.Layout"/>) instead of the model's chosen ones, as
+    /// evaluations did before 2026-10-31, to compare with them. Not saved.
+    /// </summary>
+    public bool GlimpseGrid { get; set; }
 
     /// <summary>Input pixels per spatial-map cell: the stem's stride, x2 per downsampling stage, /2 per fused stage.</summary>
     public int OutputStride { get; }
@@ -111,7 +235,8 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
     /// <summary>Index into <see cref="Layers"/> of each stage's last layer — where fusion taps stage outputs.</summary>
     private readonly int[] _stageEnds;
 
-    public ImageTower(int embeddingDim, int stemChannels = 64, int[]? stageChannels = null, int[]? blocksPerStage = null, Device? device = null, int fusedStages = 0)
+    public ImageTower(int embeddingDim, int stemChannels = 64, int[]? stageChannels = null, int[]? blocksPerStage = null, Device? device = null, int fusedStages = 0,
+        bool classificationGlimpses = false)
         : base(nameof(ImageTower))
     {
         stageChannels ??= [64, 128, 256];
@@ -167,6 +292,11 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
         Laterals = ModuleList(Enumerable.Range(1, fusedStages)
             .Select(k => Conv2d(stageChannels[stageChannels.Length - 1 - k], embeddingDim, kernel_size: 1, device: device))
             .ToArray());
+        if (classificationGlimpses)
+        {
+            GlimpseZoomCodes = new Parameter(zeros(Glimpses.Zooms.Length, embeddingDim, device: device));
+            ProposalWeights = new Parameter(eye(embeddingDim, device: device));
+        }
 
         RegisterComponents();
     }
@@ -224,16 +354,17 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
     /// <summary>Stem and stages: each stage's output, and the last one in <paramref name="last"/>.</summary>
     private Tensor[] Trunk(Tensor input, out Tensor last)
     {
-        var x = MixedPrecision.Conv(Stem, ComputeType is { } computeType && computeType != input.dtype ? input.to_type(computeType) : input);
+        var typed = ComputeType is { } computeType && computeType != input.dtype ? input.to_type(computeType) : input;
+        var x = MixedPrecision.Conv(Stem, ChannelsLast ? MixedPrecision.ToChannelsLast(typed) : typed);
         var stageOutputs = new Tensor[StageChannels.Length];
         var nextStage = 0;
         for (var i = 0; i < Layers.Count; i++)
         {
             x = MixedPrecision.Layer(Layers[i], x);
             if (nextStage < _stageEnds.Length && i == _stageEnds[nextStage])
-                stageOutputs[nextStage++] = x;
+                stageOutputs[nextStage++] = ChannelsLast ? x.contiguous() : x;
         }
-        last = x;
+        last = ChannelsLast ? x.contiguous() : x;
         return stageOutputs;
     }
 
@@ -284,6 +415,42 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
         scope.MoveToOuter(pooled);
         scope.MoveToOuter(localization);
         return (pooled, localization);
+    }
+
+    /// <summary>
+    /// <see cref="ForwardPooled"/>'s pooled embedding alone, as glimpses need it. The projection and laterals are 1x1
+    /// convolutions, so each level's masked sum is taken over its input features (at most the last stage's channels, over a
+    /// few cells) and projected afterwards: <c>Σ mask · (W f + b) = W (Σ mask · f) + b Σ mask</c>. That skips building every
+    /// level's embedding-wide map and the localization chain, which the glimpses never use. Falls back to
+    /// <see cref="ForwardPooled"/> when that one isn't exact either (a map size that isn't a power-of-two multiple).
+    /// </summary>
+    public Tensor ForwardPooledOnly(Tensor input, Tensor mask)
+    {
+        using var scope = NewDisposeScope();
+        var stageOutputs = Trunk(input, out var x);
+        Tensor LevelInput(int k) => k == 0 ? x : stageOutputs[StageChannels.Length - 1 - k];
+        var exact = LocalizationFromFusedOnly && Enumerable.Range(0, FusedStages + 1).All(k =>
+            LevelInput(k).shape[2] << (FusedStages - k) == mask.shape[2] && LevelInput(k).shape[3] << (FusedStages - k) == mask.shape[3]);
+        if (!exact)
+        {
+            var pooledFallback = ForwardPooled(input, mask).Pooled;
+            return pooledFallback.MoveToOuterDisposeScope();
+        }
+
+        Tensor? weightedSum = null;
+        for (var k = 0; k <= FusedStages; k++)
+        {
+            var conv = k == 0 ? Projection : Laterals[k - 1];
+            var factor = 1L << (FusedStages - k);
+            var blockMask = factor == 1 ? mask : functional.avg_pool2d(mask, factor) * (factor * factor); // fine cells per cell
+            var summed = (ToFloat32(LevelInput(k)) * blockMask).sum([2, 3]); // [B, C_k]
+            var term = summed.matmul(conv.weight!.flatten(1).t());
+            if (conv.bias is { } bias)
+                term = term + blockMask.sum([1, 2, 3]).unsqueeze(1) * bias;
+            weightedSum = weightedSum is null ? term : weightedSum + term;
+        }
+        var pooled = weightedSum! / mask.sum([2, 3]).clamp_min(1e-6);
+        return pooled.MoveToOuterDisposeScope();
     }
 
     /// <summary>

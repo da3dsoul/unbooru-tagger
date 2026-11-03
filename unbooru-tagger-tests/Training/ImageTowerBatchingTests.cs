@@ -116,4 +116,30 @@ public class ImageTowerBatchingTests
         for (var i = 0; i < direct.Length; i++)
             Assert.True(direct[i].allclose(viaFullMap[i], rtol: 1e-3, atol: 1e-6), $"parameter {i} differs");
     }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)] // not exact: falls back to ForwardPooled
+    public void ForwardPooledOnly_EqualsForwardPooledsPooledEmbedding_WithItsGradients(bool fusedOnly)
+    {
+        var tower = Tower();
+        tower.LocalizationFromFusedOnly = fusedOnly;
+        using var images = randn(3, 3, 64, 64);
+        using var mask = Mask();
+
+        Tensor[] Gradients(Func<Tensor> forward, out Tensor pooled)
+        {
+            tower.zero_grad();
+            pooled = forward();
+            pooled.square().sum().backward();
+            return tower.parameters().Select(p => p.grad?.clone() ?? zeros(p.shape)).ToArray();
+        }
+
+        var only = Gradients(() => tower.ForwardPooledOnly(images, mask), out var pooled);
+        var full = Gradients(() => tower.ForwardPooled(images, mask).Pooled, out var expected);
+
+        Assert.True(pooled.allclose(expected, rtol: 1e-4, atol: 1e-5), "pooled differs");
+        for (var i = 0; i < only.Length; i++)
+            Assert.True(only[i].allclose(full[i], rtol: 1e-3, atol: 1e-6), $"parameter {i} differs");
+    }
 }

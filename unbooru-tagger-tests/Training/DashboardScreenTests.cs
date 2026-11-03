@@ -14,7 +14,7 @@ public class DashboardScreenTests
         var dashboard = new TrainingDashboard(Info);
         dashboard.AddEvaluationPoint(new EvaluationPoint(190_000, false, 0.40, 0.29, 0.056, 0.107, 0.86, 0.27));
         var output = new StringWriter();
-        using (var screen = new DashboardScreen(dashboard, output, size: () => (120, 50), cell: (8, 15)))
+        using (var screen = new DashboardScreen(dashboard, output, size: () => (120, 50), cell: () => (8, 15)))
         {
             screen.Draw();
             var first = output.ToString();
@@ -43,7 +43,7 @@ public class DashboardScreenTests
         var dashboard = new TrainingDashboard(Info);
         dashboard.AddEvaluationPoint(new EvaluationPoint(190_000, false, 0.40, 0.29, 0.056, 0.107, 0.86, 0.27));
         var output = new StringWriter();
-        using var screen = new DashboardScreen(dashboard, output, size: () => (120, 50), cell: (8, 15));
+        using var screen = new DashboardScreen(dashboard, output, size: () => (120, 50), cell: () => (8, 15));
         screen.Draw();
         var text = output.ToString();
 
@@ -60,6 +60,28 @@ public class DashboardScreenTests
         // Two rows stay free under the image: the cursor moving below it must not scroll the screen.
         Assert.True(lastImageRow <= 48, $"image rows {imageRow}..{lastImageRow} come within two rows of the bottom");
         Assert.True(imageRow > panelRows.Max(), "the image starts below the panel");
+    }
+
+    [Fact]
+    public void CellSize_IsMeasuredAgain_WhenTheTerminalResizes()
+    {
+        // A trainer started in a detached tmux session measures the default cell (8x16); attaching resizes the terminal and
+        // reports the real one (8x15). The image must be redrawn for the real cell, or it runs past its rows.
+        var dashboard = new TrainingDashboard(Info);
+        dashboard.AddEvaluationPoint(new EvaluationPoint(190_000, false, 0.40, 0.29, 0.056, 0.107, 0.86, 0.27));
+        var output = new StringWriter();
+        var (size, cell) = ((80, 24), (8, 16));
+        using var screen = new DashboardScreen(dashboard, output, size: () => size, cell: () => cell);
+        screen.Draw();
+
+        (size, cell) = ((120, 50), (8, 15));
+        output.GetStringBuilder().Clear();
+        screen.Draw();
+
+        var header = System.Text.RegularExpressions.Regex.Match(output.ToString(), "\"1;1;(\\d+);(\\d+)");
+        Assert.True(header.Success);
+        var imageRow = int.Parse(System.Text.RegularExpressions.Regex.Match(output.ToString(), @"\u001b\[(\d+);1H\u001bP").Groups[1].Value);
+        Assert.True(imageRow + (int.Parse(header.Groups[2].Value) + 14) / 15 - 1 <= 48, "the image fits the rows at the real cell height");
     }
 
     private static IEnumerable<int> Sixels(string text)

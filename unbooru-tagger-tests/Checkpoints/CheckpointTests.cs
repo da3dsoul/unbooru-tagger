@@ -37,6 +37,68 @@ public class CheckpointTests
         }
     }
 
+    [Fact]
+    public void SaveThenLoad_RoundTripsTheGlimpseFeatureSplit()
+    {
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var imageTower = new ImageTower(EmbeddingDim, 4, [4, 8], [1, 1], fusedStages: 1, classificationGlimpses: true)
+            {
+                GlimpseObjectDims = EmbeddingDim / 2,
+                GlimpseContextMean = Enumerable.Range(0, EmbeddingDim - EmbeddingDim / 2).Select(i => i * 0.5f).ToArray(),
+            };
+            var vocabulary = TagVocabulary.CreateEmpty();
+            vocabulary.AddTag("solo");
+            var embeddings = TagEmbeddingStore.CreateEmpty(EmbeddingDim);
+            embeddings.AppendRow(new float[EmbeddingDim]);
+
+            Checkpoint.Save(directory, imageTower, ModelConfig.From(imageTower, 32), vocabulary, embeddings, new LogitScaleBias());
+            var (loaded, _, _, _, _) = Checkpoint.Load(directory);
+
+            Assert.Equal(EmbeddingDim / 2, loaded.GlimpseObjectDims);
+            Assert.Equal(imageTower.GlimpseContextMean, loaded.GlimpseContextMean);
+            Assert.False(loaded.GlimpseObjectOnly); // an evaluation switch, not saved
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SaveThenLoad_RoundTripsASeparateGlimpseTower()
+    {
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var config = new ModelConfig(EmbeddingDim, InputSize: 32, StemChannels: 4, StageChannels: [4, 8], BlocksPerStage: [1, 1], FusedStages: 1, ClassificationGlimpses: true);
+            var imageTower = new ImageTower(config.EmbeddingDim, config.StemChannels, config.StageChannels, config.BlocksPerStage, fusedStages: 1, classificationGlimpses: true);
+            imageTower.GlimpseTower = imageTower.CopyForGlimpses();
+            using (TorchSharp.torch.no_grad())
+                imageTower.GlimpseTower.Projection.weight!.add_(1f); // so it differs from the main tower
+            var vocabulary = TagVocabulary.CreateEmpty();
+            vocabulary.AddTag("solo");
+            var embeddings = TagEmbeddingStore.CreateEmpty(EmbeddingDim);
+            embeddings.AppendRow(new float[EmbeddingDim]);
+
+            Checkpoint.Save(directory, imageTower, config, vocabulary, embeddings, new LogitScaleBias());
+            var (loaded, _, _, _, _) = Checkpoint.Load(directory);
+
+            Assert.True(Checkpoint.HasGlimpseTower(directory));
+            Assert.NotNull(loaded.GlimpseTower);
+            Assert.True(loaded.GlimpseTower!.Projection.weight!.allclose(imageTower.GlimpseTower.Projection.weight!));
+            Assert.True(loaded.Projection.weight!.allclose(imageTower.Projection.weight!));
+            Assert.False(loaded.Projection.weight!.allclose(loaded.GlimpseTower.Projection.weight!));
+            // The main tower's own file doesn't carry it.
+            Assert.DoesNotContain(loaded.named_parameters(), p => p.name.Contains("GlimpseTower"));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
     /// <summary>
     /// A checkpoint written before <see cref="LogitScaleBias"/> existed has every other
     /// file but not <c>logit_scale_bias.dat</c> — resuming it must still succeed, just

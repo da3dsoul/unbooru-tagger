@@ -33,4 +33,7 @@ public sealed class LogitScaleBias : Module<Tensor, Tensor>
     public LogitScaling ToLogitScaling() => new(Scale, Bias);
 
     public override Tensor forward(Tensor logits) => logits * _logScale.exp() + _bias;
+
+    /// <summary>The same, with no gradient into the scale and bias (a loss that should move the embeddings only).</summary>
+    public Tensor ForwardDetached(Tensor logits) => logits * _logScale.detach().exp() + _bias.detach();
 }

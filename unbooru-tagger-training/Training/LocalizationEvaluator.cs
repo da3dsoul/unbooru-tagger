@@ -64,7 +64,31 @@ public sealed record LocalizationReport(
     IReadOnlyList<OcclusionResult>? Occlusion = null,
     IReadOnlyList<OcclusionResult>? OcclusionTags = null,
     IReadOnlyList<OcclusionResult>? MapOcclusion = null,
-    IReadOnlyList<OcclusionResult>? MapOcclusionTags = null);
+    IReadOnlyList<OcclusionResult>? MapOcclusionTags = null,
+    IReadOnlyList<GlimpseFunnelResult>? GlimpseFunnel = null);
+
+/// <summary>
+/// The glimpse funnel on the gold set, for a glimpse checkpoint (<see cref="Glimpses"/>): where a labelled object is lost
+/// between the model suspecting it and calling it. Over the localizable (image, tag) pairs with a certain or group box.
+/// </summary>
+/// <param name="Suspected">The tag is among the proposal head's top <see cref="ImageTower.GlimpseCount"/>, the tags
+/// <see cref="Glimpses.Propose"/> places windows for (in rank order, so only the first dozen or so get any).</param>
+/// <param name="PeakFramed">A chosen close window (128px or smaller) is a look at the tag's own map peak
+/// (<see cref="Glimpses.Frames"/>): what training's "framed" share counts, which says nothing of where the object is.</param>
+/// <param name="Covered">A chosen close window, chosen for any tag, holds at least half of one of the tag's gold boxes, or
+/// lies at least half inside one (<see cref="LocalizationEvaluator.Covers"/>): the model looked at the object.</param>
+/// <param name="BestOnObject">The tag's highest-scoring glimpse, at any zoom, covers a gold box the same way: the score
+/// was decided from the object.</param>
+/// <param name="WindowsOnObject">The mean share of an image's glimpses that cover one of the tag's gold boxes: what
+/// <paramref name="BestOnObject"/> would be if the best glimpse were a random one.</param>
+/// <param name="BestZoom">Which zoom the tag's highest-scoring glimpse is, as shares in <see cref="Glimpses.Zooms"/> order
+/// (32, 64, 128, 256px windows).</param>
+/// <param name="Called">The tag's glimpse score is at least 0.5.</param>
+/// <param name="CalledWhenCovered">Called, over the covered pairs.</param>
+/// <param name="CalledWhenNotCovered">Called, over the pairs no close window covered.</param>
+public sealed record GlimpseFunnelResult(
+    string Name, int Pairs, double Suspected, double PeakFramed, double Covered, double BestOnObject, double Called,
+    double CalledWhenCovered, double CalledWhenNotCovered, double WindowsOnObject = double.NaN, double[]? BestZoom = null);
 
 /// <summary>
 /// Does a whole-image call depend on the object itself? For each gold pair the classifier finds
@@ -78,7 +102,33 @@ public sealed record LocalizationReport(
 /// <param name="ObjectDrop">Mean drop in confidence from blanking the object.</param>
 /// <param name="ControlDrop">Mean drop from blanking the same area elsewhere.</param>
 /// <param name="WinRate">Fraction of pairs where blanking the object dropped confidence more than the control (0.5 = the object doesn't matter).</param>
-public sealed record OcclusionResult(string Name, int Pairs, double StillYesRate, double ObjectDrop, double ControlDrop, double WinRate);
+/// <param name="ScoredPairs">Every gold pair both blanks fit in, found on the full image or not: a fixed set, where <paramref name="Pairs"/> moves with the model's calibration.</param>
+/// <param name="ObjectEffect">
+/// Mean over <paramref name="ScoredPairs"/> of logit(control blanked) − logit(object blanked): how much more the object counts than
+/// the same area elsewhere, in log-odds. Threshold-free, so unlike <paramref name="StillYesRate"/> it doesn't jump when scores near
+/// 0.5 move a little (a quarter of the found pairs change between checkpoints 4,500 steps apart). Higher is better; 0 = the object
+/// doesn't matter.
+/// </param>
+/// <param name="ObjectEffectMedian">Its median.</param>
+public sealed record OcclusionResult(
+    string Name, int Pairs, double StillYesRate, double ObjectDrop, double ControlDrop, double WinRate,
+    int ScoredPairs = 0, double ObjectEffect = double.NaN, double ObjectEffectMedian = double.NaN);
+
+/// <summary>One gold pair of the (pooled) occlusion check: the confidence on the full image, with the object blanked, and with the control blanked.</summary>
+public sealed record OcclusionPair(int CacheIndex, string Tag, string Stratum, string Size, float Full, float Occluded, float Control);
+
+/// <summary>
+/// One labelled localizable gold pair as the glimpse funnel saw it: its gold boxes and every chosen window ([zoom, x, y, side]
+/// on the canvas) with the tag's logit there, the pooled probability, and how many localizable tags the proposal head ranks above it.
+/// </summary>
+/// <summary>
+/// One gold image's chosen windows ([zoom, x, y, side]) with their glimpse embeddings (zoom code included, as the tags see them;
+/// base64 little-endian float32, window-major, <c>Dim</c> per window) and the image's pooled whole-image embedding: for probing
+/// whether a window's embedding holds the object at all, independently of the tag rows.
+/// </summary>
+public sealed record GlimpseEmbeddings(int CacheIndex, int Dim, int[][] Windows, string Embeddings, string Pooled);
+
+public sealed record GlimpsePair(int CacheIndex, string Tag, string Stratum, string Size, int[][] Boxes, int[][] Windows, float[] Logits, float Probability, int ProposalRank);
 
 /// <summary>
 /// How reliable the whole-image classifier is as a teacher for crop consistency
@@ -126,6 +176,25 @@ public sealed class LocalizationEvaluator(
     /// </summary>
     public float? MapScoreTemperature { get; init; }
 
+    /// <summary>With a list, every pair of the pooled occlusion check is added to it (<c>evaluate --dump-occlusion</c>).</summary>
+    public List<OcclusionPair>? OcclusionPairs { get; init; }
+
+    /// <summary>When set, the glimpse funnel adds each gold pair's windows and logits here (<c>evaluate --dump-occlusion</c>).</summary>
+    public List<GlimpsePair>? GlimpsePairs { get; init; }
+
+    /// <summary>With <see cref="GlimpsePairs"/>, each gold image's window embeddings (<c>evaluate --dump-occlusion</c>).</summary>
+    public List<GlimpseEmbeddings>? GlimpseEmbeddingDump { get; init; }
+
+    /// <summary>
+    /// Whether the gold checks include the crop teacher (<see cref="LocalizationReport.Teacher"/>). It only says whether
+    /// crop consistency (<c>--crop-teacher-*</c>) may trust the classifier, and costs ~40% of a glimpse checkpoint's gold
+    /// checks (each crop is a full pass with its own glimpses); <c>evaluate --no-crop-teacher</c> leaves it out.
+    /// </summary>
+    public bool CropTeacher { get; init; } = true;
+
+    /// <summary>What the occlusion check fills blanked rectangles with (<see cref="Training.OcclusionFill"/>).</summary>
+    public OcclusionFill OcclusionFill { get; init; } = OcclusionFill.Zero;
+
     // One instance per person — on a solo image, exactly one box is right.
     public static readonly string[] OncePerPersonTags = ["blush", "necktie", "hat", "choker", "scarf", "glasses", "headphones", "halo"];
 
@@ -156,6 +225,59 @@ public sealed class LocalizationEvaluator(
         return images;
     }
 
+    /// <summary>
+    /// The gold set read through tag families (<see cref="TagFamilies"/>), as training reads labels:
+    /// <list type="bullet">
+    /// <item>a box of a kind is also a box of everything it is a kind of (a boots box is a shoes box), and that
+    /// parent becomes a target unless the labeler marked it not visible; a parent box already there in the same
+    /// place (IoU ≥ 0.5) isn't doubled;</item>
+    /// <item>a box the labeler drew for the parent alone (shoes, kind not named) is an ignore region for every
+    /// targeted kind of it: a boots call there is neither right nor wrong.</item>
+    /// </list>
+    /// </summary>
+    public static List<GoldImage> ExpandFamilies(IReadOnlyList<GoldImage> gold, TagFamilies families, TagVocabulary vocabulary)
+    {
+        var rowOf = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var record in vocabulary.Records)
+            rowOf[record.Tag] = record.RowIndex;
+        string Name(int row) => vocabulary.GetByRowIndex(row).Tag;
+
+        var expanded = new List<GoldImage>(gold.Count);
+        foreach (var image in gold)
+        {
+            var instances = image.Instances.ToList();
+            var targets = image.Targets.ToList();
+            foreach (var instance in image.Instances)
+            {
+                if (!rowOf.TryGetValue(instance.Tag, out var row))
+                    continue;
+                foreach (var parent in families.KindOf(row).Select(Name))
+                {
+                    if (image.NotVisible.Contains(parent))
+                        continue;
+                    if (!instances.Any(x => x.Tag == parent && IoU(x.Box, instance.Box) >= 0.5))
+                        instances.Add(instance with { Tag = parent });
+                    if (instance.Kind != GoldKind.Ignore && !targets.Contains(parent))
+                        targets.Add(parent);
+                }
+            }
+
+            foreach (var target in image.Targets)
+            {
+                if (!rowOf.TryGetValue(target, out var row))
+                    continue;
+                foreach (var parent in families.FamilyAncestors(row).Select(Name))
+                    foreach (var parentOnly in image.Instances.Where(x => x.Tag == parent))
+                        if (!instances.Any(x => x.Tag == target && IoU(x.Box, parentOnly.Box) >= 0.3))
+                            instances.Add(new GoldInstance(target, parentOnly.Box, GoldKind.Ignore));
+            }
+
+            expanded.Add(image with { Instances = instances, Targets = targets });
+        }
+
+        return expanded;
+    }
+
     private static GoldKind ParseKind(string? kind) => kind?.ToLowerInvariant() switch
     {
         "group" => GoldKind.Group,
@@ -180,12 +302,13 @@ public sealed class LocalizationEvaluator(
         var localizable = vocabulary.Records.Select(r => localizability.IsLocalizable(r.Tag)).ToArray();
 
         var (goldSummary, goldTags) = gold is { Count: > 0 } ? EvaluateGold(gold, rowOf) : ([], []);
-        var (teacherSummary, teacherTags) = gold is { Count: > 0 } ? EvaluateTeacher(gold, rowOf, random) : ([], []);
-        var (occlusionSummary, occlusionTags) = gold is { Count: > 0 } ? EvaluateOcclusion(gold, rowOf, random, (pixels, _) => Forward(pixels).PooledScore, _ => true) : ([], []);
+        var (teacherSummary, teacherTags) = gold is { Count: > 0 } && CropTeacher ? EvaluateTeacher(gold, rowOf, random) : ([], []);
+        var (occlusionSummary, occlusionTags) = gold is { Count: > 0 } ? EvaluateOcclusion(gold, rowOf, random, (pixels, boxes) => Score(pixels, boxes), _ => true, OcclusionPairs) : ([], []);
         // Its own random source: the pooled check and everything after it see the same draws as before.
         var (mapOcclusionSummary, mapOcclusionTags) = gold is { Count: > 0 } && MapScoreTemperature is { } temperature
             ? EvaluateOcclusion(gold, rowOf, new Random(seed + 1), (pixels, boxes) => MapScorer(pixels, boxes, temperature), t => localizable[t])
             : ([], []);
+        var funnel = gold is { Count: > 0 } ? EvaluateGlimpseFunnel(gold, rowOf) : [];
 
         // The label-free checks cost thousands of extra forward passes; training's per-epoch
         // evaluation skips them and scores only the gold set (labelFreeChecks: false).
@@ -213,7 +336,8 @@ public sealed class LocalizationEvaluator(
             goldTags,
             teacherSummary, teacherTags,
             occlusionSummary, occlusionTags,
-            mapOcclusionSummary, mapOcclusionTags);
+            mapOcclusionSummary, mapOcclusionTags,
+            funnel);
     }
 
     /// <summary>Running totals for one tag or stratum.</summary>
@@ -332,7 +456,7 @@ public sealed class LocalizationEvaluator(
                     var tag = tagsPerImage[i][k];
                     var instances = image.Instances.Where(x => x.Tag == tag).ToList();
                     var map = heatmaps[i][k];
-                    var extracted = TagScorer.DetectBoxes(map, 0.5f, 0.6f, boxes[i], inputSize, boxes[i].Width, boxes[i].Height, 0.05f)
+                    var extracted = DetectBoxes(map, boxes[i])
                         .Select(b => new[] { b.X, b.Y, b.Width, b.Height }).ToList();
                     var score = ScorePair(
                         instances, PeakCellCenterInContent(map, boxes[i]),
@@ -404,7 +528,7 @@ public sealed class LocalizationEvaluator(
         {
             using var scope = NewDisposeScope();
             var (pixels, boxes) = Load(chunk.Select(g => g.CacheIndex).ToArray());
-            var (fullScore, _) = Forward(pixels);
+            var fullScore = Score(pixels, boxes);
 
             // (image, tag, window, tag-in-crop) for every crop to score, batched below.
             var crops = new List<(int Image, string Tag, CellWindow Window, bool Contains)>();
@@ -461,11 +585,11 @@ public sealed class LocalizationEvaluator(
                 }
             }
 
-            foreach (var batch in crops.Chunk(8))
+            foreach (var batch in crops.Chunk(ScoreBatch))
             {
                 using var batchScope = NewDisposeScope();
                 var cropPixels = cat(batch.Select(c => UnbooruTagger.Training.Training.CropConsistency.CropPixels(pixels[c.Image..(c.Image + 1)], [c.Window], grid)).ToArray(), 0);
-                var (cropScore, _) = Forward(cropPixels);
+                var cropScore = Score(cropPixels);
                 for (var k = 0; k < batch.Length; k++)
                 {
                     var p = cropScore(k, rowOf[batch[k].Tag]);
@@ -487,13 +611,195 @@ public sealed class LocalizationEvaluator(
         }
     }
 
+    private sealed class FunnelTally
+    {
+        private int _pairs, _suspected, _peakFramed, _covered, _best, _called, _calledCovered, _calledUncovered;
+        private double _windowsOnObject;
+        private readonly int[] _bestZoom = new int[Glimpses.Zooms.Length];
+
+        public void Add(bool suspected, bool peakFramed, bool covered, bool best, bool called, double windowsOnObject, int bestZoom)
+        {
+            _pairs++;
+            _windowsOnObject += windowsOnObject;
+            if (bestZoom >= 0) _bestZoom[bestZoom]++;
+            if (suspected) _suspected++;
+            if (peakFramed) _peakFramed++;
+            if (covered) _covered++;
+            if (best) _best++;
+            if (called) _called++;
+            if (called && covered) _calledCovered++;
+            if (called && !covered) _calledUncovered++;
+        }
+
+        public GlimpseFunnelResult ToResult(string name)
+        {
+            double Rate(int n, int d) => d > 0 ? (double)n / d : double.NaN;
+            return new GlimpseFunnelResult(name, _pairs, Rate(_suspected, _pairs), Rate(_peakFramed, _pairs), Rate(_covered, _pairs),
+                Rate(_best, _pairs), Rate(_called, _pairs), Rate(_calledCovered, _covered), Rate(_calledUncovered, _pairs - _covered),
+                _pairs > 0 ? _windowsOnObject / _pairs : double.NaN, _bestZoom.Select(z => Rate(z, _bestZoom.Sum())).ToArray());
+        }
+    }
+
+    /// <summary>
+    /// <see cref="GlimpseFunnelResult"/> per stratum and size bucket: each gold image's windows chosen as the model chooses
+    /// them (<see cref="Glimpses.Propose"/>, as <see cref="GlimpseForward"/>), its tags' per-glimpse logits and map peaks.
+    /// Empty for a checkpoint without glimpses, or when scoring the whole grid.
+    /// </summary>
+    private List<GlimpseFunnelResult> EvaluateGlimpseFunnel(IReadOnlyList<GoldImage> gold, IReadOnlyDictionary<string, int> rowOf)
+    {
+        if (!imageTower.ClassificationGlimpses || imageTower.GlimpseGrid || imageTower.ClassificationPoolingTemperature <= 0
+            || ClassificationPooledTags is not { } perTag)
+            return [];
+        var temperature = imageTower.ClassificationPoolingTemperature;
+        var close = Glimpses.Zooms.Length - 1;
+        var localizableTags = LocalizableTags();
+        var columnOf = new Dictionary<int, long>();
+        for (var t = 0; t < perTag.Count; t++)
+            if (perTag[t])
+                columnOf[t] = columnOf.Count;
+        var tallies = new Dictionary<string, FunnelTally> { ["all"] = new() };
+        foreach (var chunk in gold.Chunk(16))
+        {
+            var tags = chunk.Select(g => g.Targets
+                .Where(t => !g.NotVisible.Contains(t) && rowOf.TryGetValue(t, out var row) && perTag[row]
+                    && g.Instances.Any(x => x.Tag == t && x.Kind != GoldKind.Ignore))
+                .ToArray()).ToArray();
+            var most = tags.Max(t => t.Length);
+            if (most == 0)
+                continue;
+
+            GlimpseWindow[][] windows;
+            float[] dots, peakX, peakY, ranks;
+            int slots;
+            bool[] valid, pooledValid;
+            using (no_grad())
+            using (NewDisposeScope())
+            {
+                var (pixels, boxes) = Load(chunk.Select(g => g.CacheIndex).ToArray());
+                var (pooled, localization) = imageTower.ForwardPooled(pixels, ContentMask(pixels, boxes));
+                var proposals = imageTower.Proposals(pooled);
+                var contentBoxes = Glimpses.ContentBoxes(boxes, device);
+                var mapMask = SpatialMask.Build(boxes, inputSize, localization.shape[2], localization.shape[3], device);
+                using var choice = Glimpses.Propose(proposals, localization, localizableTags, mapMask, contentBoxes, inputSize, imageTower.OutputStride, imageTower.GlimpseCount);
+                windows = choice.ToWindows();
+                var (cells, validCells) = Glimpses.Embed(imageTower, pixels, contentBoxes, choice); // [B, D, K]
+                slots = (int)cells.shape[2];
+                // Every chosen window (they fill an image's first slots in order), and which of them pool (ImageTower.GlimpsePoolZooms).
+                valid = choice.Valid.cpu().data<bool>().ToArray();
+                pooledValid = validCells.cpu().data<bool>().ToArray();
+                if (GlimpseEmbeddingDump is not null)
+                {
+                    var cellValues = cells.cpu().data<float>().ToArray(); // [B, D, K]
+                    var pooledValues = pooled.cpu().data<float>().ToArray();
+                    for (var i = 0; i < chunk.Length; i++)
+                    {
+                        var windowEmbeddings = new float[windows[i].Length * dim];
+                        for (int s = 0, n = 0; s < slots && n < windows[i].Length; s++)
+                        {
+                            if (!valid[i * slots + s])
+                                continue;
+                            for (var d = 0; d < dim; d++)
+                                windowEmbeddings[n * dim + d] = cellValues[((long)i * dim + d) * slots + s];
+                            n++;
+                        }
+                        GlimpseEmbeddingDump.Add(new GlimpseEmbeddings(chunk[i].CacheIndex, dim,
+                            windows[i].Select(w => new[] { w.Zoom, w.X, w.Y, w.Side }).ToArray(),
+                            Convert.ToBase64String(System.Runtime.InteropServices.MemoryMarshal.AsBytes(windowEmbeddings.AsSpan())),
+                            Convert.ToBase64String(System.Runtime.InteropServices.MemoryMarshal.AsBytes(pooledValues.AsSpan(i * dim, dim)))));
+                    }
+                }
+
+                // Each pair's tag, padded with an image's last one, or any pair's for an image with none (never read).
+                var padded = tags.SelectMany(t => Enumerable.Range(0, most).Select(k => rowOf[t.Length > 0 ? t[Math.Min(k, t.Length - 1)] : tags.First(x => x.Length > 0)[0]])).ToArray();
+                var rows = tensor(padded.Select(r => (long)r).ToArray(), device: device);
+                _deviceTags ??= tensor(tagEmbeddings, [tagEmbeddings.Length / dim, dim]).to(device).DetachFromDisposeScope();
+                var embeddings = _deviceTags.index_select(0, rows).reshape(chunk.Length, most, dim);
+                dots = embeddings.bmm(cells).cpu().data<float>().ToArray(); // [B, T, K]
+                var (x, y) = Glimpses.Peaks(localization, embeddings, mapMask, imageTower.OutputStride);
+                (peakX, peakY) = (x.to_type(ScalarType.Float32).cpu().data<float>().ToArray(), y.to_type(ScalarType.Float32).cpu().data<float>().ToArray());
+                // How many localizable tags the proposal head ranks above each pair's.
+                var scores = proposals.matmul(localizableTags.t()); // [B, L]
+                var own = scores.gather(1, tensor(padded.Select(r => columnOf[r]).ToArray(), device: device).reshape(chunk.Length, most)); // [B, T]
+                ranks = scores.unsqueeze(1).gt(own.unsqueeze(2)).sum(2).to_type(ScalarType.Float32).cpu().data<float>().ToArray();
+            }
+
+            for (var i = 0; i < chunk.Length; i++)
+            {
+                var image = chunk[i];
+                var content = image.Content;
+                for (var k = 0; k < tags[i].Length; k++)
+                {
+                    var tag = tags[i][k];
+                    var instances = image.Instances.Where(x => x.Tag == tag).ToList();
+                    var targets = instances.Where(x => x.Kind != GoldKind.Ignore)
+                        .Select(x => new[] { x.Box[0] + content.X, x.Box[1] + content.Y, x.Box[2], x.Box[3] }).ToList();
+
+                    // The image's windows fill its first slots, in order (Propose's scatter).
+                    var logits = new List<(double Logit, GlimpseWindow Window)>();
+                    var pooledLogits = new List<(double Logit, GlimpseWindow Window)>();
+                    for (var s = 0; s < slots && logits.Count < windows[i].Length; s++)
+                        if (valid[i * slots + s])
+                        {
+                            logits.Add((dots[((long)i * most + k) * slots + s], windows[i][logits.Count]));
+                            if (pooledValid[i * slots + s])
+                                pooledLogits.Add(logits[^1]);
+                        }
+                    var called = false;
+                    var probability = float.NaN;
+                    var best = false;
+                    var bestZoom = -1;
+                    var onObject = logits.Count > 0 ? logits.Count(l => targets.Any(b => Covers(l.Window, b))) / (double)logits.Count : 0;
+                    if (pooledLogits.Count > 0)
+                    {
+                        probability = Sigmoid(scaling.Apply((float)ClassificationPooling.Pool(pooledLogits.Select(l => l.Logit).ToList(), temperature, imageTower.ClassificationPoolingTopK, imageTower.ClassificationPoolingBottomWeight)));
+                        called = probability >= 0.5f;
+                        var top = pooledLogits.MaxBy(l => l.Logit).Window;
+                        best = targets.Any(b => Covers(top, b));
+                        bestZoom = top.Zoom;
+                    }
+                    var covered = windows[i].Any(w => w.Zoom < close && targets.Any(b => Covers(w, b)));
+                    var sensor = Glimpses.Sensor((int)peakX[i * most + k], (int)peakY[i * most + k], content, inputSize);
+                    var peakFramed = Glimpses.Frames(windows[i], sensor);
+                    var suspected = ranks[i * most + k] < imageTower.GlimpseCount;
+                    GlimpsePairs?.Add(new GlimpsePair(image.CacheIndex, tag, image.Stratum, SizeBucket(tag, instances), targets.ToArray(),
+                        logits.Select(l => new[] { l.Window.Zoom, l.Window.X, l.Window.Y, l.Window.Side }).ToArray(),
+                        logits.Select(l => (float)l.Logit).ToArray(), probability, (int)ranks[i * most + k]));
+
+                    foreach (var name in new[] { "all", image.Stratum, SizeBucket(tag, instances) })
+                        (tallies.TryGetValue(name, out var tally) ? tally : tallies[name] = new()).Add(suspected, peakFramed, covered, best, called, onObject, bestZoom);
+                }
+            }
+        }
+
+        return tallies.Select(kv => kv.Value.ToResult(kv.Key)).OrderBy(r => r.Name == "all" ? 0 : 1).ThenBy(r => r.Name).ToList();
+    }
+
+    /// <summary>
+    /// Whether a glimpse window shows a gold box ([x, y, w, h] on the canvas): their overlap is at least half of the smaller of
+    /// the two, so a small object wholly inside a large window counts, and so does a window wholly on a large object.
+    /// </summary>
+    public static bool Covers(GlimpseWindow window, int[] box)
+    {
+        var w = Math.Min(window.X + window.Side, box[0] + box[2]) - Math.Max(window.X, box[0]);
+        var h = Math.Min(window.Y + window.Side, box[1] + box[3]) - Math.Max(window.Y, box[1]);
+        if (w <= 0 || h <= 0)
+            return false;
+        var smaller = Math.Min((double)window.Side * window.Side, (double)box[2] * box[3]);
+        return smaller > 0 && w * (double)h >= 0.5 * smaller;
+    }
+
     private sealed class OcclusionTally
     {
         public int Pairs, StillYes, Wins;
         public double ObjectDrop, ControlDrop;
+        private readonly List<double> _effects = [];
 
+        /// <summary>Every scored pair counts toward the object effect; only found ones (full p &gt;= 0.5) toward the rest.</summary>
         public void Add(float full, float occluded, float control)
         {
+            _effects.Add(Logit(control) - Logit(occluded));
+            if (full < 0.5f)
+                return;
             Pairs++;
             if (occluded >= 0.5f) StillYes++;
             ObjectDrop += full - occluded;
@@ -501,9 +807,25 @@ public sealed class LocalizationEvaluator(
             if (control > occluded) Wins++;
         }
 
-        public OcclusionResult ToResult(string name) => Pairs == 0
-            ? new(name, 0, double.NaN, double.NaN, double.NaN, double.NaN)
-            : new(name, Pairs, (double)StillYes / Pairs, ObjectDrop / Pairs, ControlDrop / Pairs, (double)Wins / Pairs);
+        private static double Logit(float p)
+        {
+            var q = Math.Clamp((double)p, 1e-6, 1 - 1e-6);
+            return Math.Log(q / (1 - q));
+        }
+
+        public OcclusionResult ToResult(string name)
+        {
+            var (effect, median) = _effects.Count == 0 ? (double.NaN, double.NaN) : (_effects.Average(), Median(_effects));
+            return Pairs == 0
+                ? new(name, 0, double.NaN, double.NaN, double.NaN, double.NaN, _effects.Count, effect, median)
+                : new(name, Pairs, (double)StillYes / Pairs, ObjectDrop / Pairs, ControlDrop / Pairs, (double)Wins / Pairs, _effects.Count, effect, median);
+        }
+
+        private static double Median(List<double> values)
+        {
+            var sorted = values.Order().ToArray();
+            return sorted.Length % 2 == 1 ? sorted[sorted.Length / 2] : (sorted[sorted.Length / 2 - 1] + sorted[sorted.Length / 2]) / 2;
+        }
     }
 
     /// <summary>Margin (input pixels) added around each blanked gold box, so its edges and the outline around it go too.</summary>
@@ -513,7 +835,7 @@ public sealed class LocalizationEvaluator(
     /// <param name="eligible">Which tag rows to check.</param>
     private (List<OcclusionResult> Summary, List<OcclusionResult> Tags) EvaluateOcclusion(
         IReadOnlyList<GoldImage> gold, IReadOnlyDictionary<string, int> rowOf, Random random,
-        Func<Tensor, LetterboxBox[], Func<int, int, float>> score, Func<int, bool> eligible)
+        Func<Tensor, LetterboxBox[], Func<int, int, float>> score, Func<int, bool> eligible, List<OcclusionPair>? sink = null)
     {
         var perTag = new Dictionary<string, OcclusionTally>();
         var perStratum = new Dictionary<string, OcclusionTally> { ["all"] = new() };
@@ -537,8 +859,6 @@ public sealed class LocalizationEvaluator(
                     if (!instances.Any(x => x.Kind != GoldKind.Ignore))
                         continue;
                     var full = fullScore(i, rowOf[tag]);
-                    if (full < 0.5f)
-                        continue;
 
                     // Every box of the tag, ignore boxes too: whatever might be the object goes.
                     var blank = instances.Select(x => Grow(ToCanvas(x.Box, boxes[i]), OcclusionMargin, content)).Where(b => b[2] > 0 && b[3] > 0).ToList();
@@ -547,7 +867,7 @@ public sealed class LocalizationEvaluator(
                 }
             }
 
-            foreach (var batch in pairs.Chunk(4))
+            foreach (var batch in pairs.Chunk(ScoreBatch / 2))
             {
                 using var batchScope = NewDisposeScope();
                 var variants = new float[batch.Length * 2 * floats];
@@ -556,8 +876,8 @@ public sealed class LocalizationEvaluator(
                     var source = pixelArray.AsSpan(batch[k].Image * floats, floats);
                     source.CopyTo(variants.AsSpan(2 * k * floats, floats));
                     source.CopyTo(variants.AsSpan((2 * k + 1) * floats, floats));
-                    Blank(variants.AsSpan(2 * k * floats, floats), batch[k].Object, inputSize);
-                    Blank(variants.AsSpan((2 * k + 1) * floats, floats), batch[k].Control, inputSize);
+                    OcclusionFills.Apply(variants.AsSpan(2 * k * floats, floats), batch[k].Object, inputSize, OcclusionFill, random);
+                    OcclusionFills.Apply(variants.AsSpan((2 * k + 1) * floats, floats), batch[k].Control, inputSize, OcclusionFill, random);
                 }
 
                 var variantBoxes = batch.SelectMany(p => new[] { boxes[p.Image], boxes[p.Image] }).ToArray();
@@ -568,7 +888,9 @@ public sealed class LocalizationEvaluator(
                     var occluded = variantScore(2 * k, rowOf[tag]);
                     var control = variantScore(2 * k + 1, rowOf[tag]);
                     var image = chunk[imageIndex];
-                    foreach (var key in new[] { image.Stratum, SizeBucket(tag, image.Instances.Where(x => x.Tag == tag).ToList()) })
+                    var size = SizeBucket(tag, image.Instances.Where(x => x.Tag == tag).ToList());
+                    sink?.Add(new OcclusionPair(image.CacheIndex, tag, image.Stratum, size, full, occluded, control));
+                    foreach (var key in new[] { image.Stratum, size })
                         (perStratum.TryGetValue(key, out var t) ? t : perStratum[key] = new()).Add(full, occluded, control);
                     perStratum["all"].Add(full, occluded, control);
                     (perTag.TryGetValue(tag, out var tagTally) ? tagTally : perTag[tag] = new()).Add(full, occluded, control);
@@ -673,7 +995,7 @@ public sealed class LocalizationEvaluator(
 
             // Up to 2 localizable positive tags per image: the ones the model is most sure of,
             // so the test asks "where does the evidence for this confident call sit?".
-            var (pooledScores, spatial) = Forward(pixels);
+            var (pooledScores, spatial) = Forward(pixels, boxes);
             var chosen = new int[chunk.Length][];
             for (var i = 0; i < chunk.Length; i++)
                 chosen[i] = imageTagRows[chunk[i]].Where(t => t < localizable.Length && localizable[t])
@@ -702,8 +1024,8 @@ public sealed class LocalizationEvaluator(
                     var rand = validCells.OrderBy(_ => random.Next()).Take(count).ToArray();
 
                     var original = pooledScores(i, tag);
-                    var maskedTop = ScoreMasked(pixelArray.AsSpan(i * floats, floats), top, gridW, cell, tag);
-                    var maskedRandom = ScoreMasked(pixelArray.AsSpan(i * floats, floats), rand, gridW, cell, tag);
+                    var maskedTop = ScoreMasked(pixelArray.AsSpan(i * floats, floats), boxes[i], top, gridW, cell, tag);
+                    var maskedRandom = ScoreMasked(pixelArray.AsSpan(i * floats, floats), boxes[i], rand, gridW, cell, tag);
                     var gap = (original - maskedTop) - (original - maskedRandom);
                     gapSum += gap;
                     if (gap > 0)
@@ -766,7 +1088,7 @@ public sealed class LocalizationEvaluator(
             for (var i = 0; i < chunk.Length; i++)
                 for (var k = 0; k < tags[i].Length; k++)
                 {
-                    var extracted = TagScorer.DetectBoxes(heatmaps[i][k], 0.5f, 0.6f, boxes[i], inputSize, boxes[i].Width, boxes[i].Height, 0.05f);
+                    var extracted = DetectBoxes(heatmaps[i][k], boxes[i]);
                     pairs++;
                     if (extracted.Count == 1)
                         single++;
@@ -798,17 +1120,52 @@ public sealed class LocalizationEvaluator(
     /// </summary>
     public IReadOnlyList<bool>? ClassificationPooledTags { get; init; }
 
-    /// <summary>Spatial map plus a whole-image scorer (pooled as training pools).</summary>
-    private (Func<int, int, float> PooledScore, Tensor Spatial) Forward(Tensor pixels)
+    /// <summary>Images per forward pass in the checks that only need whole-image scores (<see cref="Score"/>).</summary>
+    private const int ScoreBatch = 32;
+
+    /// <summary>
+    /// A whole-image scorer alone: the pooled embedding without building the full map (<see cref="ImageTower.ForwardPooled"/>),
+    /// unless per-tag classification pooling needs the cells.
+    /// </summary>
+    /// <param name="content">Each image's content box: pooled over the content only, as training and the held-out
+    /// evaluation pool, not the letterbox bars. Null when the whole canvas is content (a resized crop).</param>
+    private Func<int, int, float> Score(Tensor pixels, IReadOnlyList<LetterboxBox>? content = null)
+    {
+        if (imageTower.ClassificationPoolingTemperature > 0 && ClassificationPooledTags is not null)
+            return Forward(pixels, content).PooledScore;
+        using var _ = no_grad();
+        using var scope = NewDisposeScope();
+        var mask = ContentMask(pixels, content);
+        var pooled = imageTower.ForwardPooled(pixels, mask).Pooled.cpu().data<float>().ToArray();
+        return (image, tag) => Sigmoid(scaling.Apply(Dot(pooled.AsSpan(image * dim, dim), tagEmbeddings.AsSpan(tag * dim, dim))));
+    }
+
+    /// <summary>[batch, 1, map, map]: 1 on each image's content cells (<paramref name="content"/>), or everywhere when null.</summary>
+    private Tensor ContentMask(Tensor pixels, IReadOnlyList<LetterboxBox>? content)
+    {
+        var (height, width) = (pixels.shape[2] / imageTower.OutputStride, pixels.shape[3] / imageTower.OutputStride);
+        return content is null
+            ? ones(pixels.shape[0], 1, height, width, device: pixels.device)
+            : SpatialMask.Build(content, inputSize, height, width, pixels.device);
+    }
+
+    /// <summary>
+    /// The localization map (left on the device; <see cref="HeatmapOf"/> reads one tag's map off it) plus a whole-image
+    /// scorer, pooled over <paramref name="content"/> as in <see cref="Score"/>.
+    /// </summary>
+    private (Func<int, int, float> PooledScore, Tensor Spatial) Forward(Tensor pixels, IReadOnlyList<LetterboxBox>? content = null)
     {
         using var _ = no_grad();
+        if (imageTower.ClassificationGlimpses && imageTower.ClassificationPoolingTemperature > 0 && ClassificationPooledTags is not null)
+            return GlimpseForward(pixels, content);
         // Whole-image scores pool the full map; heatmaps come from the localization map.
         var (spatial, localization) = imageTower.ForwardMaps(pixels);
-        var spatialCpu = localization.cpu();
-        var pooled = spatial.cpu().mean([2, 3]).data<float>().ToArray();
+        float[] pooled;
+        using (NewDisposeScope())
+            pooled = ImageTower.MaskedPool(spatial, ContentMask(pixels, content)).cpu().data<float>().ToArray();
         var temperature = imageTower.ClassificationPoolingTemperature;
         if (temperature <= 0 || ClassificationPooledTags is not { } perTag)
-            return ((image, tag) => Sigmoid(scaling.Apply(Dot(pooled.AsSpan(image * dim, dim), tagEmbeddings.AsSpan(tag * dim, dim)))), spatialCpu);
+            return ((image, tag) => Sigmoid(scaling.Apply(Dot(pooled.AsSpan(image * dim, dim), tagEmbeddings.AsSpan(tag * dim, dim)))), localization);
 
         // [B, D, cells], the whole canvas counted as content, as the averaged score here is, so a plain average per
         // cell (masking with ones would copy the full map, which ran the A4000 out of memory on gold batches).
@@ -820,20 +1177,78 @@ public sealed class LocalizationEvaluator(
             var embedding = tagEmbeddings.AsSpan(tag * dim, dim);
             if (!perTag[tag])
                 return Sigmoid(scaling.Apply(Dot(pooled.AsSpan(image * dim, dim), embedding)));
-            // T · (logsumexp over cells of cell·tag / T − log n), as ClassificationPooling.RawScores.
+            // Pooled over the cells as ClassificationPooling.RawScores pools them.
             var dots = new double[cellCount];
-            var max = double.NegativeInfinity;
             for (var c = 0; c < cellCount; c++)
             {
                 double sum = 0;
                 for (var d = 0; d < dim; d++)
                     sum += cellValues[((long)image * dim + d) * cellCount + c] * embedding[d];
-                dots[c] = sum / temperature;
-                max = Math.Max(max, dots[c]);
+                dots[c] = sum;
             }
-            var total = dots.Sum(x => Math.Exp(x - max));
-            return Sigmoid(scaling.Apply((float)(temperature * (max + Math.Log(total) - Math.Log(cellCount)))));
-        }, spatialCpu);
+            return Sigmoid(scaling.Apply((float)ClassificationPooling.Pool(dots, temperature, imageTower.ClassificationPoolingTopK, imageTower.ClassificationPoolingBottomWeight)));
+        }, localization);
+    }
+
+    /// <summary>
+    /// <see cref="Forward"/> for a tower that scores localizable tags from glimpses (<see cref="Glimpses"/>): the windows the
+    /// model chooses from its localization map (<see cref="Glimpses.Look"/>; the content is the whole canvas when
+    /// <paramref name="content"/> is null), pooled as <see cref="ClassificationPooling.RawScores"/> pools them.
+    /// </summary>
+    private (Func<int, int, float> PooledScore, Tensor Spatial) GlimpseForward(Tensor pixels, IReadOnlyList<LetterboxBox>? content)
+    {
+        // The pooled embedding without building the full map, which glimpse batches can't afford next to their crops.
+        var (pooledTensor, localization) = imageTower.ForwardPooled(pixels, ContentMask(pixels, content));
+        var boxes = content ?? Enumerable.Repeat(new LetterboxBox(0, 0, (int)pixels.shape[3], (int)pixels.shape[2]), (int)pixels.shape[0]).ToList();
+        float[] pooled, cellValues;
+        bool[] valid;
+        int cellCount;
+        using (NewDisposeScope())
+        {
+            pooled = pooledTensor.cpu().data<float>().ToArray();
+            // The windows the model chooses, as in training (or the whole grid: --glimpse-grid).
+            var (cells, validCells) = Glimpses.Look(imageTower, pixels, boxes, pooledTensor, localization, LocalizableTags());
+            pooledTensor.Dispose();
+            cellCount = (int)cells.shape[2];
+            cellValues = cells.cpu().data<float>().ToArray();
+            valid = validCells.cpu().data<bool>().ToArray();
+        }
+        var temperature = imageTower.ClassificationPoolingTemperature;
+        var perTag = ClassificationPooledTags!;
+        return ((image, tag) =>
+        {
+            var embedding = tagEmbeddings.AsSpan(tag * dim, dim);
+            if (!perTag[tag])
+                return Sigmoid(scaling.Apply(Dot(pooled.AsSpan(image * dim, dim), embedding)));
+            var dots = new List<double>();
+            for (var c = 0; c < cellCount; c++)
+            {
+                if (!valid[image * cellCount + c])
+                    continue;
+                double sum = 0;
+                for (var d = 0; d < dim; d++)
+                    sum += cellValues[((long)image * dim + d) * cellCount + c] * embedding[d];
+                dots.Add(sum);
+            }
+            if (dots.Count == 0)
+                return Sigmoid(scaling.Apply(Dot(pooled.AsSpan(image * dim, dim), embedding)));
+            return Sigmoid(scaling.Apply((float)ClassificationPooling.Pool(dots, temperature, imageTower.ClassificationPoolingTopK, imageTower.ClassificationPoolingBottomWeight)));
+        }, localization);
+    }
+
+    private Tensor? _localizableTags;
+
+    /// <summary>[L, D] the localizable tags' embeddings on the device (<see cref="ClassificationPooledTags"/>), which <see cref="Glimpses.Propose"/> ranks.</summary>
+    private Tensor LocalizableTags()
+    {
+        if (_localizableTags is null)
+        {
+            _deviceTags ??= tensor(tagEmbeddings, [tagEmbeddings.Length / dim, dim]).to(device).DetachFromDisposeScope();
+            var rows = ClassificationPooledTags!.Select((pooledTag, t) => (pooledTag, t)).Where(x => x.pooledTag).Select(x => (long)x.t).ToArray();
+            using var index = tensor(rows, device: device);
+            _localizableTags = _deviceTags.index_select(0, index).DetachFromDisposeScope();
+        }
+        return _localizableTags;
     }
 
     /// <summary>
@@ -870,34 +1285,34 @@ public sealed class LocalizationEvaluator(
         using var scope = NewDisposeScope();
         var (pixels, loadedBoxes) = Load(indices);
         boxes = loadedBoxes;
-        var (_, spatial) = Forward(pixels);
+        var (_, spatial) = Forward(pixels, loadedBoxes);
         var result = new float[indices.Count][][,];
         for (var i = 0; i < indices.Count; i++)
             result[i] = tagsPerImage[i].Select(t => HeatmapOf(spatial, i, t)).ToArray();
         return result;
     }
 
-    private float[,] HeatmapOf(Tensor spatialCpu, int image, int tag)
+    /// <summary>One tag's sigmoid heatmap off a localization map from <see cref="Forward"/> (the dot products on its device).</summary>
+    private float[,] HeatmapOf(Tensor localization, int image, int tag)
     {
-        var gridH = (int)spatialCpu.shape[2];
-        var gridW = (int)spatialCpu.shape[3];
-        var values = spatialCpu[image].data<float>().ToArray(); // [dim, H, W]
+        var gridH = (int)localization.shape[2];
+        var gridW = (int)localization.shape[3];
+        float[] values;
+        using (no_grad())
+        using (NewDisposeScope())
+        {
+            _deviceTags ??= tensor(tagEmbeddings, [tagEmbeddings.Length / dim, dim]).to(device).DetachFromDisposeScope();
+            values = _deviceTags[tag].matmul(localization[image].reshape([dim, gridH * gridW])).cpu().data<float>().ToArray();
+        }
+
         var map = new float[gridH, gridW];
-        var embedding = tagEmbeddings.AsSpan(tag * dim, dim);
         for (var y = 0; y < gridH; y++)
             for (var x = 0; x < gridW; x++)
-            {
-                var sum = 0f;
-                var at = y * gridW + x;
-                for (var d = 0; d < dim; d++)
-                    sum += values[d * gridH * gridW + at] * embedding[d];
-                map[y, x] = Sigmoid(scaling.Apply(sum));
-            }
-
+                map[y, x] = Sigmoid(scaling.Apply(values[y * gridW + x]));
         return map;
     }
 
-    private float ScoreMasked(ReadOnlySpan<float> imagePixels, int[] cells, int gridW, int cell, int tag)
+    private float ScoreMasked(ReadOnlySpan<float> imagePixels, LetterboxBox content, int[] cells, int gridW, int cell, int tag)
     {
         using var scope = NewDisposeScope();
         var copy = imagePixels.ToArray();
@@ -911,8 +1326,7 @@ public sealed class LocalizationEvaluator(
                         copy[ch * channel + y * inputSize + x] = 0f; // the normalized "neutral" padding value
         }
 
-        var (score, _) = Forward(tensor(copy, [1, 3, inputSize, inputSize]).to(device));
-        return score(0, tag);
+        return Score(tensor(copy, [1, 3, inputSize, inputSize]).to(device), [content])(0, tag);
     }
 
     /// <summary>Heatmap of a random ~70% crop (cell-aligned, inside the content) vs. the same crop of the full heatmap, both on the crop's own grid.</summary>
@@ -965,6 +1379,11 @@ public sealed class LocalizationEvaluator(
     }
 
     // ---- geometry / statistics ----
+
+    /// <summary>Boxes as <c>detect</c> extracts them (its defaults), in content pixels; without its edge-guided refinement, which needs the source image.</summary>
+    private List<BoundingBox> DetectBoxes(float[,] map, LetterboxBox content) =>
+        TagScorer.DetectBoxes(map, TagScorer.DefaultBoxThreshold, TagScorer.DefaultBoxPercentile, content, inputSize, content.Width, content.Height,
+            TagScorer.DefaultMinHeatmapRange, TagScorer.DefaultMinBoxFraction, TagScorer.DefaultMaxBoxesPerTag);
 
     private (float X, float Y) PeakCellCenterInContent(float[,] map, LetterboxBox content)
     {

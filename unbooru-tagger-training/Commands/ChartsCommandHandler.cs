@@ -11,24 +11,18 @@ namespace UnbooruTagger.Training.Commands;
 /// </summary>
 public static class ChartsCommandHandler
 {
-    public static int Run(string checkpointDir, int epochs, IReadOnlyList<string> references, string? pngPath, bool watch, int intervalSeconds, int width, int height)
+    /// <param name="comparisons">Other runs as label=checkpoint directory, drawn as curves over this run's steps.</param>
+    public static int Run(string checkpointDir, int epochs, IReadOnlyList<string> references, IReadOnlyList<string> comparisons, string? pngPath, bool watch,
+        int intervalSeconds, int width, int height)
     {
-        var parsedReferences = new List<(string, string)>();
-        foreach (var reference in references)
-        {
-            var split = reference.IndexOf('=');
-            if (split <= 0)
-            {
-                AnsiConsole.MarkupLineInterpolated($"[red]--reference takes label=report directory, got '{reference}'.[/]");
-                return 1;
-            }
-            parsedReferences.Add((reference[..split], reference[(split + 1)..]));
-        }
+        if (Labelled(references, "--reference", "report directory") is not { } parsedReferences
+            || Labelled(comparisons, "--compare", "checkpoint directory") is not { } parsedComparisons)
+            return 1;
 
         var toTerminal = !Console.IsOutputRedirected && (watch || pngPath is null);
         if (!watch)
         {
-            Draw(checkpointDir, epochs, parsedReferences, pngPath, toTerminal, width, height);
+            Draw(checkpointDir, epochs, parsedReferences, parsedComparisons, pngPath, toTerminal, width, height);
             return 0;
         }
 
@@ -37,19 +31,37 @@ public static class ChartsCommandHandler
         string? shown = null;
         while (true)
         {
-            var signature = Signature(checkpointDir) + $"|{Console.WindowWidth}x{Console.WindowHeight}";
+            var signature = string.Join("|", parsedComparisons.Select(c => Signature(c.Item2)).Prepend(Signature(checkpointDir))) + $"|{Console.WindowWidth}x{Console.WindowHeight}";
             if (signature != shown)
             {
-                Draw(checkpointDir, epochs, parsedReferences, pngPath, toTerminal, width, height);
+                Draw(checkpointDir, epochs, parsedReferences, parsedComparisons, pngPath, toTerminal, width, height);
                 shown = signature;
             }
             Thread.Sleep(TimeSpan.FromSeconds(Math.Max(1, intervalSeconds)));
         }
     }
 
-    private static void Draw(string checkpointDir, int epochs, IReadOnlyList<(string, string)> references, string? pngPath, bool toTerminal, int width, int height)
+    /// <summary>label=path arguments as pairs; null (after saying why) if one isn't.</summary>
+    private static List<(string, string)>? Labelled(IReadOnlyList<string> arguments, string option, string what)
     {
-        var series = TrainingSeries.Load(checkpointDir, epochs, references);
+        var parsed = new List<(string, string)>();
+        foreach (var argument in arguments)
+        {
+            var split = argument.IndexOf('=');
+            if (split <= 0)
+            {
+                AnsiConsole.MarkupLineInterpolated($"[red]{option} takes label={what}, got '{argument}'.[/]");
+                return null;
+            }
+            parsed.Add((argument[..split], argument[(split + 1)..]));
+        }
+        return parsed;
+    }
+
+    private static void Draw(string checkpointDir, int epochs, IReadOnlyList<(string, string)> references, IReadOnlyList<(string, string)> comparisons,
+        string? pngPath, bool toTerminal, int width, int height)
+    {
+        var series = TrainingSeries.Load(checkpointDir, epochs, references, comparisons);
         var (cellWidth, cellHeight) = TerminalGraphics.CellSize();
         // Leave the last terminal row for the status line.
         var (w, h) = (width > 0 ? width : Console.WindowWidth * cellWidth, height > 0 ? height : (Console.WindowHeight - 1) * cellHeight);

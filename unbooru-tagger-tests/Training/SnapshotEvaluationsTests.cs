@@ -4,7 +4,7 @@ namespace UnbooruTagger.Tests.Training;
 
 public class SnapshotEvaluationsTests
 {
-    // A stand-in for `evaluate`: reports mAP = step / 1,000,000 and gold pointing 0.3, unless the
+    // A stand-in for `evaluate`: reports mAP = step / 1,000,000, gold pointing 0.3 and gold-small pointing 0.2, unless the
     // snapshot holds a "fail" file (exit 3).
     private const string Script = """
         #!/usr/bin/env bash
@@ -13,8 +13,9 @@ public class SnapshotEvaluationsTests
         [ -e "$snapshot/fail" ] && exit 3
         step="${out##*step-}"
         map=$(printf '0.%06d' "$step")
-        echo "{\"MeanAveragePrecision\":$map,\"ExclusiveViolationRate\":0.05,\"ContextReliance\":{\"MacroRecallGap\":0.1,\"MacroFalsePositiveGap\":\"NaN\"}}" > "$out/evaluation_report.json"
-        echo '{"Gold":[{"Name":"clean","PointingAccuracy":0.9},{"Name":"all","PointingAccuracy":0.3}],"Occlusion":[{"Name":"all","StillYesRate":0.8}]}' > "$out/localization_report.json"
+        echo "{\"MeanAveragePrecision\":$map,\"ExclusiveViolationRate\":0.05,\"ContextReliance\":{\"MacroRecallGap\":0.1,\"MacroFalsePositiveGap\":\"NaN\"},\"LabelledContext\":{\"AbsentCalledRate\":0.08,\"AbsentMeanLogit\":-1.3,\"PresentCalledRate\":0.7,\"PresentMeanLogit\":0.75}}" > "$out/evaluation_report.json"
+        echo '{"Gold":[{"Name":"clean","PointingAccuracy":0.9},{"Name":"all","PointingAccuracy":0.3}],"Occlusion":[{"Name":"all","StillYesRate":0.8,"ObjectEffect":0.45}]}' > "$out/localization_report.json"
+        echo '{"Gold":[{"Name":"all","PointingAccuracy":0.2}],"Occlusion":[{"Name":"all","StillYesRate":0.7}]}' > "$out/localization_report_small.json"
         """;
 
     [Fact]
@@ -36,9 +37,15 @@ public class SnapshotEvaluationsTests
         Assert.Equal(0.02, point.MeanAveragePrecision, 6);
         Assert.Equal(0.3, point.GoldPointing, 6);
         Assert.Equal(0.8, point.OccludedStillCalled, 6);
+        Assert.Equal(0.45, point.ObjectEffect, 6);
+        Assert.True(double.IsNaN(point.SmallObjectEffect)); // reports from before it existed
+        Assert.Equal(0.2, point.SmallGoldPointing, 6);
+        Assert.Equal(0.7, point.SmallOccludedStillCalled, 6);
         Assert.Equal(0.1, point.RecallGap, 6);
         Assert.True(double.IsNaN(point.FalsePositiveGap));
         Assert.Equal(0.05, point.ExclusiveViolations, 6);
+        Assert.Equal(-1.3, point.LabelledAbsentLogit, 6);
+        Assert.Equal(0.75, point.LabelledPresentLogit, 6);
         Assert.False(Directory.Exists(snapshots.SnapshotDirectory(20_000)));
         Assert.True(File.Exists(Path.Combine(snapshots.StepDirectory(20_000), "evaluation_report.json")));
         Assert.Empty(snapshots.TakeFinished());

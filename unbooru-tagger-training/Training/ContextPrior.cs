@@ -90,3 +90,77 @@ public sealed class ContextPrior
 
     private static double Logit(double p) => Math.Log(p / (1 - p));
 }
+
+/// <summary>
+/// Each image's context prior for a tag: the highest P(t | s) over its character, artist and series tags s,
+/// estimated from a sample of s's training images (as <see cref="ContextPrior"/> and
+/// <see cref="ContextRelianceEvaluator"/> do). <see cref="TagCentricBatchSampler"/> uses it to pick
+/// out-of-context positives: gloves on a character who rarely wears them, which can only be learned from the
+/// gloves themselves.
+/// </summary>
+public sealed class ContextPriorTable
+{
+    /// <summary>[source s] → P(t | s) for every eligible t seen in its sample.</summary>
+    private readonly Dictionary<int, Dictionary<int, float>> _priors;
+
+    public int SourceCount => _priors.Count;
+
+    private ContextPriorTable(Dictionary<int, Dictionary<int, float>> priors) => _priors = priors;
+
+    /// <param name="isSource">Per tag row: a context source (character/artist/series).</param>
+    /// <param name="eligible">Per tag row: record priors for this tag.</param>
+    /// <param name="minSourceImages">Sources with fewer training images are skipped: too few to estimate a prior.</param>
+    public static ContextPriorTable Build(
+        TagStatistics statistics, IReadOnlyList<bool> isSource, IReadOnlyList<bool> eligible,
+        int samplesPerSource = 512, int minSourceImages = 20, int seed = 0)
+    {
+        var priors = new Dictionary<int, Dictionary<int, float>>();
+        var lockObject = new object();
+        Parallel.For(0, statistics.VocabularySize, s =>
+        {
+            if (s >= isSource.Count || !isSource[s] || statistics.Positives[s].Length < minSourceImages)
+                return;
+            var images = statistics.Positives[s];
+            var random = new Random(DeterministicSeed.For(seed, s));
+            var sample = images.Length <= samplesPerSource ? images : images.OrderBy(_ => random.Next()).Take(samplesPerSource).ToArray();
+            var tally = new Dictionary<int, int>();
+            foreach (var image in sample)
+                foreach (var t in statistics.ImageTagRows[image])
+                    if (t != s && (uint)t < (uint)eligible.Count && eligible[t])
+                        tally[t] = tally.GetValueOrDefault(t) + 1;
+            var row = tally.ToDictionary(kv => kv.Key, kv => kv.Value / (float)sample.Length);
+            lock (lockObject)
+                priors[s] = row;
+        });
+        return new ContextPriorTable(priors);
+    }
+
+    /// <summary>Whether any of <paramref name="imageTags"/> is a source with priors (so a prior of 0 means "rarely", not "unknown").</summary>
+    public bool HasSource(IReadOnlyList<int> imageTags)
+    {
+        foreach (var s in imageTags)
+            if (_priors.ContainsKey(s))
+                return true;
+        return false;
+    }
+
+    /// <summary>The tags some source among <paramref name="imageTags"/> gives a prior of at least <paramref name="minPrior"/> (repeats possible).</summary>
+    public IEnumerable<int> LikelyTags(IReadOnlyList<int> imageTags, float minPrior)
+    {
+        foreach (var s in imageTags)
+            if (_priors.TryGetValue(s, out var row))
+                foreach (var (t, p) in row)
+                    if (p >= minPrior)
+                        yield return t;
+    }
+
+    /// <summary>The highest P(<paramref name="tag"/> | s) over <paramref name="imageTags"/>' sources; 0 without any.</summary>
+    public float Prior(IReadOnlyList<int> imageTags, int tag)
+    {
+        var best = 0f;
+        foreach (var s in imageTags)
+            if (_priors.TryGetValue(s, out var row) && row.TryGetValue(tag, out var p) && p > best)
+                best = p;
+        return best;
+    }
+}

@@ -1,3 +1,4 @@
+using UnbooruTagger.Core.Scoring;
 using UnbooruTagger.Core.Encoding;
 using System.CommandLine;
 using UnbooruTagger.Inference.Commands;
@@ -25,31 +26,31 @@ var outputOption = new Option<string>("--out")
 var boxThresholdOption = new Option<float>("--box-threshold")
 {
     Description = "Absolute floor: minimum per-location confidence required to include a spatial cell in a bounding box",
-    DefaultValueFactory = _ => 0.5f
+    DefaultValueFactory = _ => TagScorer.DefaultBoxThreshold
 };
 
 var boxPercentileOption = new Option<float>("--box-percentile")
 {
     Description = "Additionally cut within each tag's own heatmap range (0 = its weakest cell, 1 = only its single strongest) to tighten boxes around each tag's peak",
-    DefaultValueFactory = _ => 0.6f
+    DefaultValueFactory = _ => TagScorer.DefaultBoxPercentile
 };
 
 var minHeatmapRangeOption = new Option<float>("--min-heatmap-range")
 {
     Description = "Suppress all boxes for a tag whose heatmap's own max-min spread sits below this — a near-flat heatmap has no real spatial signal to cut into, so a box built from it is noise, not localization",
-    DefaultValueFactory = _ => 0.05f
+    DefaultValueFactory = _ => TagScorer.DefaultMinHeatmapRange
 };
 
 var minBoxFractionOption = new Option<float>("--min-box-fraction")
 {
     Description = "Drop any box whose connected region covers less than this fraction of the heatmap grid -- isolated specks are noise, not localization",
-    DefaultValueFactory = _ => 0.002f
+    DefaultValueFactory = _ => TagScorer.DefaultMinBoxFraction
 };
 
 var maxBoxesPerTagOption = new Option<int>("--max-boxes-per-tag")
 {
     Description = "Keep at most this many boxes per tag, strongest peak first. 0 keeps every box",
-    DefaultValueFactory = _ => 3
+    DefaultValueFactory = _ => TagScorer.DefaultMaxBoxesPerTag
 };
 
 var detectOutputOption = new Option<string?>("--out")
@@ -152,6 +153,18 @@ renderGoldCommand.Options.Add(minBoxFractionOption);
 renderGoldCommand.Options.Add(maxBoxesPerTagOption);
 renderGoldCommand.Options.Add(allTagsOption);
 renderGoldCommand.Options.Add(pngOption);
+var goldScoresOption = new Option<string?>("--scores")
+{
+    Description = "occlusion_pairs.jsonl from training's evaluate --dump-occlusion: score each gold pair from it instead of the model (for a checkpoint exported with --ignore-pooling)"
+};
+renderGoldCommand.Options.Add(goldScoresOption);
+var minConfidenceOption = new Option<float?>("--min-confidence")
+{
+    Description = "With a model, keep the gold set's tags down to this confidence instead of their thresholds; boxes.json records each tag's threshold, so gold/compare.html's cutoff slider can raise it back"
+};
+renderGoldCommand.Options.Add(minConfidenceOption);
+renderGoldCommand.Options.Add(deviceOption);
+renderGoldCommand.Options.Add(batchSizeOption);
 renderGoldCommand.SetAction(parseResult => RenderGoldCommandHandler.Run(
     parseResult.GetRequiredValue(goldArgument),
     parseResult.GetRequiredValue(renderOutDirOption),
@@ -163,7 +176,11 @@ renderGoldCommand.SetAction(parseResult => RenderGoldCommandHandler.Run(
     parseResult.GetRequiredValue(minBoxFractionOption),
     parseResult.GetRequiredValue(maxBoxesPerTagOption),
     parseResult.GetValue(allTagsOption),
-    parseResult.GetValue(pngOption)));
+    parseResult.GetValue(pngOption),
+    parseResult.GetValue(goldScoresOption),
+    parseResult.GetValue(minConfidenceOption),
+    parseResult.GetRequiredValue(deviceOption),
+    parseResult.GetRequiredValue(batchSizeOption)));
 
 var resultsOption = new Option<string>("--out")
 {

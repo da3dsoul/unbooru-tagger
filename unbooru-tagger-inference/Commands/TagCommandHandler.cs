@@ -44,13 +44,27 @@ public static class TagCommandHandler
             .Select(r => (model.Vocabulary.GetByRowIndex(r.Row).Tag, r.Confidence))
             .ToList();
 
-    /// <summary>Vocabulary rows that clear their threshold, strongest first, with contradictory pairs resolved.</summary>
-    internal static List<(int Row, float Confidence)> ScoreRows(ModelBundle model, ImageEncoding encoding, float? threshold)
+    /// <summary>
+    /// Vocabulary rows that clear their threshold, strongest first, with contradictory pairs resolved. Given
+    /// <paramref name="scores"/>, only its tags are scored, with its confidences instead of the bundle's (scores the bundle
+    /// can't compute, see render-gold --scores: the bundle's own scores for the rest are then meaningless, and thousands of
+    /// them clearing their thresholds each cost a heatmap and boxes). Given <paramref name="onlyTags"/> (underscored, as booru
+    /// tags are written), only those tags are scored.
+    /// </summary>
+    internal static List<(int Row, float Confidence)> ScoreRows(
+        ModelBundle model, ImageEncoding encoding, float? threshold, IReadOnlyDictionary<string, float>? scores = null,
+        IReadOnlySet<string>? onlyTags = null)
     {
         var results = new List<(int Row, float Confidence)>();
         for (var row = 0; row < model.Embeddings.RowCount; row++)
         {
-            var confidence = TagScorer.Score(encoding.PooledEmbedding, model.Embeddings.GetRow(row), model.LogitScaling);
+            if (onlyTags is not null && !onlyTags.Contains(model.Vocabulary.GetByRowIndex(row).Tag.Replace(' ', '_')))
+                continue;
+            float confidence;
+            if (scores is null)
+                confidence = TagScorer.Score(encoding.PooledEmbedding, model.Embeddings.GetRow(row), model.LogitScaling);
+            else if (!scores.TryGetValue(model.Vocabulary.GetByRowIndex(row).Tag.Replace(' ', '_'), out confidence))
+                continue;
             if (confidence >= model.ThresholdFor(row, threshold))
                 results.Add((row, confidence));
         }

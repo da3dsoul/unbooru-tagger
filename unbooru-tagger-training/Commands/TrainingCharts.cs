@@ -8,15 +8,19 @@ namespace UnbooruTagger.Training.Commands;
 /// <summary>Everything the charts show for one run, read from its checkpoint directory.</summary>
 /// <param name="CurrentStep">Global step of the latest checkpoint save.</param>
 /// <param name="References">Other runs' evaluations to compare against (e.g. "v3 e1"), drawn as dashed lines.</param>
+/// <param name="Comparisons">Other runs drawn as curves over the same steps (e.g. run 4 beside a fresh run testing a change): their evaluations up to this run's latest one, their loss up to the current step.</param>
 public sealed record TrainingSeries(
     string Name, LossHistory Loss, IReadOnlyList<EvaluationPoint> Points, long CurrentStep, int StepsPerEpoch, int Epochs,
-    IReadOnlyList<(string Label, EvaluationPoint Point)> References)
+    IReadOnlyList<(string Label, EvaluationPoint Point)> References,
+    IReadOnlyList<(string Label, TrainingSeries Run)>? Comparisons = null)
 {
     /// <summary>
     /// Reads <paramref name="checkpointDir"/>: the saved loss history, every epoch evaluation
     /// (history/epoch-N) and finished snapshot evaluation (snapshots/step-N).
     /// </summary>
-    public static TrainingSeries Load(string checkpointDir, int epochs, IReadOnlyList<(string Label, string Directory)>? references = null)
+    /// <param name="comparisons">Other runs' checkpoint directories, read the same way, drawn as curves up to this run's step.</param>
+    public static TrainingSeries Load(string checkpointDir, int epochs, IReadOnlyList<(string Label, string Directory)>? references = null,
+        IReadOnlyList<(string Label, string Directory)>? comparisons = null)
     {
         var progress = TrainingState.HasProgress(checkpointDir) ? TrainingState.LoadProgress(checkpointDir) : TrainingProgress.Initial;
         var stepsPerEpoch = Math.Max(1, progress.StepsPerEpoch);
@@ -41,13 +45,14 @@ public sealed record TrainingSeries(
             .ToList();
         var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(checkpointDir)));
         return new TrainingSeries(name, LossHistory.Load(checkpointDir, currentStep), points.OrderBy(p => p.Step).ToList(),
-            currentStep, stepsPerEpoch, epochs, referencePoints);
+            currentStep, stepsPerEpoch, epochs, referencePoints,
+            (comparisons ?? []).Select(c => (c.Label, Load(c.Directory, epochs))).ToList());
     }
 }
 
 /// <summary>
-/// Draws a run's <see cref="TrainingSeries"/> as one image: the loss over the whole run on top, then
-/// one panel per headline evaluation metric, with epoch boundaries and other runs' values for
+/// Draws a run's <see cref="TrainingSeries"/> as one image: a grid of panels, the loss over the whole run
+/// first, then one per headline evaluation metric, with epoch boundaries and other runs' values for
 /// comparison. Shown in the terminal as Sixel by the <c>charts</c> command, or saved as a PNG.
 /// </summary>
 public static class TrainingCharts
@@ -69,11 +74,25 @@ public static class TrainingCharts
     [
         new("held-out mAP", p => p.MeanAveragePrecision, false, false),
         new("gold pointing", p => p.GoldPointing, false, true),
-        new("blanked object still called", p => p.OccludedStillCalled, true, true),
+        new("gold-small pointing", p => p.SmallGoldPointing, false, true),
+        new("exclusive-tag violations", p => p.ExclusiveViolations, true, true),
+        // Object effect, not the still-called rate: that one counts only pairs found at p >= 0.5 and flips on small
+        // score changes near 0.5 (a quarter of its pairs change between checkpoints 4,500 steps apart).
+        new("object effect (log-odds)", p => p.ObjectEffect, false, false),
+        new("gold-small object effect", p => p.SmallObjectEffect, false, false),
         new("context recall gap", p => p.RecallGap, true, true),
         new("context false-positive gap", p => p.FalsePositiveGap, true, true),
-        new("exclusive-tag violations", p => p.ExclusiveViolations, true, true),
+        // The gap counts untagged objects the model finds as false positives; these are images checked by eye. Log-odds
+        // past the threshold, not the called rate, for the same reason as the object effect: ~200 pairs at thresholds
+        // recalibrated each evaluation, so a few pairs flipping moved the rate by points.
+        new("absent objects (labelled)", p => p.LabelledAbsentLogit, true, false),
+        new("untagged objects (labelled)", p => p.LabelledPresentLogit, false, false),
     ];
+
+    /// <summary>Panels per row; the loss takes the first two.</summary>
+    private const int Columns = 4;
+
+    private const int LossColumns = 2;
 
     /// <param name="header">A title line with the run and step; the training dashboard leaves it out, its panel already says so.</param>
     /// <param name="textScale">Text and line size (1 = 13 px labels); in a terminal, matched to its own text. Default: from the height.</param>
@@ -98,24 +117,21 @@ public static class TrainingCharts
             Draw(canvas, $"{series.Points.Count} evaluations · updated {now:HH:mm}", width - margin, margin + 16 * scale, font, Axis, SKTextAlign.Right);
             top += 26 * scale;
         }
-        var lossHeight = (height - top - margin) * 0.34f;
         var gap = 10 * scale;
-        var lossBox = new SKRect(margin, top, width - margin, top + lossHeight);
-        DrawLoss(canvas, series, lossBox, scale, font, bold);
+        var rows = (Metrics.Length + LossColumns + Columns - 1) / Columns;
+        var cellWidth = (width - 2 * margin - (Columns - 1) * gap) / Columns;
+        var cellHeight = (height - margin - top - (rows - 1) * gap) / rows;
+        SKRect Cell(int k) => SKRect.Create(margin + k % Columns * (cellWidth + gap), top + k / Columns * (cellHeight + gap), cellWidth, cellHeight);
+        DrawLoss(canvas, series, SKRect.Union(Cell(0), Cell(LossColumns - 1)), scale, font, bold);
 
         // Evaluation panels share one x range, so the same step lines up across them.
-        var metricsTop = lossBox.Bottom + gap;
-        var cellWidth = (width - 2 * margin - 2 * gap) / 3;
-        var cellHeight = (height - margin - metricsTop - gap) / 2;
         var steps = series.Points.Select(p => (double)p.Step).ToList();
-        var xMin = steps.Count > 0 ? Math.Min(steps.Min(), series.CurrentStep) : 0;
+        // From the run's first loss bucket (its start, or where it resumed from), so the first evaluation isn't on the edge.
+        var start = series.Loss.Buckets.Count > 0 ? series.Loss.Buckets[0].End - series.Loss.BucketSteps : series.CurrentStep;
+        var xMin = Math.Max(0, Math.Min(start, steps.Count > 0 ? steps.Min() : series.CurrentStep));
         var xMax = Math.Max(series.CurrentStep, steps.Count > 0 ? steps.Max() : 1);
         for (var k = 0; k < Metrics.Length; k++)
-        {
-            var (column, row) = (k % 3, k / 3);
-            var box = SKRect.Create(margin + column * (cellWidth + gap), metricsTop + row * (cellHeight + gap), cellWidth, cellHeight);
-            DrawMetric(canvas, series, Metrics[k], box, xMin, xMax, scale, font, bold);
-        }
+            DrawMetric(canvas, series, Metrics[k], Cell(k + LossColumns), xMin, xMax, scale, font, bold);
         return bitmap;
     }
 
@@ -130,7 +146,7 @@ public static class TrainingCharts
     private static void DrawLoss(SKCanvas canvas, TrainingSeries series, SKRect box, float scale, SKFont font, SKFont bold)
     {
         var buckets = series.Loss.Buckets;
-        var title = $"loss · mean per {series.Loss.BucketSteps:N0} steps";
+        var title = $"loss · per {TrainingDashboard.Steps(series.Loss.BucketSteps)} steps";
         var plot = PanelFrame(canvas, box, scale, title, buckets.Count > 0 ? buckets[^1].Mean.ToString("G4", CultureInfo.InvariantCulture) : null, null, false, font, bold);
         if (buckets.Count < 2)
         {
@@ -140,13 +156,16 @@ public static class TrainingCharts
 
         // Raw bucket means, and a smoothed line over them: the trend the noise hides.
         var raw = buckets.Select(b => ((double)b.End, (double)b.Mean)).ToList();
-        var smoothed = new List<(double, double)>();
-        var ema = raw[0].Item2;
-        foreach (var (x, y) in raw)
-            smoothed.Add((x, ema = 0.85 * ema + 0.15 * y));
-        var (yMin, yMax) = Range(raw.Select(p => p.Item2), false);
+        var smoothed = Smooth(raw);
         var (xMin, xMax) = (raw[0].Item1, Math.Max(raw[^1].Item1, series.CurrentStep));
+        // Comparison runs over this run's steps, smoothed only (their raw buckets would bury this run's).
+        var others = (series.Comparisons ?? [])
+            .Select(c => (c.Label, Points: Smooth(c.Run.Loss.Buckets.Select(b => ((double)b.End, (double)b.Mean)).ToList()).Where(p => p.X >= xMin && p.X <= xMax).ToList()))
+            .Where(c => c.Points.Count > 1).ToList();
+        var (yMin, yMax) = Range(raw.Select(p => p.Item2).Concat(others.SelectMany(c => c.Points.Select(p => p.Y))), false);
         var area = Axes(canvas, plot, xMin, xMax, yMin, yMax, false, series, scale, font);
+        foreach (var (label, points) in others)
+            Comparison(canvas, area, label, points, xMin, xMax, yMin, yMax, scale, font);
         Line(canvas, area, raw, xMin, xMax, yMin, yMax, LossColor.WithAlpha(90), 1.2f * scale);
         Line(canvas, area, smoothed, xMin, xMax, yMin, yMax, LossColor, 2.4f * scale);
     }
@@ -155,14 +174,13 @@ public static class TrainingCharts
     {
         var values = series.Points.Select(p => ((double)p.Step, metric.Value(p), p.EndOfEpoch)).Where(p => !double.IsNaN(p.Item2)).ToList();
         string? latest = values.Count > 0 ? Format(values[^1].Item2, metric.Percent) : null;
-        (string, SKColor)? change = null;
+        (string, string, SKColor)? change = null;
         if (values.Count > 1)
         {
             var delta = values[^1].Item2 - values[^2].Item2;
             var better = metric.LowerIsBetter ? delta < 0 : delta > 0;
             var magnitude = metric.Percent ? (100 * Math.Abs(delta)).ToString("0.0", CultureInfo.InvariantCulture) + " pts" : Format(Math.Abs(delta), false);
-            change = ($"{(delta >= 0 ? "+" : "−")}{magnitude} since {TrainingDashboard.Steps(values[^2].Item1)}",
-                delta == 0 ? Axis : better ? Better : Worse);
+            change = ($"{(delta >= 0 ? "+" : "−")}{magnitude}", $" since {TrainingDashboard.Steps(values[^2].Item1)}", delta == 0 ? Axis : better ? Better : Worse);
         }
         var plot = PanelFrame(canvas, box, scale, metric.Name, latest, change, metric.LowerIsBetter, font, bold);
         if (values.Count == 0)
@@ -172,7 +190,15 @@ public static class TrainingCharts
         }
 
         var references = series.References.Select(r => (r.Label, Value: metric.Value(r.Point))).Where(r => !double.IsNaN(r.Value)).ToList();
-        var (yMin, yMax) = Range(values.Select(v => v.Item2).Concat(references.Select(r => r.Value)), metric.Percent);
+        // Other runs only up to this run's latest evaluation, not the current step: this run's evaluations land a while
+        // after their step (they run in another process), so otherwise the other run's newer points come in alone.
+        var compareTo = Math.Min(xMax, values[^1].Item1);
+        var others = (series.Comparisons ?? [])
+            .Select(c => (c.Label, Points: c.Run.Points.Where(p => p.Step >= xMin && p.Step <= compareTo).Select(p => ((double)p.Step, metric.Value(p)))
+                .Where(p => !double.IsNaN(p.Item2)).ToList()))
+            .Where(c => c.Points.Count > 0).ToList();
+        var (yMin, yMax) = Range(values.Select(v => v.Item2).Concat(references.Select(r => r.Value)).Concat(others.SelectMany(c => c.Points.Select(p => p.Item2))),
+            metric.Percent);
         var area = Axes(canvas, plot, xMin, xMax, yMin, yMax, metric.Percent, series, scale, font);
 
         using var dashed = new SKPaint { Color = ReferenceColor.WithAlpha(170), StrokeWidth = 1.2f * scale, IsAntialias = true, Style = SKPaintStyle.Stroke,
@@ -190,6 +216,8 @@ public static class TrainingCharts
             placed.Add((y, Draw(canvas, label, x, y - 3 * scale, small, ReferenceColor)));
         }
 
+        foreach (var (label, points) in others)
+            Comparison(canvas, area, label, points, xMin, xMax, yMin, yMax, scale, font);
         Line(canvas, area, values.Select(v => (v.Item1, v.Item2)).ToList(), xMin, xMax, yMin, yMax, MetricColor, 2.2f * scale);
         using var dot = new SKPaint { Color = MetricColor, IsAntialias = true };
         using var ring = new SKPaint { Color = Text, IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = 1.5f * scale };
@@ -202,21 +230,34 @@ public static class TrainingCharts
         }
     }
 
-    /// <summary>The panel background and its title line; returns the area left for the plot.</summary>
-    private static SKRect PanelFrame(SKCanvas canvas, SKRect box, float scale, string name, string? latest, (string Text, SKColor Color)? change, bool lowerIsBetter,
+    /// <summary>
+    /// The panel background and its title line; returns the area left for the plot. In a narrow panel the title's
+    /// extras give way, least needed first: "lower is better" becomes an arrow, then the arrow goes (the change's color
+    /// still says better or worse), then the change loses its "since", then the change goes. The name and the latest value stay.
+    /// </summary>
+    /// <param name="change">The change since the previous evaluation, the step it was at (" since 1.2M"), and its color.</param>
+    private static SKRect PanelFrame(SKCanvas canvas, SKRect box, float scale, string name, string? latest, (string Text, string Since, SKColor Color)? change, bool lowerIsBetter,
         SKFont font, SKFont bold)
     {
         using var panel = new SKPaint { Color = Panel, IsAntialias = true };
         canvas.DrawRoundRect(box, 6 * scale, 6 * scale, panel);
         var x = box.Left + 10 * scale;
+        var right = box.Right - 10 * scale;
         var baseline = box.Top + 20 * scale;
         x = Draw(canvas, name, x, baseline, font, Axis) + 8 * scale;
         if (latest is not null)
             x = Draw(canvas, latest, x, baseline, bold, Text) + 8 * scale;
-        if (change is { } c)
-            x = Draw(canvas, c.Text, x, baseline, font, c.Color) + 8 * scale;
-        if (lowerIsBetter)
-            Draw(canvas, "lower is better", box.Right - 10 * scale, baseline, font, Axis.WithAlpha(150), SKTextAlign.Right);
+
+        string[] hints = lowerIsBetter ? ["lower is better", "↓", ""] : [""];
+        string[] changes = change is { } c ? [c.Text + c.Since, c.Text, ""] : [""];
+        var fits = (from text in changes from hint in hints
+                    let width = (text.Length > 0 ? font.MeasureText(text) + 8 * scale : 0) + (hint.Length > 0 ? font.MeasureText(hint) : 0)
+                    where x + width <= right
+                    select (Change: text, Hint: hint)).FirstOrDefault();
+        if (fits.Change is { Length: > 0 })
+            Draw(canvas, fits.Change, x, baseline, font, change!.Value.Color);
+        if (fits.Hint is { Length: > 0 })
+            Draw(canvas, fits.Hint, right, baseline, font, Axis.WithAlpha(150), SKTextAlign.Right);
         return new SKRect(box.Left + 8 * scale, baseline + 8 * scale, box.Right - 12 * scale, box.Bottom - 6 * scale);
     }
 
@@ -235,17 +276,16 @@ public static class TrainingCharts
             Draw(canvas, Format(t, percent), area.Left - 6 * scale, y + font.Size * 0.35f, font, Axis, SKTextAlign.Right);
         }
 
-        // Epoch boundaries inside the range.
+        // Epoch boundaries inside the range, labelled on their left with the epoch that ends there, whose evaluation sits on the
+        // line. Labelled with the epoch starting there, "epoch 3" sat beside epoch 2's evaluation and read as epoch 3's.
         using var epochLine = new SKPaint { Color = Axis.WithAlpha(110), StrokeWidth = 1.2f * scale, IsAntialias = true,
             PathEffect = SKPathEffect.CreateDash([3 * scale, 4 * scale], 0) };
-        for (var e = 1; e < series.Epochs; e++)
+        foreach (var (step, label) in EpochEnds(series, xMin, xMax))
         {
-            var step = (double)e * series.StepsPerEpoch;
-            if (step <= xMin || step >= xMax)
-                continue;
             var x = X(area, step, xMin, xMax);
             canvas.DrawLine(x, area.Top, x, area.Bottom, epochLine);
-            Draw(canvas, $"epoch {e + 1}", x + 4 * scale, area.Top + font.Size, font, Axis);
+            if (x - 4 * scale - font.MeasureText(label) >= area.Left)
+                Draw(canvas, label, x - 4 * scale, area.Top + font.Size, font, Axis, SKTextAlign.Right);
         }
 
         var labelY = area.Bottom + font.Size + 4 * scale;
@@ -253,6 +293,38 @@ public static class TrainingCharts
         foreach (var t in xTicks.Where(t => t >= xMin && t <= xMax))
             Draw(canvas, TrainingDashboard.Steps(t), X(area, t, xMin, xMax), labelY, font, Axis, SKTextAlign.Center);
         return area;
+    }
+
+    /// <summary>
+    /// A centred running mean over a run's loss buckets (7 wide, narrower at the ends): the trend the noise hides. Not an
+    /// exponential average, which lags: early in a run, with few buckets, it sat well above the falling loss.
+    /// </summary>
+    private static List<(double X, double Y)> Smooth(IReadOnlyList<(double X, double Y)> raw)
+    {
+        var smoothed = new List<(double, double)>(raw.Count);
+        for (var i = 0; i < raw.Count; i++)
+        {
+            var half = Math.Min(3, Math.Min(i, raw.Count - 1 - i));
+            var sum = 0.0;
+            for (var j = i - half; j <= i + half; j++)
+                sum += raw[j].Y;
+            smoothed.Add((raw[i].X, sum / (2 * half + 1)));
+        }
+        return smoothed;
+    }
+
+    /// <summary>Another run's curve (<see cref="TrainingSeries.Comparisons"/>), labelled at its last point.</summary>
+    private static void Comparison(SKCanvas canvas, SKRect area, string label, IReadOnlyList<(double X, double Y)> points,
+        double xMin, double xMax, double yMin, double yMax, float scale, SKFont font)
+    {
+        Line(canvas, area, points, xMin, xMax, yMin, yMax, ReferenceColor, 1.6f * scale);
+        using var dot = new SKPaint { Color = ReferenceColor, IsAntialias = true };
+        foreach (var (x, y) in points)
+            canvas.DrawCircle(X(area, x, xMin, xMax), Y(area, y, yMin, yMax), 2.2f * scale, dot);
+        using var small = new SKFont(font.Typeface, font.Size * 0.85f);
+        var (lx, ly) = (X(area, points[^1].X, xMin, xMax), Y(area, points[^1].Y, yMin, yMax));
+        var right = lx + 5 * scale + small.MeasureText(label) > area.Right;
+        Draw(canvas, label, right ? lx - 5 * scale : lx + 5 * scale, ly - 4 * scale, small, ReferenceColor, right ? SKTextAlign.Right : SKTextAlign.Left);
     }
 
     private static void Line(SKCanvas canvas, SKRect area, IReadOnlyList<(double X, double Y)> points, double xMin, double xMax, double yMin, double yMax, SKColor color, float width)
@@ -282,6 +354,13 @@ public static class TrainingCharts
         var pad = Math.Max((max - min) * 0.12, percent ? 0.005 : Math.Max(Math.Abs(max) * 0.02, 1e-3));
         return (min - pad, max + pad);
     }
+
+    /// <summary>The epoch ends strictly inside (<paramref name="xMin"/>, <paramref name="xMax"/>): global step, and the label of the epoch ending there.</summary>
+    public static IReadOnlyList<(double Step, string Label)> EpochEnds(TrainingSeries series, double xMin, double xMax) =>
+        Enumerable.Range(1, Math.Max(0, series.Epochs - 1))
+            .Select(e => ((double)e * series.StepsPerEpoch, $"epoch {e}"))
+            .Where(end => end.Item1 > xMin && end.Item1 < xMax)
+            .ToList();
 
     /// <summary>About <paramref name="count"/> round tick values (1, 2, 2.5, 5 x 10^n apart) inside [min, max].</summary>
     public static IReadOnlyList<double> Ticks(double min, double max, int count)

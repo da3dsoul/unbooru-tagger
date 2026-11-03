@@ -199,7 +199,13 @@ built the corpus around:
 - **Gold set** (`/media/da3dsoul/Golias/unbooru-tagger/gold`, not in git): 289
   hand-checked validation images (164 clean, 125 messy) with certain, group and
   ignore boxes (COCO-style crowd/ignore semantics). Scored by `evaluate --gold`,
-  rendered side by side with `render-gold`. Run 1's epoch-12 baseline is in
+  rendered side by side with `render-gold`. A third set is being built (2026-11-02, `gold-auto/`, not in git; its
+  README.txt): 1,020 held-out images, 34 object tags x 30 at full-body/cowboy/upper-body framing, boxes proposed by OWLv2 and
+  Grounding DINO and checked by Claude subagents (`tools/CHECK.md`), calibrated blind against gold-small's verified boxes
+  (`tools/score.py`: detectors alone at score >= 0.2 find 66% of them with 27% precision; a 5-image pilot of the check found 9
+  of 11 at 90% precision). A second set, gold-small (`gold-small/`, 126 small-object images held out from run 4), is
+  scored on its own by `evaluate --gold-small` into `localization_report_small.json` and charted beside the main set
+  (most main-set images are in run 4's training split). Run 1's epoch-12 baseline is in
   `run1-small-convnext-epoch12-COMPARISON-ONLY/README.txt`. With a model, `render-gold`
   writes the detections to `boxes.json` instead of PNGs (unless `--png`), which the gold
   set's `compare.html` draws on a canvas, one list entry per box: in a PNG, overlapping
@@ -235,6 +241,17 @@ built the corpus around:
   vocabulary, e.g. witch_hat → hat, red_hat → hat). Danbooru applies them to every post,
   Gelbooru doesn't, so `TagImplications.Complete` adds each image's implied tags when the
   tags are loaded (train and `evaluate`). Ground truth, not a statistic.
+- **Tag parentage (`--tag-parentage`, `TagParentage`/`TagFamilies`, run 4 from step ~502K):** the user's
+  reviewed is-a / implies / excludes rules (the tag-parentage review page's `rules.json`, outside git), where the
+  user's ontology wins over Danbooru's: on Danbooru `shoes` means non-boot shoes (9% of boot images carry it) and
+  `hair_ornament` leaves out ribbons and bows. Is-a and implies rules complete labels like Danbooru's implications
+  (boots → shoes, chaining through them). An image tagged with a family parent but no kind of it (shoes, not which)
+  leaves the kinds unknown (weight 0), not negative, and a parent is never a hard-negative source for its kinds; this
+  applies only through reviewed is-a edges, so Danbooru-only families (costume → character) keep their negatives.
+  Excludes rules (no_shoes, barefoot → shoes) make the parent and every kind of it certain negatives unless the image
+  is tagged with the parent (a second character), and their images are sampled first as hard negatives: the user's
+  point that no_X means the character usually has X. Evaluation reads labels the same way, and the gold set too (a
+  boots box is a shoes box; a parent-only box is ignored for its kinds). Saved into the checkpoint; `none` turns it off.
 - **Site coverage:** `export-image-sites` writes `image_sites.bin` (per cache row:
   Danbooru-only 1.18M, Gelbooru-only 1.33M, both 2.87M) and `export-tag-agreement` writes
   `tag_agreement.json` (per tag, over the 2.9M images on both sites: listed by both / one
@@ -327,6 +344,273 @@ built the corpus around:
 
   Run 4 on its own kept improving occlusion (still called 79% at 280K → 56% at 310K) while mAP
   rose. Gloves AP stayed ~0.35 in every arm.
+- **Occlusion object effect (2026-10-29).** The still-called rate is noisy: it counts only pairs found at p ≥ 0.5, the median
+  found score is 0.65 and the blanked one 0.54, so between checkpoints 4,500 steps apart 15% of shared pairs flip and a quarter
+  of the found set changes; two identical 6,000-step A/B controls differed by 7 points. The occlusion check now scores every
+  gold pair and reports `ObjectEffect`: mean logit(control blanked) − logit(object blanked), threshold-free over a fixed set.
+  It rose at every checkpoint (epoch 1 0.33 → 550K 0.41 → 622K 0.48 → 700K 0.51; gold-small 0.15 → 0.34) and the trend charts
+  show it instead of still-called. `evaluate --dump-occlusion` writes each pair.
+- **Positive/negative selection A/B (2026-10-29, A4000, 6,000 steps from 626,771, two controls; all off by default).**
+  `--out-of-context-share` (anchor positives with a low character/artist/series prior, `ContextPriorTable`): no effect (each
+  tag got about one per run). `--out-of-context-all --out-of-context-weight 3` (every low-prior positive, weight 3): context
+  recall gap 20.6 → 17.2 pts, false-positive gap 19.9 → 17.8, mAP equal, but gold object effect 0.767 → 0.728 (calls more,
+  doesn't look harder). `--excluder-share 0.2 --excluded-negative-weight 3` (anchors on tags an excludes rule rules out, with
+  no_X images as certain negatives): object effect +0.03 (gold) / +0.08 (gold-small), but footwear AP −0.03 to −0.05, since
+  half its anchors were kinds of shoe; the sampler now draws the ruled-out parents uniformly. That version lost the gain
+  (object effect 0.749 vs controls 0.774/0.768, shoes AP 0.618 vs 0.64), so neither is used.
+- **Erased-view training (`--erasure-*`, `ErasureContrast`, 2026-10-29; not adopted).** The occlusion check
+  as a loss (Shetty et al. 2019; GAIN/CSS for the negative variant). For called localizable positives, the region the tag's
+  own map points at (detached; capped at 15% of the image) is blanked, and so is a same-size control on another of the
+  image's tags (random if it has none). A hinge then makes the score drop at least `--erasure-margin` more for the object.
+  A/B on the A4000, 6,000 steps from 626,771, controls ctl/ctl2 (mAP 0.706/0.707, gold object effect 0.73):
+  - Zero-filled blanks, random control: object effect 0.87 but mAP 0.686. Re-scored with noise-filled blanks it hadn't
+    seen, 0.37, below the controls' 0.42: it had learned "a grey patch lowers a score".
+  - Negative variant (object-blanked view a negative, control-blanked a positive): object effect 1.08, no patch cue, but
+    every called score rose (median logit 1.8 vs 0.6) and mAP fell to 0.667.
+  - Mean/noise fills (`OcclusionFill`; no blur, since censoring is a tag, and no patches of other images, which can carry
+    the object), control on another tag, 2 pairs/step, weight 1: object effect 0.92 with unseen zero fills, but blanking
+    anywhere lowered scores (0.58 vs 0.09) and mAP 0.672.
+  - Same, 1 pair/step, weight 0.25: the best so far. Object effect 1.11 with unseen zero fills, 0.78 with noise (controls
+    0.73/0.42); control drop 0.28; object hurts more in 86% of pairs (controls 89/87%); mAP 0.692 (-1.4), pointing -0.8.
+  - Same, every 2nd step only (`--erasure-every 2`): object effect 0.92 with unseen zero fills (hinge3 1.11), 0.79 with
+    noise (hinge3 0.78; gold-small 0.61 vs controls 0.15/0.16); control drop 0.10 with zero fills, the controls' level
+    (hinge3 0.28); object hurts more 88%; mAP 0.698 (-0.8), pointing equal, exclusive violations 9.0% vs 7.8/6.6%.
+    Halving the dose kept the whole gain on the fill it trains with and half of it on the unseen one, with no "blanking
+    anywhere lowers scores" left.
+  - Every 4th step: object effect 0.92 with zero fills (same as every 2nd), 0.84 with noise and a control drop of 0.12
+    (every 2nd: 0.79/0.26); gold-small 0.61/0.47, below every 2nd's 0.75/0.61; mAP 0.703 (-0.3), pointing 48.6% (+0.8),
+    exclusive violations back to the controls'. 336 ms/step (+2%). Nearly free at 6,000 steps, but not with more training.
+  - Every 4th step continued with a control to 12,000 and 18,000 steps (2026-10-30): the mAP gap didn't close (12K 0.702
+    vs 0.707, 18K 0.703 vs 0.708; pointing -1.2 at both), and "blanking anywhere lowers scores" came back: the noise-filled
+    control drop went 0.12 (6K) → 0.67 (12K) → 0.31 (18K), against the control's 0.06. The hinge is relative, so a cue that
+    lowers both views costs it nothing. The object effect is a difference too, so it can't see such a cue; read it with the
+    control drop, and on a fill the arm never trained with. At 18K, over all 1,030 gold pairs, zero fill: object effect 0.74
+    vs 0.46, control drop 0.16 vs 0.06.
+  - `--erasure-anchor-weight` adds a term holding the control-blanked score to the unblanked one. One-sided (only a drop
+    penalized), weight 1, every 4th step, 12,000 steps: the patch cue went and overshot (noise control drop -0.13, so a blank
+    elsewhere raised scores), the object effect was the best of any arm (zero fill 1.09 vs 0.69, gold-small 0.71 vs 0.45;
+    noise 0.85 vs 0.41), but mAP 0.687 vs 0.707, image precision -2.2, recall where context makes a tag unlikely -1.3. The
+    term is now symmetric (|unblanked - control|). That fixed the overshoot: the control drop sat at the control's level
+    (zero fill 0.06 vs 0.07, noise 0.05 vs 0.06). Over all 1,030 gold pairs the object effect was 0.65 with zero fill (control
+    0.46, one-sided anchor 0.72, unanchored 0.59), 0.56 with noise (0.41), gold-small 0.43/0.26 (0.30/0.15). But mAP was
+    0.687 again, image precision -2.6, "general called explicit/questionable" 21.2% vs 17.8%. Anchored either way, the views
+    cost 2 mAP points; unanchored, they learn the patch cue. Context false positives and the hand-checked set: unchanged.
+  None of the doses moved the context false positives: averaged per tag, the false-positive rate where the character
+  usually has the tag is 22.5-22.7% in every erasure arm vs 23.4/23.7% in the controls, and recall where context makes a
+  tag unlikely is unchanged (32-33%), at 12K and 18K too. Erased views make a called tag depend on the object; they don't stop the call.
+  The 6,000-step zero-fill numbers are over the 455 gold pairs (216 gold-small) the controls' older reports dumped; noise
+  over all. Numbers over different pair sets aren't comparable.
+  `evaluate --occlusion-fill` sets the check's fill, to test whether a gain carries to a fill the model never trained on.
+  The views are picked right after the forward pass, so reading their maps back doesn't wait on the queued losses, and they
+  share the mosaic canvases' forward pass. `--erasure-every N` runs them every Nth step only. A4000, 400 steps each:
+  none 330 ms/step; 1 pair 390 in its own pass, 377 batched with the mosaics; 2 pairs 418; 1 pair every 2nd step 351.
+  The A4000 is compute-bound, so batching saved little; the extra images themselves are the cost.
+- **Context false positives are partly missing labels (2026-10-30).** Averaged per tag, run 4's false-positive rate where the
+  character usually has the tag (prior 60-90%) rose from 20.4% at 170K to 24.6% at 1,030K, while where the prior is under 5%
+  it fell from 8.1% to 3.0%. (The pooled rate, dominated by common tags, was flat, which hid it.) To see what those calls
+  are, 180 such negatives (36 each of gloves, hat, glasses, wings, tail) were checked by eye (`context-negatives/`, outside
+  git): the object is visible in 27, can't be told in 50 (crowds, comics, tiny figures) and absent in 103. A model calls
+  most of the visible ones (run 4: 48% at epoch 1, 59-70% since 700K) and few of the absent ones (5-9% up to 600K, 11-12%
+  since 700K; n=103, so ±3 pts). So most of the rise is the model finding objects nobody tagged; the real context false
+  positives rose a little, to about 11%, against well under 4% where the prior is low. Context negatives at full strength
+  train every one of those visible objects as a "no", so a higher `--context-negative-weight` pushes against real objects
+  too. A 6,000-step A/B at weight 6 (vs. 3) bore that out: false-positive rate where the prior is high 22.1% vs 23.4/23.7%,
+  with high-prior recall down as much (49.9% vs 52.2/52.7%), low-prior recall, object effect and mAP unchanged, and on the
+  checked set 12% of absent objects called (controls 16/10%) and 56% of visible ones (controls 59/56%). With hinge5's erased views added it was worse than either alone: blanking anywhere lowered scores again (noise-fill control drop 0.33 vs 0.12) and mAP 0.698. Solo, non-comic images are no cleaner (6 visible, 5 unclear, 32 absent of 43). `score.py` there scores any
+  `evaluate --dump-scores` output on this set.
+- **Labelled context check (2026-10-30, `evaluate --context-check`, `LabelledContextCheck`).** A cheap-first investigation
+  (`ctxfp/README.txt`, outside git) grew the hand-checked set with a Sonnet labeller, calibrated on the user's 180 (of the
+  user's 103 absent it marked 37 absent, 66 unclear, 0 present; of 27 present, 23 present, 4 unclear): 257 absent / 142
+  visible-but-untagged pairs over gloves/hat/glasses/wings/tail (`context-check/context-check.json`; 197/88 fall in the first
+  20K held-out images that evaluations score). On it run 4's calls on absent objects went 10% (700K) → 7-9% (1.09-1.24M),
+  mean log-odds past the threshold -0.94 → -1.28, while visible-but-untagged calls stayed ~70-77%; over the same steps the
+  band false-positive gap rose. So the band gap mostly counts untagged objects the model finds, and true context false
+  positives are flat to slightly falling. Evaluations report both rates and chart the mean log-odds past the threshold (on run 4's snapshots, the absent rate
+  jumped between neighbours by 0.44 of its trend's range, the log-odds by 0.08); reports from before were backfilled
+  from their scores.jsonl (`context-check/backfill.py`). The same investigation ruled out, cheaply: a last-layer refit on
+  held-out data (upweighting context negatives cut false positives and recall 1:1, as at training time), scoring tags from
+  their best local cells at inference (no fewer absent calls; hat AP 0.53 → 0.37), cleaning labels by tag count, and the
+  `neg` erasure arm (its lead on the user's set didn't hold on the added images). Two identical 6K controls differ by 4
+  points on it, so 6K-step arms can't resolve this. The agent added `--erasure-loss negative-only` (off by default, untested
+  beyond 113 steps).
+- **A stricter threshold where context makes a tag likely (2026-10-30, `context-margin/`, outside git): not viable.** Run 4
+  at 1.316M, 100K held-out images, 35 object tags, the prior from the characters/artists/series the model itself calls
+  (precision 0.63, recall 0.54 against the labels). Lowering an object tag's logit by 0.25 where its prior is 60-90%: absent
+  objects called 10.5% → 7.4%, visible-but-untagged 71% → 66%, band recall 59% → 53%, macro AP 0.467 → 0.460, F1 down on
+  every tag; larger margins trade the same way. An operating point, not a better model.
+- **Glimpses (`--classification-glimpses`, `Model/Glimpses.cs`; run 5, `train-v5.sh`, from 2026-10-31).** Localizable tags
+  are decided from close looks the model chooses, so "gloves" is decided from the gloves, not the character. A whole-image
+  pass can't separate them: every map location, the localization map's included, sees most of a 512px image, so the averaged
+  score, the map-cell score (classification pooling) and the last-layer refit all kept the context. A 64px glimpse of a
+  window physically can't see the face.
+  - The model's forward, the same in training, evaluation and inference: (1) the proposal head (`ImageTower.Proposals`, a
+    D x D matrix on the pooled embedding, trained on every localizable tag from the labels) ranks what the image might hold,
+    context included; (2) the localization map gives each suspect's peak; (3) the glimpse sensor looks there with one window
+    per zoom (32/64/128/256px, centred on the peak; box filter to shrink, bilinear to enlarge; a learned zoom code each),
+    48 windows per image after merging repeats (`Glimpses.Propose`, `Sensor`, `SameLookAs`), the zoomed-out grid filling
+    any left over; (4) the localizable tags' scores are a log-sum-exp over those glimpses, so which zoom shows a tag best is
+    learned. Whole-image tags (`localizable_tags.txt`'s exclusions) keep the whole image; characters are localizable, so they
+    are glimpse-scored too (the docs said otherwise until 2026-11-01). Their AP matched run 4's at the same step (0.507 at 110K
+    vs 0.500 at 103K), but few clear 0.5 (on gold, 0.8% of character pairs): calibration, which per-tag thresholds absorb. A wrong suspicion ("this character, therefore gloves")
+    gets a close look and is trained as a "no".
+  - Training: a labelled positive the choice didn't look at closely (`Glimpses.Frames`: a window other than the 256px one
+    at its own peak) gets no glimpse loss (`--glimpse-unframed-positive-weight 0`): the classifier never saw it, and training
+    it "yes" would teach it from whatever the windows showed. The proposal and localization losses teach the model to find
+    it. While a fresh run's map can't point, a share of the windows (half at step 0, none from `--glimpse-label-framing-steps`)
+    looks at labelled positives by the same sensor rule. The localization loss's mined negatives are ranked by the
+    classifier's actual scores (they used to be ranked by the whole-image embedding, which a glimpse tower never trains for
+    localizable tags).
+  - The choice was measured against the gold boxes on run 4's map (`glimpse-frames`), not guessed. Ranking by the map put
+    6% of gold tags in an image's top 32 (it is trained on ~100 pairs per image, so its scores for the rest aren't
+    comparable); the whole-image classifier 68%. Choosing one zoom per tag from the map's response blob matched the right
+    zoom at best 41% of the time (no blob rule worked), hence the sensor. 16/32/48/64 windows frame 55/75/87/91% of gold
+    tags.
+  - **Run 5 replaces a first glimpse run (deleted 2026-10-31).** It let the labels pick its training windows (half framing
+    the positives' peaks, the rest random) and scored a fixed 378-window grid at evaluation (~6x a whole-image pass, ~30 min
+    on the A4000; bf16 didn't speed it up). The model never learned where to look, a wrong tag's peak was never looked at
+    closely, and with 16 windows in training and 378 at evaluation its scores' scale differed between the two.
+  - B70 speed: the glimpse batch is padded to a fixed size (`Glimpses.Embed`'s `padTo`; every new batch size compiled new
+    oneDNN kernels, ~2.5s each, more sizes than the cache holds: 426 -> 237 ms/step), and `ConvNeXtBlock` runs its MLP's 1x1
+    convolutions as one matrix multiply over every pixel's channels (`MixedPrecision.Rows`; oneDNN's 1x1 weight gradient ran
+    ~7x the forward, and a per-image batched multiply wasted the device on 480 glimpses with 2x2-16x16 maps). Glimpses take
+    only the pooled embedding (`ImageTower.ForwardPooledOnly`: each level's masked sum is taken over its input features and
+    projected after, exact since the projections are 1x1, so no embedding-wide maps or localization chain are built), and all
+    480 of a step run in one pass. B70, forward + backward: glimpse pass 91.7 -> 63.8 ms, the 10-image 512px pass 127 -> 109 ms
+    (2026-10-31, run 5 at step 4,331). Nothing in a step reads the device back: the window choice, crops, framing check and the
+    localization and mosaic pairs' mined negatives run on the device, and the dashboard's losses are read every 25 steps (each
+    read made the device finish the step and idle while the CPU set up the next). Uploads go from pinned memory without
+    blocking (`DeviceUpload`): on the B70 a copy from ordinary memory waits for the whole queue (147 ms behind 146 ms of
+    queued work). The pinned staging copies are held until the device has finished (released after the every-25-step read
+    back): freed as soon as the copy was queued, the copy engine faulted after ~25 minutes of training (xe "Engine memory CAT
+    error, class=bcs", engine reset, trainer hung in backward()), though a stress test of exactly that had passed. 247 -> 237 -> 228 ms/step. The tower runs channels-last on the device (`ImageTower.ChannelsLast`): bf16
+    convolutions on the B70 return channels-last, and group norm put each block back in NCHW for its MLP to copy out again;
+    with one group it equals a layer norm over (C, H, W), which `MixedPrecision.Norm` now runs on the NHWC view (same values
+    and gradients, tested). 228 -> 205 ms/step. A tanh GELU was no faster (elementwise ops are bound by memory traffic). The copy engine itself turned out to be the fault: the same bcs CAT error, at nearly the same GPU address,
+    had hit runs 3 and 4 (2026-10-24, 10-27) and two A/B arms on 2026-11-01 (one 16 minutes in, one 26), with or without the
+    pinned staging copies, so holding them wasn't the fix (the same signature is reported on other B70s: intel/torch-xpu-ops#5867,
+    vllm#61300; compute runtime 26.05.37020 here, a vLLM user saw none after 26.35). The trainer kept the bcs about as busy as the
+    compute engine (`drm-cycles-bcs` in /proc/PID/fdinfo). The NEO key `OverrideCopyOffloadMode=0` (train-v5.sh) keeps every copy
+    on the compute engine: no bcs cycles at all, the same upload timings and 204 ms/step. `UR_L0_USE_COPY_ENGINE=0` and
+    `ForceCopyOperationOffloadForComputeCmdList=0` don't stop it. Checkpoints are written to a staging directory and moved in
+    once complete (`StagedSave`), so a fault mid-save leaves the previous one whole; `xpu-test/watchdog-v5.sh` restarts the run
+    in place after a fault, a hang or a crash. Batch sampling isn't seeded, so per-run statistics such as the unframed share
+    differ by a few points between identical runs. `benchmark-tower --glimpses N --vary` times the glimpse path. Not
+    exported to ONNX; `export-onnx --ignore-pooling` exports the boxes (from the localization map) and `render-gold --scores`
+    takes the evaluation's glimpse-scored gold pairs. `evaluate --glimpse-grid` scores the old fixed grid instead.
+- **Faster, content-pooled gold checks (2026-10-29).** The gold checks had grown slow: a snapshot evaluation spent ~10 of
+  its ~14.5 minutes on 415 gold images. Every pass copied the full fp32 feature maps (about 33 MB per image) to the CPU and
+  averaged them there, and each heatmap re-copied the map per tag. The map-scored occlusion check also re-ran the whole
+  check one pair at a time, though nothing charts it. Scores now come from `ImageTower.ForwardPooled`, 32 images per pass,
+  heatmaps are computed on the device, the map-scored check is off unless `--map-score-temperature` is given, and
+  `evaluate` prints each phase's time. The held-out embedding uses `ForwardPooled` too. On the 850K checkpoint every
+  reported number was unchanged, and the whole evaluation took 362s instead of 839s. Now: held-out embedding 216s (about
+  93 images/s, compute-bound in fp32), rankings 37s, gold 55s, gold-small 28s.
+  The gold checks also pooled scores over the whole canvas, letterbox bars included, while training and the held-out
+  evaluation pool content only; they now pool content only. The old snapshots' weights are gone, so the checkpoints that
+  kept theirs were re-scored to bridge the trend (`review/content-pool/`). Gold object effect, whole canvas → content only:
+  485K 0.33 → 0.49, 550K 0.41 → 0.52, 850K 0.59 → 0.76 (272K 0.21 and 627K 0.60 content only); gold-small 0.15 → 0.24,
+  0.25 → 0.34, 0.38 → 0.50. Same order, about 0.15 higher: run 4's charted series steps up where the switch happened
+  (snapshots after 22:30 on 2026-10-29). Gold pointing and the crop teacher's crops don't depend on it.
+- **Glimpse funnel (2026-11-01, `LocalizationReport.GlimpseFunnel`, in place of the crop teacher in run 5's snapshot
+  evaluations).** Per labelled localizable gold pair, by size: is the tag among the proposal head's top 48 (suspected); does a
+  close window (<=128px) sit on its own map peak (what training's "framed" share counts); does a close window chosen for any
+  tag cover its gold box (`Covers`: overlap >= half the smaller); is the tag's highest-scoring glimpse on the object, against
+  the share of glimpses that are (chance); which zoom that glimpse is; and the called rate with and without a covering window.
+  Run 5 at ~118K, medium objects: suspected 59%, covered 82%, best glimpse on the object 28% (chance 13%), called 36% when
+  covered vs 17% when not; small 31% (chance 13%); large 32% (chance 28%). The windows find the objects; the classifier's
+  strongest evidence is mostly elsewhere. Its "called" matches the occlusion dump's scores exactly.
+- **Locality negatives (`--locality-negative-weight`, `LocalityNegatives`, 2026-11-01; not adopted yet).** The user's
+  idea: some tags can't share a close look (glasses and shoes; gloves and a face can), so a close window where one labelled tag
+  is confidently found trains each other labelled tag "no" there, weighted by how rarely the two are together. That table is
+  learned as training runs (each pair's best close windows within 64px, weighted by confidence, decaying), optionally seeded
+  from a trained map (`evaluate --locality-prior-out`: run 4's peaks over 20K training images, 385,691 pairs; shoes/glasses 1.5%
+  together, shoes/hat 2.8%, gloves/hat 7%, hat/glasses 23%, shoes/boots 61%). A/B on the B70, 6,000 steps from run 5 at
+  189,803, ctl / online / online + run 4 prior, weight 1:
+  - Best glimpse on the object (funnel, chance ~13% medium/small, 28% large): medium 31.9% / 60.6% / 59.5%, small 28.5% /
+    59.2% / 68.9%, large 38.6% / 58.1% / 56.7%, gold-small 34.9% / 63.4% / 60.2%. It does what it was meant to.
+  - But mAP 0.483 / 0.412 / 0.370, micro precision 0.173 / 0.086 / 0.069 (recall 0.373 / 0.420 / 0.452), absent objects
+    called on the labelled context set 18% / 57% / 75%, object effect 0.130 / 0.097 / 0.045 (gold-small 0.082 / 0.00 / -0.02).
+    The prior (more pairs known from the start, so more negatives) was worse: a dose effect. A negative that only says where
+    a tag isn't is cheapest to satisfy by firing everywhere else, and the term sums over every pair of an image's labelled
+    tags, so busy images got the most.
+  - Dose arms (`--locality-per-pair`: each image's term the mean over its pairs; `--locality-confidence-gate 0.9`: only
+    windows where A is called at p >= 0.9 give negatives; same start and control). Weight 0.3: best glimpse on the object
+    medium 54.6%, small 64.5%, large 54.8%, gold-small 56.5%, most of the weight-1 gain; mAP 0.475 (-0.008), micro precision
+    0.155 / recall 0.380, absent objects called 26% (controls of one recipe differ by ~4 pts there), object effect 0.091 /
+    gold-small 0.043, control drop 0.009 (the control's 0.013). Finding the object better didn't yet make the call depend on
+    it more. Weight 1 (the rerun; the first try died to an xe "VM worker error: -12" with the host at 5 GB free): best on
+    object about the same (medium 57.5%, small 64.0%, gold-small 61.4%), every cost larger: mAP 0.453, precision 0.128,
+    absent called 37%, exclusive violations 17.0%, object effect 0.072. The gain is full by 0.3; the costs grow with the dose.
+    Weight 0.1: nearly free and still a real gain: best on object medium 40.7%, small 47.8%, large 51.4%, gold-small 45.3%;
+    mAP 0.481, precision 0.168, absent called 19%, exclusive violations 13.5%, object effect 0.116 / 0.072 (all within the
+    noise of two identical controls). Weight 0.3 with `--locality-detach-scaling` (no gradient into the shared logit scale
+    and bias) matched plain 0.3 (mAP 0.474, precision 0.151, absent called 26%), so the cost isn't the shared bias. In no arm
+    did the object effect rise: the model looks at the object more, but its call doesn't depend on it more yet. Candidate:
+    weight 0.1, per pair, gate 0.9; in run 5 from step ~238K (`train-v5.sh`). The term's per-image tag rows must be padded to
+    fixed widths (`PaddedRows.Upload`'s `padTo`, 32): unpadded, their count changed nearly every step, VRAM grew ~2 GB a minute
+    and the trainer died after 14-18 minutes with UR_RESULT_ERROR_OUT_OF_RESOURCES / xe "VM worker error: -12" (pp1's first
+    try and run 5 at 21:20). Padded, VRAM held at 23.4 GB for the first 11 minutes, but the trainer died the same way after 47
+    (22:11), so the term is off in run 5 again from ~22:15 (step 256K) until the remaining growth is found (its masked_select /
+    index_put_ table updates also change size every step). At 250K, with ~12K steps of it: best glimpse on the object, medium,
+    59.5% (25-31% over the 100K steps before); glimpse-scored non-character AP still 0.039 behind run 4's. `review/locality/compare-arms.py` prints the arms side by side.
+  - Correction (2026-11-01 23:30): the best-on-object gain is an artifact. The term only penalizes close windows (32-128px),
+    so the model moved its evidence into the 256px window, a quarter of the image with the context in it: the winning zoom for
+    small/medium objects was 256px in 5-12% of pairs in the control, ~50% at 0.1, 90%+ at 0.3, all at weight 1, and in run 5
+    itself 10% (230K) -> 75% (250K). The funnel's chance level is over all windows, not the winning zoom, so bigger windows
+    read as "on the object". Not adopted.
+- **Glimpse pooling investigation (2026-11-01/02, `review/pooling/PLAN.md`; run 5 stopped at 277,022).** The user saw run 5's
+  charts track run 4's. Per-window gold dumps (`evaluate --dump-occlusion` also writes `glimpse_pairs*.jsonl` and
+  `glimpse_embeddings*.jsonl`; `review/glimpse-dump/`, `review/pooling/compare.py`) showed every glimpse learning the image's
+  label: on medium objects, window logits on and off the object differ by +0.6, 31% of windows that don't touch the object fire
+  for it, ~26 of 48 windows carry each score, and the best window alone would call 98% of labelled gold pairs vs 41% pooled. The
+  log-sum-exp temperature (0.5) is in dot units, before the learned scale (~8.6), so in logit units it is ~4.3, nearly a mean.
+  Judged on within-pair on/off-object window AUC at a fixed zoom (64/128px), not mixed-size gaps or the funnel. Arms, 6K or 12K
+  steps from run 5 at 189,803, control ctl12 (12K: mAP 0.490, absent objects called 13%, medium 64px AUC 0.66); none adopted:
+  - Sharper pooling (`--classification-pooling-temperature` 0.12/0.06/0.03, `--classification-pooling-top-k` 1/3, WILDCAT
+    `--classification-pooling-bottom-weight`, `--glimpse-pool-zooms 3`, `--glimpse-pool-min-zoom`): monotone trade. T 0.5 / 0.12 /
+    0.06 / 0.03: mAP 0.483 / 0.484 / 0.469 / 0.446, off-object windows firing 31 / 24 / 19 / 9%, window gap never wider; hard max
+    mAP 0.409. A window the object fills scores at chance (AUC 0.51-0.58) in every arm. 0.12 is the only free setting.
+  - Label framing kept on (`--glimpse-label-framing-floor 8`, `--glimpse-framed-positive-pooling`): null; the map's peak frames
+    a medium object ~1 time in 12, so framed positives mostly trained context windows "yes".
+  - Proposal loss kept off the tag rows (`--glimpse-proposal-detach-tags`): null.
+  - A separate glimpse tower (`--separate-glimpse-tower`, `ImageTower.GlimpseTower`, `--glimpse-tower-lr-scale`): at T 0.5 a
+    small probe gain (+0.04) for -1.3 mAP; under sharp pooling it learned the image's identity instead (same-image nearest
+    neighbour 32% -> 45%): the cheapest window feature for an image label is the character/palette/style every crop shows.
+  - Same-source pairs (`--context-pairs-per-batch`, `--context-pair-weight/-margin`: one image of a character with the tag, one
+    without, a hinge on their pooled glimpse logits): weight 1 collapsed every window (mAP 0.315); 0.1 cost 5 mAP points.
+  - Singh et al. 2020's feature split (`--glimpse-feature-split*`, `--glimpse-exclusive-per-batch`, `evaluate
+    --glimpse-object-only`), exclusive = a known character/artist/series with prior < 0.2, limited to the 1,980 tags with context
+    sources: mAP 0.477 / 0.471, absent called 18 / 20%; the object half alone can't call the tags (mAP 0.21-0.25).
+  - The ceiling test (`window-probe`, `WindowProbeCommandHandler`, `review/window-probe/`): ctl12's glimpse path fine-tuned on
+    gold-box windows (yes = holds half a box or is half filled by one, no = touches none; rows and scale frozen; 5 folds by image
+    over 402 gold images). Medium 64px on/off AUC 0.66 -> 0.80, also against windows on another labelled object (0.65 -> 0.80).
+    The sensor isn't the floor: run 5's losses never give a window a within-image "no". Training mustn't depend on the hand-made
+    gold set (the user), so the next arms derived window labels from tags:
+  - Mosaic window labels (`--mosaic-glimpse-weight`, `Mosaic.GlimpseTerm`: glimpses on the mosaic canvases, a tag's windows on
+    other tiles "no", its own tile a "yes" bag): mAP 0.432, calls up everywhere; the "no" windows show other images, which
+    ordinary negatives already cover.
+  - Matched twins (the user's idea; `--twin-every`, `TagCentricBatchSampler.SampleTwins`, `TwinWindows`): every Nth batch is one
+    image with a localizable general tag and 9 without it whose tags overlap it most (Jaccard, at most one character each); the
+    half of the positive's windows most like 3 twins' windows (cosine, excluding the one holding the tag's map peak) are "no".
+    Weight 1 (tw2): mAP 0.442; the batches alone (tw0, weight 0) 0.482; weight 0.2 0.477 (no gain); weight 1 with
+    `--twin-detach-scaling` 0.438 (so not the shared bias). `evaluate --twin-check` (`TwinCheck`) scores the rule against gold:
+    its "no" windows hold the object 12% of the time vs a 16% base rate, too weak a label.
+  - Pasted twins (`--twin-paste`, `TwinPaste`): the positive's 64/96/128px region at its tag's map peak is pasted (feathered) into
+    2 twins, which then carry the tag, and a region from elsewhere into 2 others as certain negatives, so a paste cue can't pay;
+    only when the peak's own logit is >= 0. Run 5's map can't place it (gold-small peak on the object 8.5% vs run 4's 55%), so it
+    ran on run 4 (`review/run4-twins/`, 12K from 1,495,198): control / twin batches / twins + pastes (11,993 pastes) mAP
+    0.788 / 0.787 / 0.787, absent called 10 / 9 / 10%, object effect 1.14 / 1.16 / 1.10, pointing 67.8 / 66.9 / 65.8%: noise.
+  Built, no A/B result recorded: `--negative-loss hill` (Hill loss for unverified negatives) and `--hard-negative-source-weight`.
+  Run 5's "ideal" for an object tag (gap >= 2 logits, < 10% off-object firing, few windows carrying the score) wasn't reached by
+  any label-only change; window-level supervision is what moved it.
+- **Gold box metrics fixed (2026-11-01).** The gold checks extracted boxes with none of `detect`'s speck filtering, so on a
+  128x128 map every above-cutoff speck was a box: ~150-190 per pair, box precision 0.1-0.3% and a count error of ~100-190 in
+  every run, run 4 at 1.49M included. They now use `detect`'s defaults (`TagScorer.Default*`: regions of at least 0.2% of the
+  map, at most 3 boxes per tag), still without its edge-guided refinement, which needs the source image. Run 5 at ~105K: count
+  error 176.7 -> 1.7, box precision 0.2% -> 7.9% (characters 20.6%), recall 21.5% -> 15.5% (the specks had hit some boxes by
+  chance); pointing and energy unchanged. Box numbers from before aren't comparable. Run 5's snapshot evaluations also pass
+  `--no-crop-teacher` (the crop teacher only matters to crop consistency, which run 5 doesn't use; ~40% of its gold checks)
+  and `--precision tf32` (held-out embedding -27%, gold -24%, mAP equal to 4 decimals).
 - **TorchSharp memory and determinism.** TorchSharp frees a tensor when its dispose scope
   ends, not when it goes out of use, so `ConvNeXtBlock.forward` and the tower's forwards open
   their own scopes; before that, a forward held every intermediate until the caller's scope ended
@@ -344,6 +628,10 @@ built the corpus around:
   weights cast per call, with fp32 outputs, gradients and checkpoints: 223 → 199 ms/step, and a
   6,000-step A/B kept mAP (0.576 vs 0.575) and gold pointing (32.3% vs 32.6%). Run 4 uses it from
   step 359,388. It isn't saved in the checkpoint.
+  From step ~1,499,226 (2026-11-02) run 4 trains on the build with run 5's speed work (the blocks' 1x1 convolutions as one
+  matrix multiply, channels-last with the norm on the NHWC view, pinned non-blocking uploads, no per-step device read-backs;
+  see Glimpses' B70 speed): 221 -> 142 ms/step with the same recipe and checkpoint. A 12,000-step arm of it reached run 4's own
+  mAP (0.788 vs 0.787 at 1.49M), and its checkpoints still load in the older evaluation build that run 4's trend charts use.
 
 ## Localization — implemented: heatmap, and (beyond the original scope) approximate boxes
 - **Heatmap** (`TagScorer.Heatmap`; `unbooru-tagger-inference heatmap`

@@ -61,12 +61,12 @@ public static class DetectCommandHandler
     /// </summary>
     public static List<TagDetection> Detect(
         ModelBundle model, string imagePath, float? threshold, float boxThreshold, float boxPercentile, float minHeatmapRange = 0.05f,
-        float minBoxFraction = 0f, int maxBoxesPerTag = 0)
+        float minBoxFraction = 0f, int maxBoxesPerTag = 0, IReadOnlyDictionary<string, float>? scores = null, IReadOnlySet<string>? onlyTags = null)
     {
         using var bitmap = SKBitmap.Decode(imagePath)
             ?? throw new InvalidDataException($"Could not decode image at '{imagePath}'.");
         var encoding = model.ImageEncoder.EncodeBatch([ImagePreprocessing.Normalize(bitmap, model.ImageEncoder.InputSize)])[0];
-        return Detect(model, encoding, RefinementGuide.From(bitmap), threshold, boxThreshold, boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag);
+        return Detect(model, encoding, RefinementGuide.From(bitmap), threshold, boxThreshold, boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag, scores, onlyTags);
     }
 
     /// <summary>What box refinement needs from the source image, so a caller can drop the decoded bitmap early.</summary>
@@ -76,15 +76,16 @@ public static class DetectCommandHandler
             new(HeatmapRefiner.BuildGuide(bitmap, RefinementSize, out var content), content, bitmap.Width, bitmap.Height);
     }
 
-    /// <summary>Same as <see cref="Detect(ModelBundle, string, float?, float, float, float, float, int)"/> for an image already encoded (e.g. as part of a batch).</summary>
+    /// <summary>Same as <see cref="Detect(ModelBundle, string, float?, float, float, float, float, int, IReadOnlyDictionary{string, float}, IReadOnlySet{string})"/> for an image already encoded (e.g. as part of a batch).</summary>
     public static List<TagDetection> Detect(
         ModelBundle model, ImageEncoding encoding, RefinementGuide guide, float? threshold, float boxThreshold, float boxPercentile,
-        float minHeatmapRange = 0.05f, float minBoxFraction = 0f, int maxBoxesPerTag = 0)
+        float minHeatmapRange = 0.05f, float minBoxFraction = 0f, int maxBoxesPerTag = 0, IReadOnlyDictionary<string, float>? scores = null,
+        IReadOnlySet<string>? onlyTags = null)
     {
         var spatialFeatures = encoding.SpatialFeatures
             ?? throw new ArgumentException("Detection needs the encoding's spatial features (EncodeBatch with withHeatmapFeatures: true).", nameof(encoding));
         var detections = new List<TagDetection>();
-        foreach (var (row, confidence) in TagCommandHandler.ScoreRows(model, encoding, threshold))
+        foreach (var (row, confidence) in TagCommandHandler.ScoreRows(model, encoding, threshold, scores, onlyTags))
         {
             var tag = model.Vocabulary.GetByRowIndex(row).Tag;
             if (!model.Localizability.IsLocalizable(tag))

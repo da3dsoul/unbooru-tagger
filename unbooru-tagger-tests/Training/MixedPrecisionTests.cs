@@ -86,4 +86,62 @@ public class MixedPrecisionTests
             Assert.InRange(RelativeError(actual.Gradients[i], expected.Gradients[i]), 0, 0.1);
         }
     }
+
+    [Fact]
+    public void Norm_OnAChannelsLastInput_IsTheGroupNorm_AndKeepsTheLayout()
+    {
+        manual_seed(4);
+        var norm = UnbooruTagger.Training.Model.ConvNeXtBlock.NewGroupNorm(6, null);
+        using (no_grad())
+        {
+            norm.weight!.normal_();
+            norm.bias!.normal_();
+        }
+        using var source = randn(3, 6, 5, 7);
+        var x = MixedPrecision.ToChannelsLast(source).requires_grad_(true);
+        var reference = source.clone().requires_grad_(true);
+
+        var output = MixedPrecision.Norm(norm, x);
+        output.square().sum().backward();
+        var gradients = (x.grad!.clone(), norm.weight!.grad!.clone(), norm.bias!.grad!.clone());
+        norm.zero_grad();
+        var expected = norm.forward(reference);
+        expected.square().sum().backward();
+
+        Assert.True(MixedPrecision.IsChannelsLast(output));
+        Assert.True(output.allclose(expected, rtol: 1e-5, atol: 1e-5));
+        Assert.True(gradients.Item1.allclose(reference.grad!, rtol: 1e-4, atol: 1e-5));
+        Assert.True(gradients.Item2.allclose(norm.weight.grad!, rtol: 1e-4, atol: 1e-5));
+        Assert.True(gradients.Item3.allclose(norm.bias.grad!, rtol: 1e-4, atol: 1e-5));
+    }
+
+    [Fact]
+    public void Tower_ChannelsLast_GivesTheSameMapsAndGradients()
+    {
+        manual_seed(8);
+        var tower = new UnbooruTagger.Training.Model.ImageTower(8, stemChannels: 8, stageChannels: [8, 16, 32], blocksPerStage: [1, 1, 1], fusedStages: 2)
+            { LocalizationFromFusedOnly = true };
+        using var images = randn(2, 3, 64, 64);
+        using var mask = ones(2, 1, 16, 16);
+
+        Tensor[] Run(bool channelsLast, out Tensor spatial, out Tensor localization, out Tensor pooled)
+        {
+            tower.ChannelsLast = channelsLast;
+            tower.zero_grad();
+            (spatial, localization) = tower.ForwardMaps(images);
+            pooled = tower.ForwardPooled(images, mask).Pooled;
+            (spatial.square().mean() + localization.abs().mean() + pooled.square().sum()).backward();
+            return tower.parameters().Select(p => p.grad!.clone()).ToArray();
+        }
+
+        var plain = Run(false, out var spatial, out var localization, out var pooled);
+        var last = Run(true, out var spatialLast, out var localizationLast, out var pooledLast);
+
+        Assert.True(spatialLast.allclose(spatial, rtol: 1e-4, atol: 1e-5));
+        Assert.True(localizationLast.allclose(localization, rtol: 1e-4, atol: 1e-5));
+        Assert.True(pooledLast.allclose(pooled, rtol: 1e-4, atol: 1e-5));
+        Assert.True(localizationLast.is_contiguous(), "the map comes out in NCHW order");
+        for (var i = 0; i < plain.Length; i++)
+            Assert.True(last[i].allclose(plain[i], rtol: 1e-3, atol: 1e-6), $"parameter {i} differs");
+    }
 }

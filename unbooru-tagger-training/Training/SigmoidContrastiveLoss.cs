@@ -10,6 +10,15 @@ namespace UnbooruTagger.Training.Training;
 /// </summary>
 public static class SigmoidContrastiveLoss
 {
+    /// <summary>
+    /// The unverified negatives' loss (pairs with a focal mask): false = the asymmetric loss (negative gamma / clip), true =
+    /// the Hill loss (Zhang et al. 2021, "Simple and Robust Loss Design for Multi-Label Learning with Missing Labels"),
+    /// <c>(1.5 − p) · p²</c>, whose gradient peaks at p = 0.5 and falls to 0 as p → 1, so a confident "yes" on an unlabelled
+    /// object stops being pushed down. Under hard glimpse pooling that push lands on the very window showing the object.
+    /// Set once per training run (<c>train --negative-loss hill</c>).
+    /// </summary>
+    public static bool HillNegatives { get; set; }
+
     /// <param name="imageEmbeddings">[batchImages, dim]</param>
     /// <param name="tagEmbeddings">[batchTags, dim]</param>
     /// <param name="labels">[batchImages, batchTags]: +1 where the image is tagged with that tag, -1 otherwise.</param>
@@ -206,7 +215,12 @@ public static class SigmoidContrastiveLoss
         // exactly softplus(logits), computed stably that way instead. The focal factor is
         // detached (treated as a per-pair weight), the common stable ASL variant.
         Tensor asl;
-        if (negativeClip > 0)
+        if (HillNegatives)
+        {
+            var p = logits.sigmoid();
+            asl = (1.5f - p) * p.square();
+        }
+        else if (negativeClip > 0)
         {
             var shifted = (logits.sigmoid() - negativeClip).clamp_min(0);
             asl = -(-shifted).log1p();

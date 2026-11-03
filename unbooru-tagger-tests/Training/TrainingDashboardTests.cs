@@ -28,6 +28,26 @@ public class TrainingDashboardTests
     }
 
     [Fact]
+    public void StepProgress_MovesTheStepEveryStep_AndLossesArriveLaterAtTheirOwnSteps()
+    {
+        // Training reports each step as it ends and its losses when it reads them back, every 25 steps.
+        var now = new DateTime(2026, 10, 22, 12, 0, 0);
+        var dashboard = new TrainingDashboard(Info, () => now);
+        for (var step = 199_001; step <= 199_025; step++)
+        {
+            now = now.AddSeconds(0.2);
+            dashboard.StepProgress(step, 1e-4, 200, 0);
+        }
+        Assert.Equal(199_025, dashboard.ChartData().Series.CurrentStep);
+
+        for (var step = 199_001; step <= 199_025; step++)
+            dashboard.StepLosses(step, 3f, 2f, 1f);
+        var history = dashboard.ChartData().Series.Loss;
+        Assert.InRange(history.Buckets.Count == 0 ? 0 : history.Buckets[^1].Mean, 0, 3f);
+        Assert.InRange(dashboard.StepsPerSecond(), 4.9, 5.1);
+    }
+
+    [Fact]
     public void Render_ShowsEpochAndRunEstimatesSeparately()
     {
         var now = new DateTime(2026, 10, 22, 12, 0, 0);
@@ -116,15 +136,16 @@ public class TrainingDashboardTests
     {
         var now = new DateTime(2026, 10, 27, 2, 0, 0);
         var dashboard = new TrainingDashboard(Info with { EvaluationsOffloaded = true, SnapshotEvaluationSteps = 10_000 }, () => now);
-        dashboard.AddEvaluationPoint(new EvaluationPoint(190_000, false, 0.40, 0.29, 0.056, 0.107, 0.86, 0.27));
-        dashboard.AddEvaluationPoint(new EvaluationPoint(200_000, false, 0.42, 0.30, 0.060, 0.100, 0.84, double.NaN));
+        dashboard.AddEvaluationPoint(new EvaluationPoint(190_000, false, 0.40, 0.29, 0.056, 0.107, 0.86, 0.27, ObjectEffect: 0.41));
+        dashboard.AddEvaluationPoint(new EvaluationPoint(200_000, false, 0.42, 0.30, 0.060, 0.100, 0.84, double.NaN, ObjectEffect: 0.45));
         dashboard.SnapshotEvaluationStarted(210_000);
 
         var text = Render(dashboard);
         Assert.Contains("every 10,000 steps · 2 evaluated so far · next at step 200,000", text);
         Assert.Contains("evaluating step 210,000 (since 02:00)", text);
         Assert.Contains("held-out mAP 0.420 +0.020 since step 190K", text);
-        Assert.Contains("blanked object still called 84.0% −2.0% since step 190K ↓", text);
+        Assert.Contains("object effect (log-odds) 0.450 +0.040 since step 190K", text);
+        Assert.Contains("context recall gap 6.0% +0.4% since step 190K ↓", text);
         Assert.Contains("exclusive-tag violations 27.0%", text); // the latest point without it keeps the last known value
         Assert.Contains("190K", text);
         Assert.Contains("200K", text);
@@ -138,5 +159,44 @@ public class TrainingDashboardTests
         console.Profile.Width = 237;
         console.Write(dashboard.Render());
         return writer.ToString();
+    }
+
+    [Fact]
+    public void ChartData_DrawsComparedRuns_AndRereadsThemEveryTenMinutes()
+    {
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            File.WriteAllText(Path.Combine(directory, "training_progress.json"),
+                """{"CompletedEpochs":0,"EarlyStoppingBestLoss":1,"EarlyStoppingEvaluationsSinceImprovement":0,"CompletedStepsInEpoch":300000,"ValidationSplitSeed":1,"StepsPerEpoch":484921,"EarlyStoppingMetric":"1-mAP"}""");
+            void Snapshot(int step)
+            {
+                var dir = Directory.CreateDirectory(Path.Combine(directory, "snapshots", $"step-{step}")).FullName;
+                File.WriteAllText(Path.Combine(dir, "evaluation_report.json"), """{"MeanAveragePrecision":0.5,"ExclusiveViolationRate":0.1}""");
+                File.WriteAllText(Path.Combine(dir, "evaluation.done"), "exit code 0");
+            }
+            Snapshot(100_000);
+            var now = new DateTime(2026, 10, 31, 17, 0, 0);
+            var dashboard = new TrainingDashboard(Info, () => now);
+            dashboard.SetChartComparisons([("run 4", directory)]);
+
+            var (series, version) = dashboard.ChartData();
+            var (label, run) = Assert.Single(series.Comparisons!);
+            Assert.Equal("run 4", label);
+            Assert.Single(run.Points);
+
+            // A new evaluation in the compared run shows up at the next re-read, not before.
+            Snapshot(200_000);
+            now = now.AddMinutes(5);
+            Assert.Equal(version, dashboard.ChartData().Version);
+            now = now.AddMinutes(6);
+            var (later, laterVersion) = dashboard.ChartData();
+            Assert.Equal(2, later.Comparisons![0].Run.Points.Count);
+            Assert.NotEqual(version, laterVersion);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
     }
 }

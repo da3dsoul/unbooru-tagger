@@ -15,9 +15,19 @@ namespace UnbooruTagger.Training.Training;
 /// <param name="RecallGap">Context reliance's macro recall gap (see <see cref="ContextRelianceReport"/>).</param>
 /// <param name="FalsePositiveGap">Its macro false-positive gap.</param>
 /// <param name="OccludedStillCalled">Occlusion check's still-called rate over all pairs; NaN without a gold set.</param>
+/// <param name="SmallGoldPointing">The same as <paramref name="GoldPointing"/> for the <c>evaluate --gold-small</c> set; NaN without one.</param>
+/// <param name="SmallOccludedStillCalled">The same as <paramref name="OccludedStillCalled"/> for that set.</param>
+/// <param name="ObjectEffect">Occlusion check's object effect over every gold pair (<see cref="OcclusionResult.ObjectEffect"/>); NaN before it existed.</param>
+/// <param name="SmallObjectEffect">The same for the gold-small set.</param>
+/// <param name="LabelledAbsentLogit">Hand-labelled context negatives where the object is absent: mean log-odds past the tag's threshold
+/// (<see cref="LabelledContextReport.AbsentMeanLogit"/>); NaN without <c>evaluate --context-check</c>. Not the called rate: about 200 pairs
+/// called at thresholds recalibrated each evaluation, so a few pairs flipping moves it by points.</param>
+/// <param name="LabelledPresentLogit">The same for those where it's visible but untagged.</param>
 public sealed record EvaluationPoint(
     long Step, bool EndOfEpoch, double MeanAveragePrecision, double GoldPointing, double RecallGap, double FalsePositiveGap,
-    double OccludedStillCalled, double ExclusiveViolations)
+    double OccludedStillCalled, double ExclusiveViolations, double SmallGoldPointing = double.NaN, double SmallOccludedStillCalled = double.NaN,
+    double ObjectEffect = double.NaN, double SmallObjectEffect = double.NaN,
+    double LabelledAbsentLogit = double.NaN, double LabelledPresentLogit = double.NaN)
 {
     /// <summary>Reads <paramref name="directory"/>'s evaluation_report.json (and localization_report.json, if any); null if there's no report.</summary>
     public static EvaluationPoint? Read(string directory, long step, bool endOfEpoch)
@@ -31,25 +41,32 @@ public sealed record EvaluationPoint(
             using var report = JsonDocument.Parse(File.ReadAllBytes(reportPath));
             var root = report.RootElement;
             var context = root.TryGetProperty(nameof(EvaluationReport.ContextReliance), out var c) && c.ValueKind == JsonValueKind.Object ? c : default;
+            var labelled = root.TryGetProperty(nameof(EvaluationReport.LabelledContext), out var l) && l.ValueKind == JsonValueKind.Object ? l : default;
 
-            double goldPointing = double.NaN, occluded = double.NaN;
-            var localizationPath = Path.Combine(directory, EvaluateCommandHandler.LocalizationReportFileName);
-            if (File.Exists(localizationPath))
-            {
-                using var localization = JsonDocument.Parse(File.ReadAllBytes(localizationPath));
-                goldPointing = All(localization.RootElement, nameof(LocalizationReport.Gold), nameof(GoldResult.PointingAccuracy));
-                occluded = All(localization.RootElement, nameof(LocalizationReport.Occlusion), nameof(OcclusionResult.StillYesRate));
-            }
+            var (goldPointing, occluded, effect) = Localization(Path.Combine(directory, EvaluateCommandHandler.LocalizationReportFileName));
+            var (smallPointing, smallOccluded, smallEffect) = Localization(Path.Combine(directory, EvaluateCommandHandler.SmallGoldReportFileName));
 
             return new EvaluationPoint(step, endOfEpoch,
                 Number(root, nameof(EvaluationReport.MeanAveragePrecision)), goldPointing,
                 Number(context, nameof(ContextRelianceReport.MacroRecallGap)), Number(context, nameof(ContextRelianceReport.MacroFalsePositiveGap)),
-                occluded, Number(root, nameof(EvaluationReport.ExclusiveViolationRate)));
+                occluded, Number(root, nameof(EvaluationReport.ExclusiveViolationRate)), smallPointing, smallOccluded, effect, smallEffect,
+                Number(labelled, nameof(LabelledContextReport.AbsentMeanLogit)), Number(labelled, nameof(LabelledContextReport.PresentMeanLogit)));
         }
         catch (Exception e) when (e is JsonException or IOException)
         {
             return null; // still being written, or damaged: not a point
         }
+    }
+
+    /// <summary>A localization report's overall gold pointing, occlusion still-called rate and object effect; NaN if it doesn't exist.</summary>
+    private static (double Pointing, double StillCalled, double ObjectEffect) Localization(string path)
+    {
+        if (!File.Exists(path))
+            return (double.NaN, double.NaN, double.NaN);
+        using var localization = JsonDocument.Parse(File.ReadAllBytes(path));
+        return (All(localization.RootElement, nameof(LocalizationReport.Gold), nameof(GoldResult.PointingAccuracy)),
+            All(localization.RootElement, nameof(LocalizationReport.Occlusion), nameof(OcclusionResult.StillYesRate)),
+            All(localization.RootElement, nameof(LocalizationReport.Occlusion), nameof(OcclusionResult.ObjectEffect)));
     }
 
     /// <summary>The "all" row's <paramref name="field"/> of a list of per-group results.</summary>

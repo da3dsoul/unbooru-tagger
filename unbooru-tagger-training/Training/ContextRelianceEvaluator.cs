@@ -118,6 +118,8 @@ public static class ContextRelianceEvaluator
                     {
                         if (imageSites is not null && tagSites is not null && (imageSites[image] & tagSites[t]) == BooruSites.None)
                             continue;
+                        if (!tagSets[image].Contains(t) && trainingStatistics.Families.IsUnknown(imageTags[image], t))
+                            continue; // an unnamed kind: no evidence either way
                         var band = Band(priors[image].GetValueOrDefault(t));
                         var hit = reported[image * tags.Length + j] ? 1 : 0;
                         if (tagSets[image].Contains(t))

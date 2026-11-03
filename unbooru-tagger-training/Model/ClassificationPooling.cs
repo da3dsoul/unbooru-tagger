@@ -39,6 +39,47 @@ public static class ClassificationPooling
         }
     }
 
+    /// <summary>
+    /// [B, L] pooled raw scores from [B, L, K] per-window (or per-cell) dots and [B, K] which windows are real:
+    /// <c>T · (logsumexp(dot / T) − log n)</c>, or with <paramref name="topK"/> above 0 the mean of the k highest dots (an image
+    /// with fewer real windows averages the ones it has), plus <paramref name="bottomWeight"/> times the mean of the k lowest
+    /// (WILDCAT's negative evidence). -infinity for an image with none.
+    /// </summary>
+    /// <param name="valid">[B, K] which windows are real, or [B, L, K] which windows each tag pools.</param>
+    public static Tensor Pool(Tensor dots, Tensor valid, float temperature, int topK, float bottomWeight = 0)
+    {
+        // [B, K] (every tag pools the same windows) or [B, L, K] (per tag).
+        if (valid.dim() == 2)
+            valid = valid.unsqueeze(1);
+        var masked = dots.masked_fill(valid.logical_not(), float.NegativeInfinity);
+        if (topK > 0)
+        {
+            var k = (int)Math.Min(topK, masked.shape[2]);
+            Tensor Mean(Tensor values)
+            {
+                var real = values.isfinite();
+                return where(real, values, zeros_like(values)).sum(2) / real.sum(2).to_type(ScalarType.Float32).clamp_min(1f);
+            }
+            var count = valid.sum(2);
+            var pooled = Mean(masked.topk(k, dim: 2).values);
+            if (bottomWeight > 0)
+                pooled = pooled + bottomWeight * Mean(-(-masked.masked_fill(valid.logical_not(), float.PositiveInfinity)).topk(k, dim: 2).values);
+            return where(count.gt(0), pooled, full_like(pooled, float.NegativeInfinity));
+        }
+        var n = valid.sum(2).to_type(ScalarType.Float32);
+        return temperature * ((masked / temperature).logsumexp(2) - n.clamp_min(1f).log());
+    }
+
+    /// <summary><see cref="Pool(Tensor, Tensor, float, int)"/> for one image and tag on the CPU, from its real windows' raw dots.</summary>
+    public static double Pool(IReadOnlyList<double> dots, float temperature, int topK, float bottomWeight = 0)
+    {
+        if (topK > 0)
+            return dots.OrderDescending().Take(topK).Average() + (bottomWeight > 0 ? bottomWeight * dots.Order().Take(topK).Average() : 0);
+        var max = dots.Max(d => d / temperature);
+        var total = dots.Sum(d => Math.Exp(d / temperature - max));
+        return temperature * (max + Math.Log(total) - Math.Log(dots.Count));
+    }
+
     /// <summary>Cells per side: 32px at 512px input.</summary>
     public const int Grid = 16;
 
@@ -60,7 +101,7 @@ public static class ClassificationPooling
     /// <see cref="Training.LocalizationPairSelector"/>).
     /// </summary>
     /// <param name="targets">The batch's targets, on the CPU.</param>
-    public static Tensor TrainedRows(Tensor cells, Tensor valid, Tensor tagEmbeddings, long[] pooledRows, Training.PairTargets targets, float temperature, int minedPerImage)
+    public static Tensor TrainedRows(Tensor cells, Tensor valid, Tensor tagEmbeddings, long[] pooledRows, Training.PairTargets targets, float temperature, int minedPerImage, int topK = 0, float bottomWeight = 0)
     {
         var batch = (int)targets.Labels.shape[0];
         var vocabulary = (int)targets.Labels.shape[1];
@@ -75,8 +116,8 @@ public static class ClassificationPooling
                 using var scope = NewDisposeScope();
                 var count = Math.Min(chunk, pooledRows.Length - start);
                 var rows = tensor(pooledRows.AsSpan(start, count).ToArray(), device: cells.device);
-                var dots = cells.transpose(1, 2).matmul(tagEmbeddings.index_select(0, rows).t()) / temperature;
-                var part = dots.masked_fill(valid.logical_not().unsqueeze(2), float.NegativeInfinity).logsumexp(1).cpu().data<float>().ToArray();
+                var dots = cells.transpose(1, 2).matmul(tagEmbeddings.index_select(0, rows).t()); // [B, K, L]
+                var part = Pool(dots.transpose(1, 2), valid, temperature, topK, bottomWeight).cpu().data<float>().ToArray();
                 for (var i = 0; i < batch; i++)
                     Array.Copy(part, i * count, scores, i * pooledRows.Length + start, count);
             }
@@ -109,17 +150,19 @@ public static class ClassificationPooling
 
     /// <summary>
     /// [B, V] raw scores (dot-product units, before <see cref="LogitScaleBias"/>): <c>pooled · tag</c> for every
-    /// tag, replaced for <paramref name="pooledRows"/> by <c>T · (logsumexp over valid cells of cell · tag / T − log n)</c>.
+    /// tag, replaced for <paramref name="pooledRows"/> by <see cref="Pool(Tensor, Tensor, float, int)"/> over the valid cells.
     /// </summary>
-    public static Tensor RawScores(Tensor pooled, Tensor cells, Tensor valid, Tensor tagEmbeddings, Tensor pooledRows, float temperature)
+    /// <param name="windowMask">[B, L, K] optional per-tag window choice (training's framed-positive pooling), within <paramref name="valid"/>.</param>
+    public static Tensor RawScores(Tensor pooled, Tensor cells, Tensor valid, Tensor tagEmbeddings, Tensor pooledRows, float temperature, int topK = 0, float bottomWeight = 0, Tensor? windowMask = null)
     {
         var mean = pooled.matmul(tagEmbeddings.t());
         if (pooledRows.numel() == 0)
             return mean;
-        var dots = cells.transpose(1, 2).matmul(tagEmbeddings.index_select(0, pooledRows).t()) / temperature; // [B, L, K]
-        dots = dots.masked_fill(valid.logical_not().unsqueeze(2), float.NegativeInfinity);
-        var count = valid.sum(1, keepdim: true).to_type(ScalarType.Float32).clamp_min(1f);
-        var pooledScores = temperature * (dots.logsumexp(1) - count.log());
+        var dots = cells.transpose(1, 2).matmul(tagEmbeddings.index_select(0, pooledRows).t()); // [B, K, L]
+        var count = valid.sum(1, keepdim: true).to_type(ScalarType.Float32);
+        var pooledScores = Pool(dots.transpose(1, 2), windowMask ?? valid, temperature, topK, bottomWeight);
+        // An image with no cells at all (no glimpse of it) keeps its averaged score instead of -infinity.
+        pooledScores = where(count.gt(0), pooledScores, mean.index_select(1, pooledRows));
         return mean.index_copy(1, pooledRows, pooledScores);
     }
 }

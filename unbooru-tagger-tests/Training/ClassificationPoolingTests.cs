@@ -65,6 +65,56 @@ public class ClassificationPoolingTests
     }
 
     [Fact]
+    public void TopK_IsTheMeanOfTheHighestWindows_AndOnlyThoseTrain()
+    {
+        // 1 image, 1 tag, 4 windows (the last not real): dots 3, 1, 2, 9.
+        using var dots = tensor(new[] { 3f, 1f, 2f, 9f }, [1, 1, 4]).requires_grad_(true);
+        using var valid = tensor(new[] { true, true, true, false }, [1, 4]);
+        var top2 = ClassificationPooling.Pool(dots, valid, 0.5f, topK: 2);
+        Assert.Equal(2.5f, top2.item<float>(), 5);
+        Assert.Equal(2.5, ClassificationPooling.Pool([3.0, 1.0, 2.0], 0.5f, topK: 2), 5);
+        top2.backward();
+        Assert.Equal([0.5f, 0f, 0.5f, 0f], dots.grad!.data<float>().ToArray());
+
+        // More than there are real windows: the mean of the real ones; none real: -infinity.
+        Assert.Equal(2f, ClassificationPooling.Pool(dots.detach(), valid, 0.5f, topK: 10).item<float>(), 5);
+        Assert.True(float.IsNegativeInfinity(ClassificationPooling.Pool(dots.detach(), zeros_like(valid), 0.5f, topK: 2).item<float>()));
+    }
+
+    [Fact]
+    public void BottomWeight_AddsTheLowestWindows_AsWildcatsNegativeEvidence()
+    {
+        // Real windows 3, 1, 2, -4 (and a fifth not real): top 2 = 2.5, bottom 2 = -1.5.
+        using var dots = tensor(new[] { 3f, 1f, 2f, -4f, -9f }, [1, 1, 5]).requires_grad_(true);
+        using var valid = tensor(new[] { true, true, true, true, false }, [1, 5]);
+        var pooled = ClassificationPooling.Pool(dots, valid, 0.5f, topK: 2, bottomWeight: 0.5f);
+        Assert.Equal(2.5f + 0.5f * -1.5f, pooled.item<float>(), 5);
+        Assert.Equal(2.5 + 0.5 * -1.5, ClassificationPooling.Pool([3.0, 1.0, 2.0, -4.0], 0.5f, topK: 2, bottomWeight: 0.5f), 5);
+        pooled.backward();
+        Assert.Equal([0.5f, 0.25f, 0.5f, 0.25f, 0f], dots.grad!.data<float>().ToArray());
+    }
+
+    [Fact]
+    public void APerTagWindowMask_PoolsEachTagOverItsOwnWindows()
+    {
+        // 1 image, 2 tags, 3 windows; tag 0 pools all three, tag 1 only the last.
+        using var dots = tensor(new[] { 3f, 1f, 2f, 0f, 5f, -1f }, [1, 2, 3]);
+        using var mask = tensor(new[] { true, true, true, false, false, true }, [1, 2, 3]);
+        var pooled = ClassificationPooling.Pool(dots, mask, 0.5f, topK: 1).data<float>().ToArray();
+        Assert.Equal([3f, -1f], pooled);
+        var lse = ClassificationPooling.Pool(dots, mask, 0.25f, topK: 0).data<float>().ToArray();
+        Assert.Equal(-1f, lse[1], 5); // one window: its own dot (minus T·log 1)
+    }
+
+    [Fact]
+    public void Pool_OnTheCpu_MatchesTheTensorLogSumExp()
+    {
+        using var dots = tensor(new[] { 0.3f, -0.2f, 1.1f }, [1, 1, 3]);
+        using var valid = ones(1, 3, dtype: ScalarType.Bool);
+        Assert.Equal(ClassificationPooling.Pool(dots, valid, 0.25f, topK: 0).item<float>(), ClassificationPooling.Pool([0.3, -0.2, 1.1], 0.25f, topK: 0), 4);
+    }
+
+    [Fact]
     public void DenseLogits_MatchLinearLogits_ForTheSameScores()
     {
         var pooled = new[] { 1f, 2f, -1f, 0.5f, 0f, 3f };        // 3 images x 2 dims

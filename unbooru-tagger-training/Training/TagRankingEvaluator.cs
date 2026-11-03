@@ -43,6 +43,7 @@ public sealed record TagEvaluation(
 /// <param name="MeanContextAveragePrecision">Macro mean of <see cref="TagEvaluation.ContextAveragePrecision"/> over tags that had context negatives.</param>
 /// <param name="ExclusiveViolations">Which mutually exclusive pairs fired together, most frequent first, and which side the image actually carries.</param>
 /// <param name="ContextReliance">Recall and false positives by how strongly each image's characters/artists/series predict the tag (<see cref="ContextRelianceEvaluator"/>).</param>
+/// <param name="LabelledContext">Calls on hand-labelled context negatives, absent vs. visible but untagged (<see cref="LabelledContextCheck"/>; <c>evaluate --context-check</c>).</param>
 public sealed record EvaluationReport(
     int Images, int EvaluatedTags,
     double MeanAveragePrecision, double MeanHardAveragePrecision, double MeanBestF1, double MeanHeldOutF1,
@@ -50,7 +51,8 @@ public sealed record EvaluationReport(
     IReadOnlyList<TagEvaluation> Tags,
     double MeanContextAveragePrecision = double.NaN,
     ContextRelianceReport? ContextReliance = null,
-    IReadOnlyList<ExclusiveViolation>? ExclusiveViolations = null)
+    IReadOnlyList<ExclusiveViolation>? ExclusiveViolations = null,
+    LabelledContextReport? LabelledContext = null)
 {
     /// <summary>Lower-is-better form of <see cref="MeanAveragePrecision"/> for <see cref="EarlyStopping"/>.</summary>
     public double EarlyStoppingValue => 1 - MeanAveragePrecision;
@@ -141,9 +143,11 @@ public static class TagRankingEvaluator
         bool IsSiteBlind(int image, int tag) =>
             imageSites is not null && tagSites is not null && (imageSites[image] & tagSites[tag]) == BooruSites.None;
 
+        // An unnamed kind (the image is tagged shoes, not which shoes) is unknown, as in training (TagFamilies).
+        var families = trainingStatistics.Families;
         bool IsLikelyMissing(int image, int tag)
         {
-            if (IsSiteBlind(image, tag))
+            if (IsSiteBlind(image, tag) || families.IsUnknown(imageTags[image], tag))
                 return true;
             foreach (var s in imageTags[image])
                 if ((uint)s < (uint)vocabularySize
@@ -154,7 +158,7 @@ public static class TagRankingEvaluator
 
         bool IsReallyLikelyMissing(int image, int tag)
         {
-            if (IsSiteBlind(image, tag))
+            if (IsSiteBlind(image, tag) || families.IsUnknown(imageTags[image], tag))
                 return true;
             foreach (var s in imageTags[image])
                 if ((uint)s < (uint)vocabularySize && Array.BinarySearch(trainingStatistics.ImpliedBy[s], tag) >= 0)
@@ -223,7 +227,11 @@ public static class TagRankingEvaluator
             return scores;
         }
 
-        var (thresholds, heldOutF1) = CalibrateThresholds(logits, heldOut, minCalibrationPositives, minThreshold, fallbackThreshold, device, imageSites, tagSites);
+        // Held-out images where a tag is an unnamed kind: neither a hit nor a false positive.
+        IEnumerable<int> UnknownImages(int tag) => families.FamilyAncestors(tag)
+            .SelectMany(a => heldOut[a]).Distinct().Where(image => !tagSets[image].Contains(tag) && families.IsUnknown(imageTags[image], tag));
+        var (thresholds, heldOutF1) = CalibrateThresholds(logits, heldOut, minCalibrationPositives, minThreshold, fallbackThreshold, device, imageSites, tagSites,
+            families.IsEmpty ? null : UnknownImages);
         for (var t = 0; t < vocabularySize; t++)
             if (results[t] is { } result)
                 results[t] = result with { Threshold = thresholds[t], HeldOutF1 = heldOutF1[t] };
@@ -308,7 +316,7 @@ public static class TagRankingEvaluator
     private static (float[] Thresholds, double[] F1) CalibrateThresholds(
         ImageTagLogits logits, List<int>[] heldOutPositives,
         int minPositives, float minThreshold, float fallbackThreshold, Device device,
-        IReadOnlyList<BooruSites>? imageSites = null, IReadOnlyList<BooruSites>? tagSites = null)
+        IReadOnlyList<BooruSites>? imageSites = null, IReadOnlyList<BooruSites>? tagSites = null, Func<int, IEnumerable<int>>? unknownImages = null)
     {
         var vocabularySize = heldOutPositives.Length;
         var imageCount = logits.ImageCount;
@@ -340,6 +348,16 @@ public static class TagRankingEvaluator
             var probabilities = logits.Columns(tags, device).sigmoid();
             if (SiteBlindMask(imageSites, tagSites, tags, labels) is { } blind)
                 probabilities = probabilities.masked_fill(blind.to(device), -1f); // sorts last: never a false positive
+            if (unknownImages is not null)
+            {
+                var unknown = new bool[imageCount * tags.Length];
+                var any = false;
+                for (var j = 0; j < tags.Length; j++)
+                    foreach (var image in unknownImages(tags[j]))
+                        unknown[image * tags.Length + j] = any = true;
+                if (any)
+                    probabilities = probabilities.masked_fill(tensor(unknown, [imageCount, tags.Length]).to(device), -1f);
+            }
             var (sorted, order) = probabilities.sort(dim: 0, descending: true);
             var sortedLabels = tensor(labels, [imageCount, tags.Length]).to(device).gather(0, order).to(ScalarType.Float32);
             var truePositives = sortedLabels.cumsum(0);
@@ -427,6 +445,18 @@ public static class TagRankingEvaluator
                             blindMask[i * vocabularySize + t] = any = true;
                 if (any)
                     reported = reported.logical_and(tensor(blindMask, [count, vocabularySize]).to(device).logical_not());
+            }
+            if (!trainingStatistics.Families.IsEmpty)
+            {
+                // An unnamed kind (tagged shoes, not which) is neither a hit nor a false positive either.
+                var unknownMask = new bool[count * vocabularySize];
+                var any = false;
+                for (var i = 0; i < count; i++)
+                    foreach (var t in trainingStatistics.Families.UnknownRows(imageTags[start + i]))
+                        if ((uint)t < (uint)vocabularySize)
+                            unknownMask[i * vocabularySize + t] = any = true;
+                if (any)
+                    reported = reported.logical_and(tensor(unknownMask, [count, vocabularySize]).to(device).logical_not());
             }
 
             var truthRows = new List<int>[count];

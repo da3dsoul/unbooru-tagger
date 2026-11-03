@@ -60,7 +60,7 @@ public sealed record TrainingProgress(
 /// </summary>
 public static class TrainingState
 {
-    private const string ProgressFileName = "training_progress.json";
+    internal const string ProgressFileName = "training_progress.json";
     private const string OptimizerFileName = "optimizer.dat";
     private const string LogitScaleBiasOptimizerFileName = "logit_scale_bias_optimizer.dat";
 
@@ -128,4 +128,18 @@ public static class TrainingState
 
     public static void LoadLogitScaleBiasOptimizerState(string directory, OptimizerHelper optimizer) =>
         optimizer.load_state_dict(Path.Combine(directory, LogitScaleBiasOptimizerFileName));
+
+    private const string GlimpseTowerOptimizerFileName = "glimpse_tower_optimizer.dat";
+
+    /// <summary>The separate glimpse tower's optimizer (<c>ImageTower.GlimpseTower</c>), kept apart from the main one for the same reason as <see cref="SaveLogitScaleBiasOptimizerState"/>.</summary>
+    public static bool HasGlimpseTowerOptimizerState(string directory) => File.Exists(Path.Combine(directory, GlimpseTowerOptimizerFileName));
+
+    public static void SaveGlimpseTowerOptimizerState(string directory, OptimizerHelper optimizer)
+    {
+        Directory.CreateDirectory(directory);
+        optimizer.save_state_dict(Path.Combine(directory, GlimpseTowerOptimizerFileName));
+    }
+
+    public static void LoadGlimpseTowerOptimizerState(string directory, OptimizerHelper optimizer) =>
+        optimizer.load_state_dict(Path.Combine(directory, GlimpseTowerOptimizerFileName));
 }

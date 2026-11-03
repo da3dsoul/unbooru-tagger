@@ -1,5 +1,6 @@
 using System.CommandLine;
 using UnbooruTagger.Training.Commands;
+using UnbooruTagger.Training.Training;
 
 var checkpointDirOption = new Option<string>("--checkpoint-dir")
 {
@@ -102,6 +103,10 @@ var exclusiveTagsOption = new Option<string?>("--exclusive-tags")
 {
     Description = "File of mutually exclusive tag groups (one comma-separated group per line, e.g. 'solo, multiple_girls'). Omit to reuse the checkpoint's saved copy, or the built-in people-count/rating groups."
 };
+var tagParentageOption = new Option<string?>("--tag-parentage")
+{
+    Description = "Reviewed tag parentage rules (the tag-parentage review page's rules.json): kinds complete their parents (boots -> shoes), a parent with no kind named leaves its kinds unknown instead of negative, no_X rules X out. Saved into the checkpoint; omit to reuse the checkpoint's copy, 'none' to turn it off."
+};
 var validationMaxImagesOption = new Option<int>("--validation-max-images")
 {
     Description = "Evaluate at most this many held-out images per epoch (the same fixed subset every epoch). 0 = the whole validation split.",
@@ -171,6 +176,28 @@ var mosaicFullSizeOption = new Option<bool>("--mosaic-full-size")
 {
     Description = "Mosaic tiles at the input size on a canvas twice as wide, instead of shrunk 2x (about 4x a mosaic's cost; small objects stay their real size)."
 };
+var erasurePairsOption = new Option<int>("--erasure-pairs-per-step")
+{
+    Description = "Erased-view training (Shetty et al. 2019, GAIN): each step, this many localizable positives the model already calls get the region their own localization map points at blanked, and a same-size region elsewhere blanked; the tag must drop more for the object than for the control. Two extra images through the tower per pair. 0 = off.",
+    DefaultValueFactory = _ => 0
+};
+var erasureLossOption = new Option<string>("--erasure-loss")
+{
+    Description = "hinge: the object-blanked score must fall --erasure-margin below the control-blanked one. negative: the object-blanked image is a certain negative and the control-blanked one a positive. negative-only: the object-blanked image is a certain negative; the control-blanked one is trained only through --erasure-anchor-weight.",
+    DefaultValueFactory = _ => "hinge"
+};
+erasureLossOption.AcceptOnlyFromAmong("hinge", "negative", "negative-only");
+var erasureWeightOption = new Option<float>("--erasure-weight") { Description = "Erased-view loss weight, relative to the whole-image tag loss.", DefaultValueFactory = _ => 1f };
+var erasureMarginOption = new Option<float>("--erasure-margin") { Description = "The erased-view hinge's margin, in log-odds.", DefaultValueFactory = _ => 1f };
+var erasureAnchorOption = new Option<float>("--erasure-anchor-weight") { Description = "Also hold the control-blanked score to the unblanked one, at this weight (0 = off): the hinge alone lets any filled patch lower every score.", DefaultValueFactory = _ => 0f };
+var validationSplitSeedOption = new Option<int?>("--validation-split-seed") { Description = "A fresh run's validation split seed (default: random), to hold out the same images as another run: its training_progress.json's ValidationSplitSeed. A resume keeps its own." };
+var erasureEveryOption = new Option<int>("--erasure-every") { Description = "Erased views on every Nth step only (1 = every step).", DefaultValueFactory = _ => 1 };
+var erasureFillOption = new Option<string[]>("--erasure-fill")
+{
+    Description = "Fills for erased-view blanks, one drawn per pair (comma-separated or repeated): zero, mean, noise. Default mean,noise; zero alone taught the model that a grey patch lowers a score.",
+    DefaultValueFactory = _ => [],
+    AllowMultipleArgumentsPerToken = true
+};
 var focusShareOption = new Option<double>("--focus-share")
 {
     Description = "Fraction of batch anchors drawn from tags the latest epoch evaluation found answered from context instead of the object (context gaps >= 20 pts, or still called with the object blanked >= 90%), each with as many context negatives as positives and grouped on one mosaic. Re-picked after every epoch evaluation; needs tag-centric sampling. 0 = off.",
@@ -194,6 +221,18 @@ var classificationPoolingAnnealOption = new Option<int>("--classification-poolin
     Description = "Global steps to anneal the pooling temperature over (see --classification-pooling-start-temperature).",
     DefaultValueFactory = _ => 0
 };
+var classificationPoolingTopKOption = new Option<int?>("--classification-pooling-top-k")
+{
+    Description = "Pool localizable tags' window (or cell) scores as the mean of the k highest instead of a log-sum-exp; only those windows train. Saved in model_config.json and used by evaluate; 0 = the log-sum-exp; omitted keeps the checkpoint's setting. Needs --classification-pooling-temperature above 0 to turn pooling on."
+};
+var classificationPoolingBottomWeightOption = new Option<float?>("--classification-pooling-bottom-weight")
+{
+    Description = "With --classification-pooling-top-k: add this weight times the mean of the k lowest windows' scores (WILDCAT's negative evidence, alpha 0.7 in the paper). Saved in model_config.json; 0 = off; omitted keeps the checkpoint's setting."
+};
+var glimpsePoolZoomsOption = new Option<int?>("--glimpse-pool-zooms")
+{
+    Description = "With --classification-glimpses: only windows of the first N zooms (32/64/128/256px) score localizable tags; 3 leaves out the 256px window. The rest are still chosen. Saved in model_config.json; omitted keeps the checkpoint's setting (4 = all)."
+};
 var bf16Option = new Option<bool>("--bf16")
 {
     Description = "Run the image tower in bfloat16: weights, gradients, the optimizer and checkpoints stay fp32 (ImageTower.ComputeType). Not saved with the checkpoint: pass it on every resume.",
@@ -202,6 +241,20 @@ var classificationPoolingMinedOption = new Option<int>("--classification-pooling
 {
     Description = "Per image, the highest-scoring negatives trained on their pooled score each step, besides positives and full-strength negatives; the rest train on the averaged score.",
     DefaultValueFactory = _ => 64
+};
+var classificationGlimpsesOption = new Option<bool>("--classification-glimpses")
+{
+    Description = "Fresh runs only: score localizable tags from 64px zoomed glimpses of the image (32-256px windows; a log-sum-exp at --classification-pooling-temperature) instead of the whole image, so an object tag can't be read off the character. Saved in model_config.json and used by evaluate. Not exported to ONNX."
+};
+var glimpsesPerImageOption = new Option<int>("--glimpses-per-image")
+{
+    Description = "With --classification-glimpses, the windows the model chooses to look at per image, from its own localization map (Glimpses.Propose): in training, and in evaluation (saved with the checkpoint).",
+    DefaultValueFactory = _ => 16
+};
+var glimpseUnframedPositiveWeightOption = new Option<float>("--glimpse-unframed-positive-weight")
+{
+    Description = "With --classification-glimpses, the glimpse loss's weight for a labelled positive none of the chosen windows frames (its map peak is in none of them). The classifier never saw it; 0 leaves it to the localization loss to teach the map where it is.",
+    DefaultValueFactory = _ => 0f
 };
 var trainGoldOption = new Option<string?>("--gold")
 {
@@ -224,6 +277,11 @@ var snapshotEvaluationStepsOption = new Option<int>("--snapshot-evaluation-steps
 var chartReferenceOption = new Option<string[]>("--chart-reference")
 {
     Description = "Another run's evaluation to compare against on the dashboard's graphical charts, as label=report directory (e.g. v3-e1=context-check/v3-e1). Repeatable.",
+    DefaultValueFactory = _ => []
+};
+var chartCompareOption = new Option<string[]>("--chart-compare")
+{
+    Description = "Another run to draw as curves over this run's steps on the dashboard's graphical charts, as label=checkpoint directory (e.g. \"run 4=checkpoint-v4\"), the way charts --compare does. Re-read every 10 minutes. Repeatable.",
     DefaultValueFactory = _ => []
 };
 var textDashboardOption = new Option<bool>("--text-dashboard") { Description = "Keep the all-text dashboard even in a terminal that can show graphical charts (Sixel)" };
@@ -291,6 +349,7 @@ trainCommand.Options.Add(contextNegativesPerAnchorOption);
 trainCommand.Options.Add(contextNegativeWeightOption);
 trainCommand.Options.Add(contextPriorWeightOption);
 trainCommand.Options.Add(exclusiveTagsOption);
+trainCommand.Options.Add(tagParentageOption);
 trainCommand.Options.Add(validationMaxImagesOption);
 trainCommand.Options.Add(ioParallelismOption);
 trainCommand.Options.Add(noRatingsOption);
@@ -308,6 +367,7 @@ trainCommand.Options.Add(maxStepsOption);
 trainCommand.Options.Add(evaluationCommandOption);
 trainCommand.Options.Add(snapshotEvaluationStepsOption);
 trainCommand.Options.Add(chartReferenceOption);
+trainCommand.Options.Add(chartCompareOption);
 trainCommand.Options.Add(textDashboardOption);
 trainCommand.Options.Add(trainGoldOption);
 trainCommand.Options.Add(cropConsistencyWeightOption);
@@ -317,12 +377,192 @@ trainCommand.Options.Add(mosaicsPerStepOption);
 trainCommand.Options.Add(mosaicWeightOption);
 trainCommand.Options.Add(mosaicClassificationWeightOption);
 trainCommand.Options.Add(mosaicFullSizeOption);
+trainCommand.Options.Add(erasurePairsOption);
+trainCommand.Options.Add(erasureLossOption);
+trainCommand.Options.Add(erasureWeightOption);
+trainCommand.Options.Add(erasureMarginOption);
+trainCommand.Options.Add(erasureFillOption);
+trainCommand.Options.Add(erasureEveryOption);
+trainCommand.Options.Add(erasureAnchorOption);
+trainCommand.Options.Add(validationSplitSeedOption);
 trainCommand.Options.Add(focusShareOption);
 trainCommand.Options.Add(hardNegativeSourceWeightOption);
+var outOfContextShareOption = new Option<double>("--out-of-context-share")
+{
+    Description = "Fraction of a localizable general anchor tag's positives drawn for a low context prior (the highest P(tag | character/artist/series) of the image): the lowest of 16 random positives, if below --out-of-context-max-prior. Gloves on a character who rarely wears them can only be learned from the gloves. 0 = off.",
+    DefaultValueFactory = _ => 0
+};
+var outOfContextMaxPriorOption = new Option<double>("--out-of-context-max-prior") { Description = "Highest context prior an out-of-context positive may have", DefaultValueFactory = _ => 0.3 };
+var outOfContextWeightOption = new Option<float>("--out-of-context-weight") { Description = "Weight of an out-of-context positive's pair with its anchor tag (0 = the usual 1)", DefaultValueFactory = _ => 0f };
+trainCommand.Options.Add(outOfContextShareOption);
+trainCommand.Options.Add(outOfContextMaxPriorOption);
+trainCommand.Options.Add(outOfContextWeightOption);
+var outOfContextAllOption = new Option<bool>("--out-of-context-all") { Description = "Give --out-of-context-weight to every localizable general positive in a batch whose context prior is below --out-of-context-max-prior, not only to sampled anchors' (the way context negatives are weighted)" };
+trainCommand.Options.Add(outOfContextAllOption);
+var excluderShareOption = new Option<double>("--excluder-share")
+{
+    Description = "Fraction of anchors drawn from the tags an excludes rule (--tag-parentage) rules out, e.g. gloves for no_gloves, each with two of the excluders' images as certain negatives: they're rare, so otherwise they reach training only by chance. 0 = off.",
+    DefaultValueFactory = _ => 0
+};
+var excludedNegativeWeightOption = new Option<float>("--excluded-negative-weight") { Description = "Weight of a tag an excludes rule rules out on an image (no_gloves: gloves), if above --certain-negative-weight. 0 = that weight.", DefaultValueFactory = _ => 0f };
+trainCommand.Options.Add(excluderShareOption);
+trainCommand.Options.Add(excludedNegativeWeightOption);
 trainCommand.Options.Add(classificationPoolingOption);
 trainCommand.Options.Add(classificationPoolingStartOption);
 trainCommand.Options.Add(classificationPoolingAnnealOption);
+trainCommand.Options.Add(classificationPoolingTopKOption);
+trainCommand.Options.Add(classificationPoolingBottomWeightOption);
+trainCommand.Options.Add(glimpsePoolZoomsOption);
 trainCommand.Options.Add(classificationPoolingMinedOption);
+trainCommand.Options.Add(classificationGlimpsesOption);
+trainCommand.Options.Add(glimpsesPerImageOption);
+trainCommand.Options.Add(glimpseUnframedPositiveWeightOption);
+var glimpseLabelFramingStepsOption = new Option<int>("--glimpse-label-framing-steps")
+{
+    Description = "With --classification-glimpses, a fresh run's warm-up: a share of each image's windows (half at step 0, none from this global step on) frames labelled positives, by the same rule as the model's own choice, while the localization map can't point yet. 0 = the model's choice from the start.",
+    DefaultValueFactory = _ => 0
+};
+trainCommand.Options.Add(glimpseLabelFramingStepsOption);
+var glimpseLabelFramingFloorOption = new Option<int>("--glimpse-label-framing-floor")
+{
+    Description = "With --classification-glimpses: at least this many of each image's windows always frame labelled positives (as --glimpse-label-framing-steps does early on), so a tag the proposals rarely suspect still gets positive glimpse gradient. 0 = off.",
+    DefaultValueFactory = _ => 0
+};
+trainCommand.Options.Add(glimpseLabelFramingFloorOption);
+var glimpseFramedPositivePoolingOption = new Option<bool>("--glimpse-framed-positive-pooling")
+{
+    Description = "With label framing (--glimpse-label-framing-floor / -steps): a labelled positive the framing looked at is scored, for its loss, from the close windows (below 256px) that frame it only, so they get its \"yes\"; negatives and every other tag pool every window. Training only."
+};
+trainCommand.Options.Add(glimpseFramedPositivePoolingOption);
+var glimpsePoolMinZoomOption = new Option<int?>("--glimpse-pool-min-zoom")
+{
+    Description = "With --classification-glimpses: windows of zooms below this index (0 = 32px) don't score localizable tags; 1 leaves out the 32px window. Saved in model_config.json; omitted keeps the checkpoint's setting."
+};
+trainCommand.Options.Add(glimpsePoolMinZoomOption);
+var separateGlimpseTowerOption = new Option<bool>("--separate-glimpse-tower")
+{
+    Description = "With --classification-glimpses: embed glimpses with a separate copy of the image tower (made from the current weights the first time, its own optimizer, saved as glimpse_tower.dat and used by evaluate) instead of the tower the whole image goes through."
+};
+trainCommand.Options.Add(separateGlimpseTowerOption);
+var glimpseTowerLearningRateScaleOption = new Option<float>("--glimpse-tower-lr-scale")
+{
+    Description = "With --separate-glimpse-tower: its learning rate as a multiple of the run's (it has to leave the 512px solution; the main tower doesn't).",
+    DefaultValueFactory = _ => 1f
+};
+trainCommand.Options.Add(glimpseTowerLearningRateScaleOption);
+var contextPairsPerBatchOption = new Option<int>("--context-pairs-per-batch")
+{
+    Description = "Tag-centric sampling: each batch starts with this many pairs of images of one source (a character, artist or series), one with a localizable tag and one without, the tag drawn uniformly from those with context sources. 0 = off.",
+    DefaultValueFactory = _ => 0
+};
+trainCommand.Options.Add(contextPairsPerBatchOption);
+var contextPairWeightOption = new Option<float>("--context-pair-weight")
+{
+    Description = "With --context-pairs-per-batch and --classification-glimpses: weight of a hinge making the image with the tag score --context-pair-margin logits above its pair without it. 0 = off.",
+    DefaultValueFactory = _ => 0f
+};
+trainCommand.Options.Add(contextPairWeightOption);
+var contextPairMarginOption = new Option<float>("--context-pair-margin")
+{
+    Description = "The --context-pair-weight hinge's margin, in logits.",
+    DefaultValueFactory = _ => 1f
+};
+trainCommand.Options.Add(contextPairMarginOption);
+var glimpseFeatureSplitOption = new Option<bool>("--glimpse-feature-split")
+{
+    Description = "Singh et al. 2020's feature split on the glimpse embedding: half of it is the object half. A localizable general tag's positive on an image whose character/artist/series rarely carries it (prior below 0.2: an exclusive image) is scored with the other half held at its running mean, without gradient there, so the object half carries those calls. Saved in the model config."
+};
+trainCommand.Options.Add(glimpseFeatureSplitOption);
+var glimpseFeatureSplitWeightOption = new Option<float>("--glimpse-feature-split-weight")
+{
+    Description = "With --glimpse-feature-split: the glimpse loss's weight on exclusive positives (Singh et al. weight them by how much rarer they are, at least 3).",
+    DefaultValueFactory = _ => 1f
+};
+trainCommand.Options.Add(glimpseFeatureSplitWeightOption);
+var glimpseFeatureSplitNegativesOption = new Option<bool>("--glimpse-feature-split-negatives")
+{
+    Description = "With --glimpse-feature-split: context negatives too (the tag a \"no\" on an image whose character/artist/series usually carries it: prior at least 0.6) score from the object half, so it learns both sides: the object without the character, and the character without the object. Singh et al. split only the exclusive positives."
+};
+trainCommand.Options.Add(glimpseFeatureSplitNegativesOption);
+var glimpseExclusivePerBatchOption = new Option<int>("--glimpse-exclusive-per-batch")
+{
+    Description = "Each batch starts with this many images for the feature split: alternately a context negative and an exclusive positive, anchored on localizable tags with context sources. A larger share of the batch instead of a heavier weight.",
+    DefaultValueFactory = _ => 0
+};
+trainCommand.Options.Add(glimpseExclusivePerBatchOption);
+var mosaicGlimpseWeightOption = new Option<float>("--mosaic-glimpse-weight")
+{
+    Description = "With --classification-glimpses and --mosaics-per-step: the mosaic canvases get glimpses too, chosen by the model, and a tag one tile carries is a \"no\" in every window on tiles whose image says no, window by window, and a \"yes\" pooled over the windows inside its own tile. Window-level labels from the tags alone. 0 = off.",
+    DefaultValueFactory = _ => 0f
+};
+trainCommand.Options.Add(mosaicGlimpseWeightOption);
+var twinEveryOption = new Option<int>("--twin-every")
+{
+    Description = "Matched twins: every Nth batch is one image with a localizable general tag and images without it whose tags otherwise overlap it most (at most one character each). With --classification-glimpses, the half of its glimpses most like the twins' glimpses are a \"no\" for the tag (--twin-weight). 0 = off.",
+    DefaultValueFactory = _ => 0
+};
+trainCommand.Options.Add(twinEveryOption);
+var twinWeightOption = new Option<float>("--twin-weight") { Description = "Weight of the matched twins' window term.", DefaultValueFactory = _ => 1f };
+trainCommand.Options.Add(twinWeightOption);
+var twinDetachScalingOption = new Option<bool>("--twin-detach-scaling") { Description = "The twins' window term sends no gradient into the shared logit scale and bias." };
+trainCommand.Options.Add(twinDetachScalingOption);
+var twinPasteOption = new Option<int>("--twin-paste")
+{
+    Description = "With --twin-every: in each twin batch, this many twins get the positive's region at its tag's localization-map peak pasted in at the same place (and carry the tag), and as many others a same-size region from elsewhere in the positive (certain negatives). Needs a map that points. 0 = off.",
+    DefaultValueFactory = _ => 0
+};
+trainCommand.Options.Add(twinPasteOption);
+var negativeLossOption = new Option<string>("--negative-loss")
+{
+    Description = "Deliberate targets: the unverified negatives' loss: asl (the asymmetric loss, --negative-gamma / --negative-clip) or hill ((1.5 - p) p^2, robust to missing labels).",
+    DefaultValueFactory = _ => "asl"
+};
+negativeLossOption.AcceptOnlyFromAmong("asl", "hill");
+trainCommand.Options.Add(negativeLossOption);
+var glimpseProposalWeightOption = new Option<float>("--glimpse-proposal-weight")
+{
+    Description = "With --classification-glimpses, the weight of the proposal loss: the whole-image proposal scores, which pick where the glimpses look, trained on every localizable tag from the labels.",
+    DefaultValueFactory = _ => 1f
+};
+trainCommand.Options.Add(glimpseProposalWeightOption);
+var glimpseProposalDetachTagsOption = new Option<bool>("--glimpse-proposal-detach-tags")
+{
+    Description = "With --classification-glimpses, the proposal loss trains only the proposal head and the tower, not the tag embeddings, so the whole-image context it learns can't pull the embeddings the localization map points with."
+};
+trainCommand.Options.Add(glimpseProposalDetachTagsOption);
+var localityNegativeWeightOption = new Option<float>("--locality-negative-weight")
+{
+    Description = "With --classification-glimpses: a close window where one labelled tag is confidently found trains each other labelled tag \"no\" there, weighted by how rarely the two are together (glasses and shoes, not gloves and a face), learned as training runs. This weight times that term; 0 = off.",
+    DefaultValueFactory = _ => 0f
+};
+trainCommand.Options.Add(localityNegativeWeightOption);
+var localityPriorOption = new Option<string?>("--locality-prior")
+{
+    Description = "With --locality-negative-weight: start the which-tags-are-together table from this file (evaluate --locality-prior-out on a trained map) instead of from nothing."
+};
+trainCommand.Options.Add(localityPriorOption);
+var localityMinObservationsOption = new Option<float>("--locality-min-observations")
+{
+    Description = "With --locality-negative-weight: weighted observations a tag pair needs before it gives negatives.",
+    DefaultValueFactory = _ => 20f
+};
+trainCommand.Options.Add(localityMinObservationsOption);
+var localityConfidenceGateOption = new Option<float>("--locality-confidence-gate")
+{
+    Description = "With --locality-negative-weight: only windows where the found tag's call is at least this sure (e.g. 0.9) give negatives; 0 = any.",
+    DefaultValueFactory = _ => 0f
+};
+trainCommand.Options.Add(localityConfidenceGateOption);
+var localityPerPairOption = new Option<bool>("--locality-per-pair")
+{
+    Description = "With --locality-negative-weight: each image's term is the mean over its tag pairs instead of the sum, so images with many tags don't dominate."
+};
+trainCommand.Options.Add(localityPerPairOption);
+var localityDetachScalingOption = new Option<bool>("--locality-detach-scaling")
+{
+    Description = "With --locality-negative-weight: the term trains no gradient into the shared logit scale and bias, only the tower and the tag embeddings."
+};
+trainCommand.Options.Add(localityDetachScalingOption);
 trainCommand.Options.Add(bf16Option);
 trainCommand.Options.Add(cropTeacherMinPositivesOption);
 trainCommand.Options.Add(localizationMapOption);
@@ -361,6 +601,7 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         ContextNegativeWeight: parseResult.GetRequiredValue(contextNegativeWeightOption),
         ContextPriorWeight: parseResult.GetRequiredValue(contextPriorWeightOption),
         ExclusiveTagsPath: parseResult.GetValue(exclusiveTagsOption),
+        TagParentagePath: parseResult.GetValue(tagParentageOption),
         ValidationMaxImages: parseResult.GetRequiredValue(validationMaxImagesOption),
         Ratings: !parseResult.GetValue(noRatingsOption),
         LocalizationMinedNegatives: parseResult.GetRequiredValue(localizationMinedNegativesOption),
@@ -376,12 +617,59 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         MosaicWeight: parseResult.GetRequiredValue(mosaicWeightOption),
         MosaicClassificationWeight: parseResult.GetRequiredValue(mosaicClassificationWeightOption),
         MosaicFullSizeTiles: parseResult.GetValue(mosaicFullSizeOption),
+        ErasurePairsPerStep: parseResult.GetRequiredValue(erasurePairsOption),
+        ErasureLoss: parseResult.GetRequiredValue(erasureLossOption) switch { "negative" => ErasureLoss.Negative, "negative-only" => ErasureLoss.NegativeOnly, _ => ErasureLoss.Hinge },
+        ErasureWeight: parseResult.GetRequiredValue(erasureWeightOption),
+        ErasureMargin: parseResult.GetRequiredValue(erasureMarginOption),
+        ErasureFillNames: parseResult.GetRequiredValue(erasureFillOption).SelectMany(v => v.Split(',', StringSplitOptions.RemoveEmptyEntries)).Select(OcclusionFills.Parse).ToList(),
+        ErasureEvery: parseResult.GetRequiredValue(erasureEveryOption),
+        ErasureAnchorWeight: parseResult.GetRequiredValue(erasureAnchorOption),
+        ValidationSplitSeed: parseResult.GetValue(validationSplitSeedOption),
         FocusShare: parseResult.GetRequiredValue(focusShareOption),
         HardNegativeSourceWeight: parseResult.GetRequiredValue(hardNegativeSourceWeightOption),
+        OutOfContextShare: parseResult.GetRequiredValue(outOfContextShareOption),
+        OutOfContextMaxPrior: parseResult.GetRequiredValue(outOfContextMaxPriorOption),
+        OutOfContextWeight: parseResult.GetRequiredValue(outOfContextWeightOption),
+        OutOfContextAll: parseResult.GetValue(outOfContextAllOption),
+        ExcluderShare: parseResult.GetRequiredValue(excluderShareOption),
+        ExcludedNegativeWeight: parseResult.GetRequiredValue(excludedNegativeWeightOption),
         ClassificationPoolingTemperature: parseResult.GetValue(classificationPoolingOption),
         ClassificationPoolingStartTemperature: parseResult.GetValue(classificationPoolingStartOption),
         ClassificationPoolingAnnealSteps: parseResult.GetValue(classificationPoolingAnnealOption),
+        ClassificationPoolingTopK: parseResult.GetValue(classificationPoolingTopKOption),
+        ClassificationPoolingBottomWeight: parseResult.GetValue(classificationPoolingBottomWeightOption),
+        GlimpsePoolZooms: parseResult.GetValue(glimpsePoolZoomsOption),
         ClassificationPoolingMinedNegatives: parseResult.GetValue(classificationPoolingMinedOption),
+        ClassificationGlimpses: parseResult.GetValue(classificationGlimpsesOption),
+        GlimpsesPerImage: parseResult.GetValue(glimpsesPerImageOption),
+        GlimpseUnframedPositiveWeight: parseResult.GetValue(glimpseUnframedPositiveWeightOption),
+        GlimpseLabelFramingSteps: parseResult.GetValue(glimpseLabelFramingStepsOption),
+        GlimpseLabelFramingFloor: parseResult.GetValue(glimpseLabelFramingFloorOption),
+        GlimpseFramedPositivePooling: parseResult.GetValue(glimpseFramedPositivePoolingOption),
+        SeparateGlimpseTower: parseResult.GetValue(separateGlimpseTowerOption),
+        GlimpseTowerLearningRateScale: parseResult.GetValue(glimpseTowerLearningRateScaleOption),
+        ContextPairsPerBatch: parseResult.GetValue(contextPairsPerBatchOption),
+        ContextPairMargin: parseResult.GetValue(contextPairMarginOption),
+        ContextPairWeight: parseResult.GetValue(contextPairWeightOption),
+        GlimpseFeatureSplit: parseResult.GetValue(glimpseFeatureSplitOption),
+        GlimpseFeatureSplitWeight: parseResult.GetValue(glimpseFeatureSplitWeightOption),
+        GlimpseFeatureSplitNegatives: parseResult.GetValue(glimpseFeatureSplitNegativesOption),
+        GlimpseExclusivePerBatch: parseResult.GetValue(glimpseExclusivePerBatchOption),
+        MosaicGlimpseWeight: parseResult.GetValue(mosaicGlimpseWeightOption),
+        TwinEvery: parseResult.GetValue(twinEveryOption),
+        TwinWeight: parseResult.GetValue(twinWeightOption),
+        TwinDetachScaling: parseResult.GetValue(twinDetachScalingOption),
+        TwinPaste: parseResult.GetValue(twinPasteOption),
+        GlimpsePoolMinZoom: parseResult.GetValue(glimpsePoolMinZoomOption),
+        HillNegatives: parseResult.GetValue(negativeLossOption) == "hill",
+        GlimpseProposalWeight: parseResult.GetValue(glimpseProposalWeightOption),
+        GlimpseProposalDetachTags: parseResult.GetValue(glimpseProposalDetachTagsOption),
+        LocalityNegativeWeight: parseResult.GetRequiredValue(localityNegativeWeightOption),
+        LocalityPriorPath: parseResult.GetValue(localityPriorOption),
+        LocalityMinObservations: parseResult.GetRequiredValue(localityMinObservationsOption),
+        LocalityConfidenceGate: parseResult.GetRequiredValue(localityConfidenceGateOption),
+        LocalityPerPair: parseResult.GetValue(localityPerPairOption),
+        LocalityDetachScaling: parseResult.GetValue(localityDetachScalingOption),
         Bf16Compute: parseResult.GetValue(bf16Option),
         LocalizationFromFusedOnly: parseResult.GetValue(localizationMapOption) switch { "fused" or "local" => true, "full" => false, _ => null },
         LocalizationSkippedLaterals: parseResult.GetValue(localizationMapOption) switch { "local" => 1, "fused" or "full" => 0, _ => null },
@@ -392,7 +680,8 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         EvaluationCommand: parseResult.GetValue(evaluationCommandOption),
         SnapshotEvaluationSteps: parseResult.GetRequiredValue(snapshotEvaluationStepsOption),
         ChartReferences: parseResult.GetValue(chartReferenceOption) ?? [],
-        TextDashboard: parseResult.GetValue(textDashboardOption)),
+        TextDashboard: parseResult.GetValue(textDashboardOption),
+        ChartComparisons: parseResult.GetValue(chartCompareOption) ?? []),
     parseResult.GetRequiredValue(ioParallelismOption),
     parseResult.GetRequiredValue(prefetchBatchesOption),
     new TowerOptions(
@@ -456,9 +745,15 @@ var modelDirOption = new Option<string>("--model-dir")
 var exportOnnxCommand = new Command("export-onnx", "Export a training checkpoint to the ONNX bundle unbooru-tagger-inference reads");
 exportOnnxCommand.Options.Add(checkpointDirOption);
 exportOnnxCommand.Options.Add(modelDirOption);
+var ignorePoolingOption = new Option<bool>("--ignore-pooling")
+{
+    Description = "Export a checkpoint that scores localizable tags per tag (classification pooling, glimpses) anyway: its boxes are right, its scores for those tags aren't (render-gold --scores supplies them)"
+};
+exportOnnxCommand.Options.Add(ignorePoolingOption);
 exportOnnxCommand.SetAction(parseResult => ExportOnnxCommandHandler.Run(
     parseResult.GetRequiredValue(checkpointDirOption),
-    parseResult.GetRequiredValue(modelDirOption)));
+    parseResult.GetRequiredValue(modelDirOption),
+    parseResult.GetValue(ignorePoolingOption)));
 
 var evaluateCacheDirOption = new Option<string>("--cache-dir") { Description = "The PreprocessedDatasetCache the checkpoint was trained on", Required = true };
 var evaluateMaxImagesOption = new Option<int>("--max-images")
@@ -473,6 +768,10 @@ var embeddingsCacheOption = new Option<string?>("--embeddings-cache")
     Description = "File to save the held-out image embeddings to, and reuse them from on later runs (ignored if older than the checkpoint's image tower or the held-out set changed size) -- skips the slow embedding pass when re-evaluating the same checkpoint."
 };
 var goldOption = new Option<string?>("--gold") { Description = "Hand-checked box set (gold.json) to score localization against" };
+var smallGoldOption = new Option<string?>("--gold-small")
+{
+    Description = "A second hand-checked box set (gold.json), scored on its own into localization_report_small.json (gold scoring, crop teacher, occlusion) and charted separately"
+};
 var localizationSamplesOption = new Option<int>("--localization-samples")
 {
     Description = "Held-out images used for the label-free localization checks (deletion, crop consistency, two-character, solo counts). 0 skips them.",
@@ -480,8 +779,8 @@ var localizationSamplesOption = new Option<int>("--localization-samples")
 };
 var mapScoreTemperatureOption = new Option<float>("--map-score-temperature")
 {
-    Description = "With --gold: also run the occlusion check with localizable tags scored from the localization map, pooled by a log-sum-exp at this temperature (match training's --localization-temperature). 0 skips it.",
-    DefaultValueFactory = _ => 0.25f
+    Description = "With --gold: also run the occlusion check with localizable tags scored from the localization map, pooled by a log-sum-exp at this temperature (training's --localization-temperature, 0.25, is the natural choice). 0 (the default) skips it: it repeats the whole occlusion check, one pair at a time.",
+    DefaultValueFactory = _ => 0f
 };
 var worstTagsOption = new Option<int>("--show") { Description = "How many worst tags to list", DefaultValueFactory = _ => 25 };
 
@@ -492,10 +791,24 @@ evaluateCommand.Options.Add(validationFractionOption);
 evaluateCommand.Options.Add(evaluateMaxImagesOption);
 evaluateCommand.Options.Add(evaluateBatchSizeOption);
 evaluateCommand.Options.Add(exclusiveTagsOption);
+evaluateCommand.Options.Add(tagParentageOption);
 evaluateCommand.Options.Add(evaluateOutDirOption);
 evaluateCommand.Options.Add(worstTagsOption);
 evaluateCommand.Options.Add(embeddingsCacheOption);
 evaluateCommand.Options.Add(goldOption);
+evaluateCommand.Options.Add(smallGoldOption);
+var dumpOcclusionOption = new Option<bool>("--dump-occlusion")
+{
+    Description = "Also write occlusion_pairs.jsonl (and occlusion_pairs_small.jsonl): every gold pair of the occlusion check with its full, blanked-object and blanked-control confidence"
+};
+evaluateCommand.Options.Add(dumpOcclusionOption);
+var occlusionFillOption = new Option<string>("--occlusion-fill")
+{
+    Description = "What the occlusion check fills blanked boxes with: zero (the padding value), mean (the image's mean color) or noise (with the image's colors). Score an erased-view model with a fill it didn't train on: whether its effect holds there says whether it learned the object or the fill.",
+    DefaultValueFactory = _ => "zero"
+};
+occlusionFillOption.AcceptOnlyFromAmong("zero", "mean", "noise");
+evaluateCommand.Options.Add(occlusionFillOption);
 evaluateCommand.Options.Add(localizationSamplesOption);
 evaluateCommand.Options.Add(mapScoreTemperatureOption);
 var dumpScoresOption = new Option<string[]>("--dump-scores")
@@ -505,6 +818,49 @@ var dumpScoresOption = new Option<string[]>("--dump-scores")
     AllowMultipleArgumentsPerToken = true
 };
 evaluateCommand.Options.Add(dumpScoresOption);
+var contextCheckOption = new Option<string?>("--context-check")
+{
+    Description = "Hand-labelled context negatives (JSON list of {cacheIndex, tag, label: present|absent}): reports how often a tag is called on the held-out ones where the object is absent, and where it's visible but untagged. The context-reliance bands can't tell those apart."
+};
+evaluateCommand.Options.Add(contextCheckOption);
+var evaluatePrecisionOption = new Option<string>("--precision")
+{
+    Description = "The image tower's arithmetic: fp32 (cuDNN's TF32 convolutions, as on CUDA by default), tf32 (also TF32 matrix multiplies, which the 1x1 convolutions run as) or bf16 (bfloat16 compute from the fp32 weights, as train --bf16). A glimpse checkpoint's evaluation scores ~6x the pixels of a plain one, so this is most of its time.",
+    DefaultValueFactory = _ => "fp32"
+};
+evaluatePrecisionOption.AcceptOnlyFromAmong("fp32", "tf32", "bf16");
+evaluateCommand.Options.Add(evaluatePrecisionOption);
+var glimpseGridOption = new Option<bool>("--glimpse-grid")
+{
+    Description = "A glimpse checkpoint: score every window of the grid (378 per image at 512px) instead of the ones the model chooses from its localization map, as evaluations did before 2026-10-31. To compare with those; ~6x the cost of a whole-image pass."
+};
+evaluateCommand.Options.Add(glimpseGridOption);
+var glimpseObjectOnlyOption = new Option<bool>("--glimpse-object-only")
+{
+    Description = "A checkpoint trained with --glimpse-feature-split: score glimpses from the object half of their embedding alone (the context half held at its training mean), as training scores exclusive images. Without it the whole embedding scores, as Singh et al. test."
+};
+evaluateCommand.Options.Add(glimpseObjectOnlyOption);
+var twinCheckOption = new Option<string?>("--twin-check")
+{
+    Description = "Only check the matched twins' \"no\" windows (--twin-every) against the gold boxes (--gold, --gold-small): how often they hold the object. Writes each pair to this JSONL file."
+};
+evaluateCommand.Options.Add(twinCheckOption);
+var noCropTeacherOption = new Option<bool>("--no-crop-teacher")
+{
+    Description = "Leave the crop-teacher check out of the gold checks. It only tells crop consistency whether to trust the classifier, and on a glimpse checkpoint it is ~40% of the gold checks' time."
+};
+evaluateCommand.Options.Add(noCropTeacherOption);
+var localityPriorOutOption = new Option<string?>("--locality-prior-out")
+{
+    Description = "Instead of evaluating: measure on this checkpoint's localization map how often each pair of labelled localizable tags is found within 64px of each other in training images, and write it here for train --locality-prior."
+};
+evaluateCommand.Options.Add(localityPriorOutOption);
+var localityPriorImagesOption = new Option<int>("--locality-prior-images")
+{
+    Description = "With --locality-prior-out: how many training images to measure.",
+    DefaultValueFactory = _ => 20000
+};
+evaluateCommand.Options.Add(localityPriorImagesOption);
 evaluateCommand.SetAction(parseResult => EvaluateCommandHandler.Run(
     parseResult.GetRequiredValue(checkpointDirOption),
     parseResult.GetRequiredValue(evaluateCacheDirOption),
@@ -518,12 +874,30 @@ evaluateCommand.SetAction(parseResult => EvaluateCommandHandler.Run(
     parseResult.GetValue(goldOption),
     parseResult.GetRequiredValue(localizationSamplesOption),
     parseResult.GetRequiredValue(mapScoreTemperatureOption),
-    parseResult.GetValue(dumpScoresOption)?.SelectMany(v => v.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).ToList()));
+    parseResult.GetValue(dumpScoresOption)?.SelectMany(v => v.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).ToList(),
+    parseResult.GetValue(tagParentageOption),
+    parseResult.GetValue(smallGoldOption),
+    parseResult.GetValue(dumpOcclusionOption),
+    OcclusionFills.Parse(parseResult.GetRequiredValue(occlusionFillOption)),
+    parseResult.GetValue(contextCheckOption),
+    parseResult.GetRequiredValue(evaluatePrecisionOption),
+    parseResult.GetValue(glimpseGridOption),
+    !parseResult.GetValue(noCropTeacherOption),
+    parseResult.GetValue(localityPriorOutOption),
+    parseResult.GetRequiredValue(localityPriorImagesOption),
+    parseResult.GetValue(glimpseObjectOnlyOption),
+    parseResult.GetValue(twinCheckOption)));
 
 var chartsEpochsOption = new Option<int>("--epochs") { Description = "The run's --epochs, for the step axis and epoch markers", DefaultValueFactory = _ => 6 };
 var chartsReferenceOption = new Option<string[]>("--reference")
 {
     Description = "Another run's evaluation to compare against, as label=report directory (e.g. v3-e1=context-check/v3-e1); drawn as a dashed line in each panel. Repeatable.",
+    DefaultValueFactory = _ => [],
+    AllowMultipleArgumentsPerToken = false
+};
+var chartsCompareOption = new Option<string[]>("--compare")
+{
+    Description = "Another run to draw as a curve over this run's steps, as label=checkpoint directory (e.g. run4=checkpoint-v4): its evaluations in each panel and its smoothed loss. Repeatable.",
     DefaultValueFactory = _ => [],
     AllowMultipleArgumentsPerToken = false
 };
@@ -536,6 +910,7 @@ var chartsCommand = new Command("charts", "Draw a run's loss and evaluation tren
 chartsCommand.Options.Add(checkpointDirOption);
 chartsCommand.Options.Add(chartsEpochsOption);
 chartsCommand.Options.Add(chartsReferenceOption);
+chartsCommand.Options.Add(chartsCompareOption);
 chartsCommand.Options.Add(chartsPngOption);
 chartsCommand.Options.Add(chartsWatchOption);
 chartsCommand.Options.Add(chartsIntervalOption);
@@ -545,6 +920,7 @@ chartsCommand.SetAction(parseResult => ChartsCommandHandler.Run(
     parseResult.GetRequiredValue(checkpointDirOption),
     parseResult.GetRequiredValue(chartsEpochsOption),
     parseResult.GetValue(chartsReferenceOption) ?? [],
+    parseResult.GetValue(chartsCompareOption) ?? [],
     parseResult.GetValue(chartsPngOption),
     parseResult.GetValue(chartsWatchOption),
     parseResult.GetRequiredValue(chartsIntervalOption),
@@ -556,33 +932,119 @@ var benchmarkInputOption = new Option<int>("--input-size") { DefaultValueFactory
 var benchmarkIterationsOption = new Option<int>("--iterations") { DefaultValueFactory = _ => 30 };
 var benchmarkLayoutsOption = new Option<string[]>("--layouts")
 {
-    Description = "Memory layouts to time: nchw, nhwc-input (channels-last input), nhwc-all (input and conv weights), bf16 (whole tower in bfloat16), bf16-mixed (fp32 weights, bfloat16 compute: train --bf16).",
+    Description = "Memory layouts to time: nchw, nhwc-input (channels-last input), nhwc-all (input and conv weights), bf16 (whole tower in bfloat16), bf16-mixed (fp32 weights, bfloat16 compute: train --bf16), bf16-mixed-nhwc (the same on channels-last input).",
     DefaultValueFactory = _ => ["nchw", "nhwc-input", "nhwc-all"],
     AllowMultipleArgumentsPerToken = true,
     CustomParser = r => r.Tokens.SelectMany(t => t.Value.Split(',', StringSplitOptions.RemoveEmptyEntries)).ToArray()
 };
+var soakStepsOption = new Option<int>("--steps") { DefaultValueFactory = _ => 20000 };
+var soakPadOption = new Option<int>("--pad-to") { DefaultValueFactory = _ => 1 };
+var soakModeOption = new Option<string>("--mode") { Description = "full, no-backward or no-upload.", DefaultValueFactory = _ => "full" };
+var soakBatchOption = new Option<int>("--batch-size") { DefaultValueFactory = _ => 10 };
+var soakVocabularyOption = new Option<int>("--vocabulary") { DefaultValueFactory = _ => 25000 };
+var soakPositivesOption = new Option<int>("--max-positives") { DefaultValueFactory = _ => 60 };
+var soakReportOption = new Option<int>("--report-every") { DefaultValueFactory = _ => 500 };
+var soakMaxVramOption = new Option<long>("--max-vram-mb") { Description = "Stop once this process's device memory passes this (it may share the device with a training run).", DefaultValueFactory = _ => 4000 };
+var soakLocalityCommand = new Command("soak-locality", "Run the locality negatives' step and backward over and over on random training-shaped input and print this process's device memory (finding a leak).");
+foreach (var option in new Option[] { soakStepsOption, soakPadOption, soakModeOption, soakBatchOption, soakVocabularyOption, soakPositivesOption, soakReportOption, soakMaxVramOption })
+    soakLocalityCommand.Options.Add(option);
+soakLocalityCommand.SetAction(parseResult => SoakLocalityCommandHandler.Run(parseResult.GetRequiredValue(soakStepsOption), parseResult.GetRequiredValue(soakPadOption),
+    parseResult.GetRequiredValue(soakModeOption), parseResult.GetRequiredValue(soakBatchOption), parseResult.GetRequiredValue(soakVocabularyOption),
+    parseResult.GetRequiredValue(soakPositivesOption), parseResult.GetRequiredValue(soakReportOption), parseResult.GetRequiredValue(soakMaxVramOption)));
 var benchmarkTowerCommand = new Command("benchmark-tower", "Time run 4's image tower forward+backward on random input per memory layout (for tuning the training step).");
 benchmarkTowerCommand.Options.Add(benchmarkBatchOption);
 benchmarkTowerCommand.Options.Add(benchmarkInputOption);
 benchmarkTowerCommand.Options.Add(benchmarkIterationsOption);
 benchmarkTowerCommand.Options.Add(benchmarkLayoutsOption);
-var benchmarkComponentsOption = new Option<bool>("--components") { Description = "Time each op of one block per stage instead of the whole tower." };
+var benchmarkComponentsOption = new Option<bool>("--components") { Description = "Time each op of one block per stage (forward + backward) instead of the whole tower, as ConvNeXtBlock runs them; with --layouts bf16-mixed, in bfloat16 as train --bf16 does." };
 benchmarkTowerCommand.Options.Add(benchmarkComponentsOption);
-benchmarkTowerCommand.SetAction(parseResult => parseResult.GetValue(benchmarkComponentsOption)
+var benchmarkGlimpsesOption = new Option<int>("--glimpses") { Description = "Time the glimpse path instead, with this many glimpses per image (--batch-size images at --input-size)." };
+var benchmarkVaryOption = new Option<bool>("--vary") { Description = "With --glimpses, drop up to 3 windows per image at random each iteration, as training's sampling does." };
+benchmarkTowerCommand.Options.Add(benchmarkGlimpsesOption);
+benchmarkTowerCommand.Options.Add(benchmarkVaryOption);
+var benchmarkNoPadOption = new Option<bool>("--no-pad") { Description = "With --glimpses, don't pad the glimpse batch to a fixed size." };
+benchmarkTowerCommand.Options.Add(benchmarkNoPadOption);
+var benchmarkGlimpseChunkOption = new Option<int>("--glimpse-chunk") { Description = "With --glimpses, glimpses per tower pass (Glimpses.Embed's chunk).", DefaultValueFactory = _ => UnbooruTagger.Training.Model.Glimpses.DefaultChunk };
+benchmarkTowerCommand.Options.Add(benchmarkGlimpseChunkOption);
+var benchmarkUploadsOption = new Option<bool>("--uploads") { Description = "Time how long a batch's upload holds the CPU while the device is busy: float vs uint8 pixels, ordinary vs pinned memory." };
+benchmarkTowerCommand.Options.Add(benchmarkUploadsOption);
+benchmarkTowerCommand.SetAction(parseResult => (parseResult.GetValue(benchmarkLayoutsOption) ?? []).Contains("probe")
+    ? BenchmarkTowerCommandHandler.ProbeLayout()
+    : parseResult.GetValue(benchmarkUploadsOption)
+    ? BenchmarkTowerCommandHandler.RunUploads(parseResult.GetRequiredValue(benchmarkBatchOption), parseResult.GetRequiredValue(benchmarkInputOption),
+        parseResult.GetRequiredValue(benchmarkIterationsOption))
+    : parseResult.GetValue(benchmarkGlimpsesOption) > 0
+    ? BenchmarkTowerCommandHandler.RunGlimpses(
+        parseResult.GetRequiredValue(benchmarkBatchOption),
+        parseResult.GetRequiredValue(benchmarkInputOption),
+        parseResult.GetRequiredValue(benchmarkIterationsOption),
+        parseResult.GetValue(benchmarkGlimpsesOption),
+        parseResult.GetValue(benchmarkVaryOption),
+        !parseResult.GetValue(benchmarkNoPadOption),
+        parseResult.GetRequiredValue(benchmarkGlimpseChunkOption))
+    : parseResult.GetValue(benchmarkComponentsOption)
     ? BenchmarkTowerCommandHandler.RunComponents(
         parseResult.GetRequiredValue(benchmarkBatchOption),
         parseResult.GetRequiredValue(benchmarkInputOption),
-        parseResult.GetRequiredValue(benchmarkIterationsOption))
+        parseResult.GetRequiredValue(benchmarkIterationsOption),
+        (parseResult.GetValue(benchmarkLayoutsOption) ?? []).Contains("bf16-mixed"))
     : BenchmarkTowerCommandHandler.Run(
         parseResult.GetRequiredValue(benchmarkBatchOption),
         parseResult.GetRequiredValue(benchmarkInputOption),
         parseResult.GetRequiredValue(benchmarkIterationsOption),
         parseResult.GetRequiredValue(benchmarkLayoutsOption)));
 
+var glimpseFramesCommand = new Command("glimpse-frames", "How well the glimpse choice (Glimpses.Propose, Sensor) fits the gold set's boxes. Reads any checkpoint with a localization map.");
+var glimpseFramesGoldOption = new Option<string>("--gold") { Description = "The gold set's gold.json", Required = true };
+var glimpseFramesCountOption = new Option<int[]>("--counts") { Description = "Window budgets per image to try Propose with", DefaultValueFactory = _ => [16, 32, 48], AllowMultipleArgumentsPerToken = true };
+glimpseFramesCommand.Options.Add(checkpointDirOption);
+glimpseFramesCommand.Options.Add(evaluateCacheDirOption);
+glimpseFramesCommand.Options.Add(glimpseFramesGoldOption);
+glimpseFramesCommand.Options.Add(glimpseFramesCountOption);
+glimpseFramesCommand.SetAction(parseResult => GlimpseFramesCommandHandler.Run(
+    parseResult.GetRequiredValue(checkpointDirOption),
+    parseResult.GetRequiredValue(evaluateCacheDirOption),
+    parseResult.GetRequiredValue(glimpseFramesGoldOption),
+    parseResult.GetRequiredValue(glimpseFramesCountOption),
+    16));
+
+var windowProbeCommand = new Command("window-probe", "The glimpse sensor's ceiling: fine-tune the glimpse path on the gold boxes' windows, k-fold by image, and dump the held-out images' windows as evaluate --dump-occlusion does.");
+var windowProbeGoldOption = new Option<string[]>("--gold") { Description = "gold.json files (the first's dumps are glimpse_*.jsonl, the rest glimpse_*_small.jsonl)", Required = true, AllowMultipleArgumentsPerToken = true };
+var windowProbeWindowsOption = new Option<string[]>("--windows") { Description = "Per gold file, the evaluate --dump-occlusion directory whose glimpse_embeddings*.jsonl give each image's windows", Required = true, AllowMultipleArgumentsPerToken = true };
+var windowProbeOutOption = new Option<string>("--out-dir") { Required = true };
+var windowProbeFoldsOption = new Option<int>("--folds") { DefaultValueFactory = _ => 5 };
+var windowProbeStepsOption = new Option<int>("--steps") { Description = "Fine-tuning steps per fold (0 = the untrained baseline)", DefaultValueFactory = _ => 400 };
+var windowProbeImagesOption = new Option<int>("--images-per-step") { DefaultValueFactory = _ => 8 };
+var windowProbeWindowsPerImageOption = new Option<int>("--windows-per-image") { DefaultValueFactory = _ => 48 };
+var windowProbeLrOption = new Option<float>("--lr") { DefaultValueFactory = _ => 1e-4f };
+var windowProbeBf16Option = new Option<bool>("--bf16");
+var windowProbeSeedOption = new Option<int>("--seed") { DefaultValueFactory = _ => 0 };
+windowProbeCommand.Options.Add(checkpointDirOption);
+windowProbeCommand.Options.Add(evaluateCacheDirOption);
+foreach (var option in new Option[] { windowProbeGoldOption, windowProbeWindowsOption, windowProbeOutOption, windowProbeFoldsOption, windowProbeStepsOption,
+             windowProbeImagesOption, windowProbeWindowsPerImageOption, windowProbeLrOption, windowProbeBf16Option, windowProbeSeedOption })
+    windowProbeCommand.Options.Add(option);
+windowProbeCommand.SetAction(parseResult => WindowProbeCommandHandler.Run(
+    parseResult.GetRequiredValue(checkpointDirOption),
+    parseResult.GetRequiredValue(evaluateCacheDirOption),
+    parseResult.GetRequiredValue(windowProbeGoldOption),
+    parseResult.GetRequiredValue(windowProbeWindowsOption),
+    parseResult.GetRequiredValue(windowProbeOutOption),
+    parseResult.GetValue(windowProbeFoldsOption),
+    parseResult.GetValue(windowProbeStepsOption),
+    parseResult.GetValue(windowProbeImagesOption),
+    parseResult.GetValue(windowProbeWindowsPerImageOption),
+    parseResult.GetValue(windowProbeLrOption),
+    parseResult.GetValue(windowProbeBf16Option),
+    parseResult.GetValue(windowProbeSeedOption)));
+
 var rootCommand = new RootCommand("unbooru-tagger training CLI")
 {
+    windowProbeCommand,
+    glimpseFramesCommand,
     trainCommand,
     benchmarkTowerCommand,
+    soakLocalityCommand,
     addTagCommand,
     exportOnnxCommand,
     evaluateCommand,

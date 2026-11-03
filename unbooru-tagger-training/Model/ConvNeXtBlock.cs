@@ -48,7 +48,7 @@ public sealed class ConvNeXtBlock : Module<Tensor, Tensor>
     /// on CPU that is sometimes NaN (every forward pass NaN from step 1), on CUDA usually
     /// zeros (a norm that outputs nothing until gradients grow its weight).
     /// </summary>
-    internal static GroupNorm NewGroupNorm(long channels, Device? device)
+    public static GroupNorm NewGroupNorm(long channels, Device? device)
     {
         var norm = GroupNorm(1, channels, eps: 1e-3, device: device);
         using (no_grad())
@@ -69,9 +69,11 @@ public sealed class ConvNeXtBlock : Module<Tensor, Tensor>
         // In the input's dtype (MixedPrecision): bf16 when ImageTower.ComputeType says so.
         var x = MixedPrecision.Conv(Depthwise, input);
         x = MixedPrecision.Norm(Norm, x);
-        x = MixedPrecision.Conv(PointwiseExpand, x);
-        x = functional.gelu(x);
-        x = MixedPrecision.Conv(PointwiseProject, x);
+        // The MLP's 1x1 convolutions as one matrix multiply over every pixel's channels (MixedPrecision.Rows), same weights.
+        var (n, c, h, w) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
+        var rows = x.permute(0, 2, 3, 1).reshape(-1, c);
+        rows = MixedPrecision.Rows(PointwiseProject, functional.gelu(MixedPrecision.Rows(PointwiseExpand, rows)));
+        x = rows.view(n, h, w, c).permute(0, 3, 1, 2);
         var layerScale = LayerScale.dtype == input.dtype ? (Tensor)LayerScale : LayerScale.to_type(input.dtype);
         return scope.MoveToOuter(input + (layerScale * x));
     }

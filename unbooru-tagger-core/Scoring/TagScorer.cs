@@ -9,6 +9,17 @@ namespace UnbooruTagger.Core.Scoring;
 /// </summary>
 public static class TagScorer
 {
+    /// <summary>
+    /// <c>detect</c>'s box extraction defaults, which <c>evaluate</c>'s gold box metrics use too. Before 2026-11-01 the
+    /// evaluator kept every region (no minimum size or count), so on a 128x128 map each above-cutoff speck was a box: about
+    /// 150-190 boxes against a couple of gold boxes per pair, box precision 0.1-0.3% in every run.
+    /// </summary>
+    public const float DefaultBoxThreshold = 0.5f;
+    public const float DefaultBoxPercentile = 0.6f;
+    public const float DefaultMinHeatmapRange = 0.05f;
+    public const float DefaultMinBoxFraction = 0.002f;
+    public const int DefaultMaxBoxesPerTag = 3;
+
     /// <summary>Confidence that <paramref name="tagEmbedding"/> applies to the whole image. <paramref name="scaling"/> defaults to <see cref="LogitScaling.Identity"/> (plain <c>sigmoid(dot)</c>) for a model bundle exported before <see cref="LogitScaling"/> existed.</summary>
     public static float Score(ReadOnlySpan<float> imageEmbedding, ReadOnlySpan<float> tagEmbedding, LogitScaling? scaling = null) =>
         Sigmoid((scaling ?? LogitScaling.Identity).Apply(Dot(imageEmbedding, tagEmbedding)));
