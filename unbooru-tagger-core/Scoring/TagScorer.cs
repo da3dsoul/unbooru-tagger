@@ -24,6 +24,14 @@ public static class TagScorer
     public const float DefaultBoxThreshold = 0.5f;
     public const float DefaultBoxPercentile = 0.6f;
     public const float DefaultBoxBelowPeak = 4f;
+    /// <summary>
+    /// With a below-peak cut, a tag's further regions are boxed only when their own peak is within this many log-odds of the tag's
+    /// peak. A 4-log-odds band also takes in faint secondary blobs that a heatmap drawn by opacity shows as nearly clear, and those
+    /// made most of the boxes the user saw as worse than the maps (2026-11-04, `review/regions/tune3.py`/`tune4.py`, run 4 at 2.12M,
+    /// 678 object-tag gold pairs): box precision 0.19 -> 0.27, recall 0.25 -> 0.22 at IoU 0.3 (0.06 -> 0.09 / 0.08 -> 0.07 at 0.5),
+    /// boxes 1,660 -> 1,028. No cut or smoothing did much better (best F1 0.26 vs 0.24): a map's extent isn't its object's.
+    /// </summary>
+    public const float DefaultBoxPeakMargin = 1f;
     public const float DefaultMinHeatmapRange = 0.05f;
     public const float DefaultMinBoxFraction = 0.0005f;
     public const int DefaultMaxBoxesPerTag = 3;
@@ -85,10 +93,12 @@ public static class TagScorer
     /// <param name="belowPeak">When above 0, cut this many log-odds below the heatmap's peak instead of at
     /// <paramref name="relativePercentile"/> of its probability range (<paramref name="threshold"/> then only decides whether the
     /// tag gets boxes at all: its peak must reach it).</param>
+    /// <param name="peakMargin">With <paramref name="belowPeak"/>, keeps only regions whose own peak is within this many log-odds of
+    /// the tag's peak (<see cref="DefaultBoxPeakMargin"/>). 0 keeps every region.</param>
     public static List<BoundingBox> DetectBoxes(
         float[,] heatmap, float threshold, float relativePercentile,
         LetterboxBox content, int canvasSize, int imageWidth, int imageHeight, float minRange = 0.05f,
-        float minComponentFraction = 0f, int maxBoxes = 0, float belowPeak = 0f)
+        float minComponentFraction = 0f, int maxBoxes = 0, float belowPeak = 0f, float peakMargin = 0f)
     {
         var height = heatmap.GetLength(0);
         var width = heatmap.GetLength(1);
@@ -105,12 +115,15 @@ public static class TagScorer
             return [];
 
         float effectiveThreshold;
+        var regionFloor = float.MinValue;
         if (belowPeak > 0)
         {
             if (max < threshold)
                 return [];
             var peak = Math.Clamp(max, 1e-7f, 1 - 1e-7f);
             effectiveThreshold = Sigmoid(MathF.Log(peak / (1 - peak)) - belowPeak);
+            if (peakMargin > 0)
+                regionFloor = Sigmoid(MathF.Log(peak / (1 - peak)) - peakMargin);
         }
         else
         {
@@ -140,7 +153,7 @@ public static class TagScorer
             var (box, cellCount) = FloodFillComponent(
                 heatmap, visited, x, y, effectiveThreshold,
                 gridToCanvasX, gridToCanvasY, canvasToImageX, canvasToImageY, content, imageWidth, imageHeight);
-            if (cellCount >= minCells)
+            if (cellCount >= minCells && box.Confidence >= regionFloor)
                 boxes.Add(box);
         }
 

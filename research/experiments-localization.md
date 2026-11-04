@@ -413,3 +413,20 @@ percentile cut P 0.08 / R 0.12 (small 0 / 0), peak − 4 P 0.19 / R 0.25 (small 
 (peak − 2.5: 0.24 / 0.24), larger ones large objects (peak − 5: 0.20 / 0.35); `detect` doesn't know the size, so it uses 4. The
 0.2% minimum region had discarded every small object's box. `TagScorer.DefaultBoxBelowPeak` = 4, `DefaultMinBoxFraction` = 0.0005;
 the evaluator's box metrics follow, and it reports region precision/recall at that cut (`GoldResult.RegionPrecision`).
+
+The user then found detect's boxes still far worse than the drawn maps. A 4-log-odds band also takes in faint secondary blobs that
+the overlay shows as nearly clear, and each tag kept up to 3 of them. Same pairs (678 object-tag gold pairs), `review/regions/tune3.py`
+and `tune4.py`: band 1-6, a margin (a further region is boxed only if its own peak is within m log-odds of the tag's peak), smoothing
+the map (box filter radius 0-2 cells) and trimming each box to its cells' weighted 5-95% or 10-90% quantiles.
+
+| Rule | P / R at IoU ≥ 0.3 | at IoU ≥ 0.5 | small / medium / large recall (0.3) | boxes |
+|---|---|---|---|---|
+| peak − 4, every region (until now) | 0.19 / 0.25 | 0.06 / 0.08 | 0.13 / 0.32 / 0.34 | 1,660 |
+| peak − 4, margin 1 (adopted) | 0.27 / 0.22 | 0.09 / 0.07 | 0.11 / 0.28 / 0.33 | 1,028 |
+| peak − 4, margin 0.5 | 0.30 / 0.20 | 0.10 / 0.07 | 0.10 / 0.25 / 0.31 | 853 |
+| peak − 3, margin 1, smoothed r 2 (best F1) | 0.30 / 0.23 | 0.11 / 0.10 | 0.07 / 0.34 / 0.31 | 994 |
+
+Nothing did much better (best F1 0.26 against 0.24): smoothing gains medium objects and loses small ones, trimming lost everywhere,
+and at IoU ≥ 0.5 every rule is near 0.1. A map's extent isn't its object's; the peak and the band are what to read.
+`TagScorer.DefaultBoxPeakMargin` = 1 (`--box-peak-margin`); `render-gold` and the evaluator follow it. The compare page also has a
+mode with nothing drawn, where hovering a tag, a gold box or a spot on the image shows that tag's map, peak and boxes.

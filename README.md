@@ -18,8 +18,8 @@ ONNX Runtime, from one command-line tool. There is no Python in the repository.
 ### Example
 
 Run 4's model on one image from the hand-checked gold set: the gold boxes (left) and the model's heatmap for each of
-the image's tags (right; one hue per tag, opaque at its strongest evidence and mixed where tags overlap, + at its peak, the
-gold boxes on top). The gold set mostly overlaps
+the image's tags (right; one hue per tag, opaque at its strongest evidence and mixed where tags overlap, + at its peak). Every box in it
+is hand-drawn; the model's heatmaps carry no boxes. The gold set mostly overlaps
 run 4's training split, so this shows what the output looks like, not held-out accuracy. Artwork by **hiyuu (hiyualice)**
 ([Danbooru post 6776791](https://danbooru.donmai.us/posts/6776791)). Twelve more, failures included:
 [docs/EXAMPLES.md](docs/EXAMPLES.md).
@@ -235,6 +235,7 @@ unbooru-tagger-inference render-gold ./gold/gold.json --out-dir ./gold/renders -
 | `--threshold` | the tag's calibrated threshold, else 0.5 | tag, tag-batch, detect, detect-batch, render-gold | Minimum confidence to report a tag. |
 | `--box-threshold` | 0.5 | detect, detect-batch, render-gold | A tag gets boxes only if its heatmap's peak reaches this (with `--box-below-peak 0`: the minimum confidence for a cell to join a box). |
 | `--box-below-peak` | 4 | same | Cut each tag's heatmap this many log-odds below its own peak to form boxes. 0 = the old cut, at `--box-percentile` of its probability range. |
+| `--box-peak-margin` | 1 | same | Box a tag's further regions only when their own peak is within this many log-odds of the tag's peak (0 = every region). |
 | `--box-percentile` | 0.6 | same | With `--box-below-peak 0`: cut within each tag's own heatmap range (0 = its weakest cell, 1 = only its peak). |
 | `--min-heatmap-range` | 0.05 | same | No boxes for a tag whose heatmap is flatter than this. |
 | `--min-box-fraction` | 0.0005 | same | Drop regions smaller than this fraction of the map. |

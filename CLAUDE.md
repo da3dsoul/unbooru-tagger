@@ -676,6 +676,9 @@ built the corpus around:
     mostly peak on their objects, but the probability-range cut kept about a fifth of the image for every tag. On run 4 at 2.12M:
     box precision 0.08 -> 0.19, recall 0.12 -> 0.25, small objects 0 -> 0.11 / 0.14 (minimum region 0.2% -> 0.05% of the map).
     The gold evaluation also reports region precision/recall at that cut (`GoldResult.RegionPrecision`), charted by size.
+    A tag's further regions are boxed only when their own peak is within 1 log-odds of its peak (`--box-peak-margin`,
+    `TagScorer.DefaultBoxPeakMargin`): the band took in faint blobs the drawn map shows as clear. Box precision 0.19 -> 0.27, recall
+    0.25 -> 0.22; no cut, smoothing or trim did much better, since a map's extent isn't its object's.
   - A joint bilateral filter (`HeatmapRefiner`) uses the source image's own
     edges as a guide to snap the heatmap boundary to real object
     contours — the label-free version of the CAM+DenseCRF refinement trick

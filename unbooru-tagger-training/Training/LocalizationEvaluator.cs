@@ -1463,7 +1463,8 @@ public sealed class LocalizationEvaluator(
     /// <summary>Boxes as <c>detect</c> extracts them (its defaults), in content pixels; without its edge-guided refinement, which needs the source image.</summary>
     private List<BoundingBox> DetectBoxes(float[,] map, LetterboxBox content) =>
         TagScorer.DetectBoxes(map, TagScorer.DefaultBoxThreshold, TagScorer.DefaultBoxPercentile, content, inputSize, content.Width, content.Height,
-            TagScorer.DefaultMinHeatmapRange, TagScorer.DefaultMinBoxFraction, TagScorer.DefaultMaxBoxesPerTag, TagScorer.DefaultBoxBelowPeak);
+            TagScorer.DefaultMinHeatmapRange, TagScorer.DefaultMinBoxFraction, TagScorer.DefaultMaxBoxesPerTag, TagScorer.DefaultBoxBelowPeak,
+            TagScorer.DefaultBoxPeakMargin);
 
     /// <summary>The best map cell inside <paramref name="boxes"/> (cell centres, content pixels), as the share of the content's cells at or below it.</summary>
     private double BoxBestRank(float[,] map, LetterboxBox content, int[][] boxes)

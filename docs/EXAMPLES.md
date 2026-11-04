@@ -2,7 +2,8 @@
 
 Twelve images from the hand-checked gold set, scored by run 4 at step 2.12M (`model-v4-s2.12M`, the first hours of
 mixed-scale training). Left: the gold boxes (solid: certain, dashed: unsure, dotted: a group). Right: the model's heatmap
-for each of the image's gold tags, drawn over the image, with the same gold boxes on top.
+for each of the image's gold tags, drawn over the image. Every box is hand-drawn gold; the model's panel shows only its maps,
+so compare the two side by side.
 
 How to read them:
 
@@ -22,7 +23,9 @@ and every earlier model, is the compare page (`gold/compare.html`, outside git; 
 It used to keep every cell above 60% of a tag's probability range, about a fifth of the image for every tag, an earring as much
 as a coat. It now cuts 4 log-odds below each tag's peak (`--box-below-peak`): over the gold set's object tags, box precision
 0.08 → 0.19, recall 0.12 → 0.25, and small objects found at all (0 → 0.11 / 0.14). Cutting 2 log-odds below the peak, 62% of a
-medium object's region lies on the object, against 12% before.
+medium object's region lies on the object, against 12% before. A further region now gets a box only if its own peak is within 1
+log-odds of the tag's (`--box-peak-margin`): precision 0.27, recall 0.22. Boxes still read worse than the maps, since a map's extent
+isn't its object's; the peak and the band are what to read.
 
 ---
 

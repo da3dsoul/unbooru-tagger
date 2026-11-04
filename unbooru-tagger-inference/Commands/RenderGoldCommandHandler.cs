@@ -86,7 +86,7 @@ public static class RenderGoldCommandHandler
         string goldPath, string outputDirectory, string? modelDir, float? threshold,
         float boxThreshold, float boxPercentile, float minHeatmapRange, float minBoxFraction, int maxBoxesPerTag, bool allTags = false, bool png = false,
         string? scoresPath = null, float? minConfidence = null, InferenceDevice device = InferenceDevice.Cpu, int batchSize = 16, bool writeHeatmaps = false,
-        float boxBelowPeak = TagScorer.DefaultBoxBelowPeak)
+        float boxBelowPeak = TagScorer.DefaultBoxBelowPeak, float boxPeakMargin = TagScorer.DefaultBoxPeakMargin)
     {
         var goldDirectory = Path.GetDirectoryName(Path.GetFullPath(goldPath))!;
         using var document = JsonDocument.Parse(File.ReadAllText(goldPath));
@@ -137,7 +137,7 @@ public static class RenderGoldCommandHandler
                         detected[c] = DetectCommandHandler.Detect(
                             model, encodings![c], DetectCommandHandler.RefinementGuide.From(bitmaps[c]), minConfidence ?? threshold, boxThreshold,
                             boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag, scores?.GetValueOrDefault(chunk[c].GetProperty("cacheIndex").GetInt32()),
-                            targets, writeHeatmaps ? tagHeatmaps[c] : null, boxBelowPeak);
+                            targets, writeHeatmaps ? tagHeatmaps[c] : null, boxBelowPeak, boxPeakMargin);
                     });
                     boxTime.Stop();
                 }

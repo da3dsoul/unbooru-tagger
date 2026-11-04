@@ -85,6 +85,27 @@ public class TagScorerTests
     }
 
     [Fact]
+    public void DetectBoxes_PeakMarginDropsFaintSecondaryRegions()
+    {
+        static float P(float logit) => 1f / (1f + MathF.Exp(-logit));
+        // Three separate regions in the 4-log-odds band: the peak (8), one 0.5 below it, one 3 below it.
+        var heatmap = new float[,]
+        {
+            { P(8), P(-6), P(7.5f), P(-6) },
+            { P(-6), P(-6), P(-6), P(-6) },
+            { P(5), P(-6), P(-6), P(-6) },
+            { P(-6), P(-6), P(-6), P(-6) }
+        };
+        var canvas = new LetterboxBox(0, 0, 4, 4);
+
+        var all = TagScorer.DetectBoxes(heatmap, threshold: 0.5f, relativePercentile: 0.6f, canvas, canvasSize: 4, imageWidth: 4, imageHeight: 4, belowPeak: 4f);
+        var near = TagScorer.DetectBoxes(heatmap, threshold: 0.5f, relativePercentile: 0.6f, canvas, canvasSize: 4, imageWidth: 4, imageHeight: 4, belowPeak: 4f, peakMargin: 1f);
+
+        Assert.Equal(3, all.Count);
+        Assert.Equal([0, 2], near.Select(b => b.X).Order());
+    }
+
+    [Fact]
     public void DetectBoxes_AbsoluteThresholdActsAsAFloorRegardlessOfPercentile()
     {
         var heatmap = new float[,] { { 0.3f, 0.2f }, { 0.1f, 0.05f } };
