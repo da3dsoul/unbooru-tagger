@@ -124,6 +124,9 @@ public static class TrainingCharts
 
     private const int LossColumns = 2;
 
+    /// <summary>A snapshot evaluation's dot radius (before scaling): just wider than the line, so a point shows without hiding it.</summary>
+    private const float SnapshotDot = 1.5f;
+
     /// <param name="header">A title line with the run and step; the training dashboard leaves it out, its panel already says so.</param>
     /// <param name="textScale">Text and line size (1 = 13 px labels); in a terminal, matched to its own text. Default: from the height.</param>
     public static SKBitmap Render(TrainingSeries series, int width, int height, DateTime now, bool header = true, float? textScale = null)
@@ -256,10 +259,11 @@ public static class TrainingCharts
         Line(canvas, area, values.Select(v => (v.Item1, v.Item2)).ToList(), xMin, xMax, yMin, yMax, MetricColor, 2.2f * scale);
         using var dot = new SKPaint { Color = MetricColor, IsAntialias = true };
         using var ring = new SKPaint { Color = Text, IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = 1.5f * scale };
+        // Snapshot dots small enough that the line stays readable where hundreds of them sit side by side; epochs keep a ring.
         foreach (var (x, y, endOfEpoch) in values)
         {
             var point = new SKPoint(X(area, x, xMin, xMax), Y(area, y, yMin, yMax));
-            canvas.DrawCircle(point, (endOfEpoch ? 4.5f : 2.8f) * scale, dot);
+            canvas.DrawCircle(point, (endOfEpoch ? 4.5f : SnapshotDot) * scale, dot);
             if (endOfEpoch)
                 canvas.DrawCircle(point, 6.5f * scale, ring);
         }
@@ -300,7 +304,7 @@ public static class TrainingCharts
             Line(canvas, area, strict.Select(v => (v.X, v.Y)).ToList(), xMin, xMax, yMin, yMax, color, 2f * scale);
             using var dot = new SKPaint { Color = color, IsAntialias = true };
             foreach (var (x, y, endOfEpoch) in strict)
-                canvas.DrawCircle(X(area, x, xMin, xMax), Y(area, y, yMin, yMax), (endOfEpoch ? 3.8f : 2.2f) * scale, dot);
+                canvas.DrawCircle(X(area, x, xMin, xMax), Y(area, y, yMin, yMax), (endOfEpoch ? 3.8f : SnapshotDot) * scale, dot);
             // The label and latest value above the line's end, where the lines are furthest apart; moved off any label already there.
             var ly = Y(area, strict[^1].Y, yMin, yMax) - 6 * scale;
             while (placed.Any(p => Math.Abs(p - ly) < small.Size))
@@ -400,7 +404,7 @@ public static class TrainingCharts
         Line(canvas, area, points, xMin, xMax, yMin, yMax, ReferenceColor, 1.6f * scale);
         using var dot = new SKPaint { Color = ReferenceColor, IsAntialias = true };
         foreach (var (x, y) in points)
-            canvas.DrawCircle(X(area, x, xMin, xMax), Y(area, y, yMin, yMax), 2.2f * scale, dot);
+            canvas.DrawCircle(X(area, x, xMin, xMax), Y(area, y, yMin, yMax), SnapshotDot * scale, dot);
         using var small = new SKFont(font.Typeface, font.Size * 0.85f);
         var (lx, ly) = (X(area, points[^1].X, xMin, xMax), Y(area, points[^1].Y, yMin, yMax));
         var right = lx + 5 * scale + small.MeasureText(label) > area.Right;

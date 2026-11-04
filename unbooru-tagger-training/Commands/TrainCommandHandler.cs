@@ -79,7 +79,10 @@ public static class TrainCommandHandler
         Func<IReadOnlyList<int>, EncodedImage[]>? readWindow = null;
         // Reads at a given canvas size, when that can differ from resolvedInputSize (--train-scales) or images need rescaling.
         Func<IReadOnlyList<int>, int, EncodedImage[]>? readWindowAt = null;
+        // Replaced whole (never changed in place) when a pending store appears, so other threads always see a complete list.
         HiResImageStore[] hiResStores = [];
+        // --hires-store directories a pull hasn't created yet (no store.json): opened at a store refresh once they exist.
+        var pendingStores = new List<string>();
         var trainingScales = targetOptions.TrainScales is { } scaleSpec
             ? new TrainingScales(TrainingScales.Parse(scaleSpec), Random.Shared.Next()) // batch sampling isn't seeded either
             : null;
@@ -119,11 +122,12 @@ public static class TrainCommandHandler
             }
             resolvedInputSize = targetOptions.TrainInputSize ?? cacheReader.InputSize;
             // Kept open for the whole run (the prefetcher reads them to the end); a pull still writing one is picked up as it goes.
-            hiResStores = (targetOptions.HiResStore ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Select(HiResImageStore.Open).OrderBy(store => store.LongSide).ToArray();
+            var storeDirectories = (targetOptions.HiResStore ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            pendingStores.AddRange(storeDirectories.Where(directory => !HiResImageStore.Exists(directory)));
+            hiResStores = storeDirectories.Where(HiResImageStore.Exists).Select(HiResImageStore.Open).OrderBy(store => store.LongSide).ToArray();
             var stores = hiResStores;
             var cacheSize = cacheReader.InputSize;
-            if (trainingScales is null && resolvedInputSize == cacheSize && stores.Length == 0)
+            if (trainingScales is null && resolvedInputSize == cacheSize && stores.Length == 0 && pendingStores.Count == 0)
             {
                 loadBatch = indices => LoadCacheBatch(cacheReader, indices, resolvedInputSize);
                 readWindow = indices => cacheReader.ReadEncoded(indices, ioParallelism);
@@ -132,14 +136,14 @@ public static class TrainCommandHandler
             {
                 // Training at another input size (e.g. fine-tuning at 1024) or several (--train-scales): rows a hi-res store holds
                 // come from it, the rest are the cached images rescaled (ImageResize).
-                readWindowAt = (indices, size) => size == cacheSize && stores.Length == 0
+                readWindowAt = (indices, size) => size == cacheSize && hiResStores.Length == 0
                     ? cacheReader.ReadEncoded(indices, ioParallelism)
-                    : ImageResize.Adapt(cacheReader.ReadEncoded(indices, ioParallelism), indices, cacheSize, size, stores);
+                    : ImageResize.Adapt(cacheReader.ReadEncoded(indices, ioParallelism), indices, cacheSize, size, hiResStores);
                 var at = readWindowAt;
                 readWindow = indices => at(indices, resolvedInputSize);
                 loadBatch = indices => LoadEncodedBatch(at(indices, resolvedInputSize), resolvedInputSize);
                 AnsiConsole.MarkupLineInterpolated(
-                    $"Input size {(trainingScales is null ? $"{resolvedInputSize}px" : $"mixed ({trainingScales}); checkpoints keep {resolvedInputSize}px")} (the cache's is {cacheSize}px); {(stores.Length == 0 ? "no hi-res store, every image rescaled" : string.Join(", ", stores.Select(store => $"{store.Count:N0} rows from the hi-res store at {store.LongSide}px ({store.Directory})")) + ", the rest rescaled")}.");
+                    $"Input size {(trainingScales is null ? $"{resolvedInputSize}px" : $"mixed ({trainingScales}); checkpoints keep {resolvedInputSize}px")} (the cache's is {cacheSize}px); {(stores.Length == 0 ? "no hi-res store, every image rescaled" : string.Join(", ", stores.Select(store => $"{store.Count:N0} rows from the hi-res store at {store.LongSide}px ({store.Directory})")) + ", the rest rescaled")}{(pendingStores.Count > 0 ? $"; waiting for {string.Join(", ", pendingStores)}" : "")}.");
             }
         }
         else
@@ -688,10 +692,18 @@ public static class TrainCommandHandler
             Dictionary<int, int[]>? storedPools = null;
             while (true)
             {
-                if (hiResStores.Length > 0 && refreshed.Elapsed >= StoreRefreshInterval)
+                if ((hiResStores.Length > 0 || pendingStores.Count > 0) && refreshed.Elapsed >= StoreRefreshInterval)
                 {
                     refreshed.Restart();
                     var added = hiResStores.Sum(store => store.Refresh());
+                    foreach (var directory in pendingStores.Where(HiResImageStore.Exists).ToList())
+                    {
+                        var opened = HiResImageStore.Open(directory);
+                        pendingStores.Remove(directory);
+                        hiResStores = [.. hiResStores.Append(opened).OrderBy(store => store.LongSide)];
+                        added += opened.Count;
+                        prefetcherLog.Enqueue(Markup.Escape($"hi-res store opened: {directory} ({opened.LongSide}px, {opened.Count:N0} rows)"));
+                    }
                     if (added > 0)
                     {
                         storedPools = null;
@@ -878,9 +890,9 @@ public static class TrainCommandHandler
         var scaleStats = trainingScales is not null ? new ScaleStats(trainingScales.Scales) : null;
         var flushClock = System.Diagnostics.Stopwatch.StartNew();
         var scaleSummaryStores = hiResStores.ToDictionary(store => store, store => store.Count);
-        string StoreLine() => hiResStores.Length == 0 ? "no stores" : "stores " + string.Join(", ", hiResStores.Select(store =>
+        string StoreLine() => hiResStores.Length == 0 ? pendingStores.Count > 0 ? "stores pending" : "no stores" : "stores " + string.Join(", ", hiResStores.Select(store =>
         {
-            var added = store.Count - scaleSummaryStores[store];
+            var added = store.Count - scaleSummaryStores.GetValueOrDefault(store);
             scaleSummaryStores[store] = store.Count;
             return $"{store.LongSide}px {store.Count:N0}{(added > 0 ? $" (+{added:N0})" : "")}";
         }));

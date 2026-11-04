@@ -79,6 +79,10 @@ public sealed class HiResImageStore : IDisposable
 
     public static HiResImageStore Open(string directory) => new(directory);
 
+    /// <summary>Whether <paramref name="directory"/> holds a store yet (a pull writes store.json and its files when it starts one).</summary>
+    public static bool Exists(string directory) =>
+        File.Exists(Path.Combine(directory, "store.json")) && File.Exists(Path.Combine(directory, "images.bin")) && File.Exists(Path.Combine(directory, "index.bin"));
+
     public bool Contains(int row) => _entries.ContainsKey(row);
 
     public IEnumerable<int> Rows => _entries.Keys;
