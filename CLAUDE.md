@@ -4,7 +4,9 @@ This file originally described the *planned* architecture before any code existe
 Most of it has since been built; where the implementation differs from the original
 plan, that's called out explicitly below rather than silently updated, so the
 reasoning behind a deviation stays visible. See [`README.md`](README.md) for how to
-actually build/run/train the thing — this file is architecture rationale and status.
+build and run the thing, [`docs/TRAINING.md`](docs/TRAINING.md) for how to train it, and
+[`research/`](research/README.md) for the research history — this file is architecture
+rationale and status.
 
 ## Goal
 Multi-label image tagger trained on booru-style string tags (no bounding box
@@ -105,7 +107,7 @@ for probability mass the way softmax forces them to).
   a model bundle exported before this existed loads as `LogitScaling.Identity`
   (`Scale=1, Bias=0`), matching its old unscaled/unbiased behavior exactly.
 - `--localization-weight` / `--localization-temperature` (on by default —
-  see README for current defaults): an MIL/log-sum-exp pooled auxiliary
+  see docs/TRAINING.md for current defaults): an MIL/log-sum-exp pooled auxiliary
   loss (`SigmoidContrastiveLoss.ComputeLocalized`), scored from every
   spatial location instead of the one pooled embedding, so sharp
   localization is directly rewarded by the loss instead of only being a
@@ -199,11 +201,12 @@ built the corpus around:
 - **Gold set** (`/media/da3dsoul/Golias/unbooru-tagger/gold`, not in git): 289
   hand-checked validation images (164 clean, 125 messy) with certain, group and
   ignore boxes (COCO-style crowd/ignore semantics). Scored by `evaluate --gold`,
-  rendered side by side with `render-gold`. A third set is being built (2026-11-02, `gold-auto/`, not in git; its
-  README.txt): 1,020 held-out images, 34 object tags x 30 at full-body/cowboy/upper-body framing, boxes proposed by OWLv2 and
-  Grounding DINO and checked by Claude subagents (`tools/CHECK.md`), calibrated blind against gold-small's verified boxes
-  (`tools/score.py`: detectors alone at score >= 0.2 find 66% of them with 27% precision; a 5-image pilot of the check found 9
-  of 11 at 90% precision). A second set, gold-small (`gold-small/`, 126 small-object images held out from run 4), is
+  rendered side by side with `render-gold`. A third set, gold-auto (2026-11-02/03, `gold-auto/`, not in git; its README.txt):
+  1,020 held-out images, 34 object tags x 30 at full-body/cowboy/upper-body framing, boxes from SAM 3 (facebook/sam3, text
+  prompts, score >= 0.7, no ignore boxes; `gold.json`, 1,830 pairs with a box). Checking OWLv2/Grounding DINO proposals with
+  Claude subagents (`tools/CHECK.md`) was the first plan, dropped at ~18M tokens for the set; SAM 3 scored 55% found / 88% right
+  at >= 0.7 on gold-small's verified boxes (`tools/score.py`), and its boxes score checkpoints like the user's on the same pairs
+  (pointing 60.4 vs 59.4%, object effect 0.93 vs 0.93), its bias being which pairs it keeps (easier ones). A second set, gold-small (`gold-small/`, 126 small-object images held out from run 4), is
   scored on its own by `evaluate --gold-small` into `localization_report_small.json` and charted beside the main set
   (most main-set images are in run 4's training split). Run 1's epoch-12 baseline is in
   `run1-small-convnext-epoch12-COMPARISON-ONLY/README.txt`. With a model, `render-gold`
@@ -255,9 +258,10 @@ built the corpus around:
 - **Site coverage:** `export-image-sites` writes `image_sites.bin` (per cache row:
   Danbooru-only 1.18M, Gelbooru-only 1.33M, both 2.87M) and `export-tag-agreement` writes
   `tag_agreement.json` (per tag, over the 2.9M images on both sites: listed by both / one
-  site only). 1,136 vocabulary tags exist on only one site's tag system: 993 Gelbooru-only
-  (silver_hair, black_legwear, *_footwear, female_focus, 10s, gen_N_pokemon) and 130
-  Danbooru-only (covered_nipples, photoshop_(medium)). An image from only the other site
+  site only). By `TagAgreement.LoadSiteCoverage`'s rule (>= 200 uses on those images, < 2% of them on one
+  site), 950 vocabulary tags are single-site: 925 Gelbooru-only (silver_hair, black_legwear, *_footwear,
+  female_focus, 10s, gen_N_pokemon) and 25 Danbooru-only (covered_nipples, photoshop_(medium)) (recounted
+  2026-11-03; this line used to say 1,136 = 993 + 130, which neither adds up nor reproduces). An image from only the other site
   can never carry them, so `TagStatistics.IsSiteBlind` pairs get weight 0 in training,
   are never sampled as negatives, and are left out of evaluation negatives, threshold
   calibration and image-level precision. The agreement counts are NOT usable as tagging
@@ -287,7 +291,7 @@ built the corpus around:
   `OneDnnPrecision` turns on oneDNN TF32 by calling libtorch's exported `at::Context` members, because
   TorchSharp only exposes the CUDA switches. Only the legacy `allowTF32OneDNN` flag reaches XPU convs.
   Measured on an Arc Pro B70: 158 ms/step for run 2's config vs. 278 on the A4000. It also needs the
-  NEO anti-migration env vars (README) so VRAM overflow fails instead of spilling to host RAM.
+  NEO anti-migration env vars (docs/TRAINING.md) so VRAM overflow fails instead of spilling to host RAM.
 - **Offloaded evaluation (`--evaluation-command`, `OffloadedEvaluations`):** each epoch's evaluation
   runs as a separate process on a model snapshot (`history/epoch-N/checkpoint/`) while training
   continues. Results are applied in epoch order at the next checkpoint save, and marker files make
@@ -546,7 +550,7 @@ built the corpus around:
     noise of two identical controls). Weight 0.3 with `--locality-detach-scaling` (no gradient into the shared logit scale
     and bias) matched plain 0.3 (mAP 0.474, precision 0.151, absent called 26%), so the cost isn't the shared bias. In no arm
     did the object effect rise: the model looks at the object more, but its call doesn't depend on it more yet. Candidate:
-    weight 0.1, per pair, gate 0.9; in run 5 from step ~238K (`train-v5.sh`). The term's per-image tag rows must be padded to
+    weight 0.1, per pair, gate 0.9; in run 5 from step ~221K (20:10, `train-v5.sh`). The term's per-image tag rows must be padded to
     fixed widths (`PaddedRows.Upload`'s `padTo`, 32): unpadded, their count changed nearly every step, VRAM grew ~2 GB a minute
     and the trainer died after 14-18 minutes with UR_RESULT_ERROR_OUT_OF_RESOURCES / xe "VM worker error: -12" (pp1's first
     try and run 5 at 21:20). Padded, VRAM held at 23.4 GB for the first 11 minutes, but the trainer died the same way after 47
@@ -632,6 +636,15 @@ built the corpus around:
   matrix multiply, channels-last with the norm on the NHWC view, pinned non-blocking uploads, no per-step device read-backs;
   see Glimpses' B70 speed): 221 -> 142 ms/step with the same recipe and checkpoint. A 12,000-step arm of it reached run 4's own
   mAP (0.788 vs 0.787 at 1.49M), and its checkpoints still load in the older evaluation build that run 4's trend charts use.
+
+- **Small/medium pointing arms (2026-11-03, `research/experiments-localization.md`; none adopted).** 12K steps from run 4 at
+  1,507,198, control ctl5 (mAP 0.789). `--context-negative-weight` 4/6/10: recall gap 27.0 -> 21.4 pts at 10, mAP 0.785,
+  pointing within noise. `--fine-localization` (`Model/FineLocalization.cs`, a stride-2 level giving a 256x256 map; its loss
+  is computed factored, `FineLocalizationMap` + `Mosaic.TileCrops`, so the dense map is never built, and it still fills the
+  B70's 32 GB): gold small 43.4% vs 37.7%, but gold-small and gold-auto small fell. A 2x zoom of the gold images at evaluation
+  (`evaluate --gold-images --gold-input-size`, Real-ESRGAN anime 6B or bicubic) raised small-object pointing 6-12 points on
+  all three sets and cost medium/large 2-20: the object's pixels, not the grid, limit small objects. Next candidate:
+  multi-scale training views. Run 4's epoch 4 (1,939,684): mAP 0.801, gold pointing 67.7%, gold-auto 65.9%.
 
 ## Localization — implemented: heatmap, and (beyond the original scope) approximate boxes
 - **Heatmap** (`TagScorer.Heatmap`; `unbooru-tagger-inference heatmap`
