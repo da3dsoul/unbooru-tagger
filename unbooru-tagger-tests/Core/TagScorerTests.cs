@@ -60,6 +60,31 @@ public class TagScorerTests
     }
 
     [Fact]
+    public void DetectBoxes_BelowPeak_CutsInLogOddsUnderTheTagsOwnPeak()
+    {
+        // Log-odds 6, 3 and 1 around a peak of 8, the rest -6: a cut 4 below the peak keeps the 8 and the 6 only, where a cut at
+        // 60% of the probability range (0.6) would also keep the 3 and the 1.
+        static float P(float logit) => 1 / (1 + MathF.Exp(-logit));
+        var heatmap = new float[,]
+        {
+            { P(8), P(6), P(3), P(1) },
+            { P(-6), P(-6), P(-6), P(-6) },
+            { P(-6), P(-6), P(-6), P(-6) },
+            { P(-6), P(-6), P(-6), P(-6) }
+        };
+        var canvas = new LetterboxBox(0, 0, 4, 4);
+
+        var belowPeak = TagScorer.DetectBoxes(heatmap, threshold: 0.5f, relativePercentile: 0.6f, canvas, canvasSize: 4, imageWidth: 4, imageHeight: 4, belowPeak: 4f);
+        var percentile = TagScorer.DetectBoxes(heatmap, threshold: 0.5f, relativePercentile: 0.6f, canvas, canvasSize: 4, imageWidth: 4, imageHeight: 4);
+
+        Assert.Equal(new BoundingBox(0, 0, 2, 1, belowPeak[0].Confidence), Assert.Single(belowPeak));
+        Assert.Equal(4, Assert.Single(percentile).Width);
+        // Below the absolute threshold at its peak, a tag still gets no boxes.
+        var weak = new float[,] { { P(-1), P(-3) }, { P(-6), P(-6) } };
+        Assert.Empty(TagScorer.DetectBoxes(weak, threshold: 0.5f, relativePercentile: 0f, new LetterboxBox(0, 0, 2, 2), canvasSize: 2, imageWidth: 2, imageHeight: 2, belowPeak: 4f));
+    }
+
+    [Fact]
     public void DetectBoxes_AbsoluteThresholdActsAsAFloorRegardlessOfPercentile()
     {
         var heatmap = new float[,] { { 0.3f, 0.2f }, { 0.1f, 0.05f } };

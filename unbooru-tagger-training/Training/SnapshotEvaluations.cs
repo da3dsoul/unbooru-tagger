@@ -26,13 +26,16 @@ namespace UnbooruTagger.Training.Training;
 /// <param name="GoldPointingBySize">Gold pointing per size bucket ("characters", "large", "medium", "small"); empty without a gold set.</param>
 /// <param name="GoldTolerantBySize">The same with <see cref="GoldResult.TolerantPointing"/> (and "all"); empty in reports from before it existed.</param>
 /// <param name="At1024">The gold checks at 1024px (<see cref="HigherScalePoint"/>); null where the evaluation didn't run them.</param>
+/// <param name="RegionPrecisionBySize">Gold region precision per size bucket (<see cref="GoldResult.RegionPrecision"/>); empty before it existed.</param>
+/// <param name="RegionRecallBySize">Gold region recall per size bucket.</param>
 public sealed record EvaluationPoint(
     long Step, bool EndOfEpoch, double MeanAveragePrecision, double GoldPointing, double RecallGap, double FalsePositiveGap,
     double OccludedStillCalled, double ExclusiveViolations, double SmallGoldPointing = double.NaN, double SmallOccludedStillCalled = double.NaN,
     double ObjectEffect = double.NaN, double SmallObjectEffect = double.NaN,
     double LabelledAbsentLogit = double.NaN, double LabelledPresentLogit = double.NaN,
     IReadOnlyDictionary<string, double>? GoldPointingBySize = null, IReadOnlyDictionary<string, double>? GoldTolerantBySize = null,
-    HigherScalePoint? At1024 = null)
+    HigherScalePoint? At1024 = null,
+    IReadOnlyDictionary<string, double>? RegionPrecisionBySize = null, IReadOnlyDictionary<string, double>? RegionRecallBySize = null)
 {
     /// <summary>The gold set's size buckets, as <see cref="LocalizationEvaluator.SizeBucket"/> names them, by short name.</summary>
     public static readonly (string Short, string Row)[] SizeRows =
@@ -58,6 +61,7 @@ public sealed record EvaluationPoint(
             var goldPath = Path.Combine(directory, EvaluateCommandHandler.LocalizationReportFileName);
             var (goldPointing, occluded, effect) = Localization(goldPath);
             var (bySize, tolerantBySize) = Sizes(goldPath);
+            var (regionPrecision, regionRecall) = Sizes(goldPath, nameof(GoldResult.RegionPrecision), nameof(GoldResult.RegionRecall));
             var (smallPointing, smallOccluded, smallEffect) = Localization(Path.Combine(directory, EvaluateCommandHandler.SmallGoldReportFileName));
 
             return new EvaluationPoint(step, endOfEpoch,
@@ -65,7 +69,7 @@ public sealed record EvaluationPoint(
                 Number(context, nameof(ContextRelianceReport.MacroRecallGap)), Number(context, nameof(ContextRelianceReport.MacroFalsePositiveGap)),
                 occluded, Number(root, nameof(EvaluationReport.ExclusiveViolationRate)), smallPointing, smallOccluded, effect, smallEffect,
                 Number(labelled, nameof(LabelledContextReport.AbsentMeanLogit)), Number(labelled, nameof(LabelledContextReport.PresentMeanLogit)),
-                bySize, tolerantBySize, HigherScalePoint.Read(directory, 1024));
+                bySize, tolerantBySize, HigherScalePoint.Read(directory, 1024), regionPrecision, regionRecall);
         }
         catch (Exception e) when (e is JsonException or IOException)
         {
@@ -85,7 +89,11 @@ public sealed record EvaluationPoint(
     }
 
     /// <summary>A localization report's gold pointing per size bucket, strict and tolerant (the tolerant one with "all" too).</summary>
-    internal static (Dictionary<string, double> Strict, Dictionary<string, double> Tolerant) Sizes(string path)
+    internal static (Dictionary<string, double> Strict, Dictionary<string, double> Tolerant) Sizes(string path) =>
+        Sizes(path, nameof(GoldResult.PointingAccuracy), nameof(GoldResult.TolerantPointing));
+
+    /// <summary>Two per-size fields of a localization report's gold rows (the second with "all" too); empty where missing.</summary>
+    internal static (Dictionary<string, double> Strict, Dictionary<string, double> Tolerant) Sizes(string path, string strictField, string tolerantField)
     {
         var (strict, tolerant) = (new Dictionary<string, double>(), new Dictionary<string, double>());
         if (!File.Exists(path))
@@ -99,9 +107,9 @@ public sealed record EvaluationPoint(
             var key = name == "all" ? "all" : SizeRows.FirstOrDefault(s => s.Row == name).Short;
             if (key is null)
                 continue;
-            if (key != "all" && Number(row, nameof(GoldResult.PointingAccuracy)) is var p && !double.IsNaN(p))
+            if (key != "all" && Number(row, strictField) is var p && !double.IsNaN(p))
                 strict[key] = p;
-            if (Number(row, nameof(GoldResult.TolerantPointing)) is var t && !double.IsNaN(t))
+            if (Number(row, tolerantField) is var t && !double.IsNaN(t))
                 tolerant[key] = t;
         }
         return (strict, tolerant);
@@ -141,10 +149,13 @@ public sealed record EvaluationPoint(
 /// <param name="AutoPointing">Gold-auto (SAM 3 boxes, 1,020 images) pointing over all pairs.</param>
 /// <param name="AutoBySize">Its pointing per size bucket.</param>
 /// <param name="AutoTolerantBySize">The same within 16px.</param>
+/// <param name="AutoRegionPrecisionBySize">Gold-auto region precision per size bucket (<see cref="GoldResult.RegionPrecision"/>).</param>
+/// <param name="AutoRegionRecallBySize">Its region recall.</param>
 public sealed record HigherScalePoint(
     double GoldPointing, IReadOnlyDictionary<string, double> GoldBySize, IReadOnlyDictionary<string, double> GoldTolerantBySize,
     double SmallGoldPointing, double ObjectEffect,
-    double AutoPointing, IReadOnlyDictionary<string, double> AutoBySize, IReadOnlyDictionary<string, double> AutoTolerantBySize)
+    double AutoPointing, IReadOnlyDictionary<string, double> AutoBySize, IReadOnlyDictionary<string, double> AutoTolerantBySize,
+    IReadOnlyDictionary<string, double>? AutoRegionPrecisionBySize = null, IReadOnlyDictionary<string, double>? AutoRegionRecallBySize = null)
 {
     public static string DirectoryName(int size) => $"at{size}";
 
@@ -162,7 +173,9 @@ public sealed record HigherScalePoint(
         var (smallPointing, _, _) = EvaluationPoint.Localization(Path.Combine(directory, DirectoryName(size), EvaluateCommandHandler.SmallGoldReportFileName));
         var (autoPointing, _, _) = EvaluationPoint.Localization(auto);
         var (autoBySize, autoTolerant) = EvaluationPoint.Sizes(auto);
-        return new HigherScalePoint(goldPointing, goldBySize, goldTolerant, smallPointing, effect, autoPointing, autoBySize, autoTolerant);
+        var (autoRegionPrecision, autoRegionRecall) = EvaluationPoint.Sizes(auto, nameof(GoldResult.RegionPrecision), nameof(GoldResult.RegionRecall));
+        return new HigherScalePoint(goldPointing, goldBySize, goldTolerant, smallPointing, effect, autoPointing, autoBySize, autoTolerant,
+            autoRegionPrecision, autoRegionRecall);
     }
 }
 

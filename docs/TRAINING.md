@@ -494,7 +494,10 @@ To `--out-dir`, which defaults to the checkpoint directory:
 - **`localization_report.json`** (and `_small.json` for `--gold-small`):
   - gold pointing, by stratum and size;
   - energy in the boxes;
-  - box precision, recall and count error;
+  - region precision and recall: the map within 4 log-odds of its peak (the cut `detect` boxes come from) against the
+    boxes, by cell (from 2026-11-04);
+  - box precision, recall and count error (boxes cut as `detect` cuts them; before 2026-11-04 at 60% of the probability
+    range, so earlier box numbers aren't comparable);
   - the occlusion check's object effect and control drop;
   - with `--localization-samples > 0`, the label-free checks (deletion, two characters, crop consistency, solo
     counts).
@@ -552,7 +555,8 @@ In a terminal, `train` shows a full-width panel. It covers:
   - the context gaps;
   - the labelled context check's log-odds;
   - the gold checks at 1,024px, when the evaluation command wrote them (`at1024/`, `at1024-auto/`): gold and
-    gold-auto pointing by size, gold-small pointing and the object effect.
+    gold-auto pointing by size, gold-small pointing and the object effect;
+  - region precision by size, recall dashed, at 512 (gold) and at 1,024 (gold-auto).
 
 In a terminal that shows Sixel images (Konsole, xterm, WezTerm, foot, or tmux 3.4+ built with sixel), the charts
 are drawn as an image. Other terminals get braille text charts, as does `--text-dashboard`. With output

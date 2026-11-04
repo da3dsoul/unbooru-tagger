@@ -47,6 +47,11 @@ var minBoxFractionOption = new Option<float>("--min-box-fraction")
     DefaultValueFactory = _ => TagScorer.DefaultMinBoxFraction
 };
 
+var boxBelowPeakOption = new Option<float>("--box-below-peak")
+{
+    Description = "Cut each tag's heatmap this many log-odds below its own peak to form boxes (0 = cut at --box-percentile of its probability range instead, as before 2026-11-04)",
+    DefaultValueFactory = _ => TagScorer.DefaultBoxBelowPeak
+};
 var maxBoxesPerTagOption = new Option<int>("--max-boxes-per-tag")
 {
     Description = "Keep at most this many boxes per tag, strongest peak first. 0 keeps every box",
@@ -120,6 +125,7 @@ detectCommand.Options.Add(boxPercentileOption);
 detectCommand.Options.Add(minHeatmapRangeOption);
 detectCommand.Options.Add(minBoxFractionOption);
 detectCommand.Options.Add(maxBoxesPerTagOption);
+detectCommand.Options.Add(boxBelowPeakOption);
 detectCommand.Options.Add(detectOutputOption);
 detectCommand.SetAction(parseResult => DetectCommandHandler.Run(
     parseResult.GetRequiredValue(modelDirOption),
@@ -130,7 +136,8 @@ detectCommand.SetAction(parseResult => DetectCommandHandler.Run(
     parseResult.GetRequiredValue(minHeatmapRangeOption),
     parseResult.GetRequiredValue(minBoxFractionOption),
     parseResult.GetRequiredValue(maxBoxesPerTagOption),
-    parseResult.GetValue(detectOutputOption)));
+    parseResult.GetValue(detectOutputOption),
+    parseResult.GetRequiredValue(boxBelowPeakOption)));
 
 var goldArgument = new Argument<string>("gold") { Description = "Gold set file (gold.json); its images are resolved relative to it" };
 var renderOutDirOption = new Option<string>("--out-dir") { Description = "Directory to write one PNG per gold image", Required = true };
@@ -151,6 +158,7 @@ renderGoldCommand.Options.Add(boxPercentileOption);
 renderGoldCommand.Options.Add(minHeatmapRangeOption);
 renderGoldCommand.Options.Add(minBoxFractionOption);
 renderGoldCommand.Options.Add(maxBoxesPerTagOption);
+renderGoldCommand.Options.Add(boxBelowPeakOption);
 renderGoldCommand.Options.Add(allTagsOption);
 renderGoldCommand.Options.Add(pngOption);
 var goldScoresOption = new Option<string?>("--scores")
@@ -163,6 +171,11 @@ var minConfidenceOption = new Option<float?>("--min-confidence")
     Description = "With a model, keep the gold set's tags down to this confidence instead of their thresholds; boxes.json records each tag's threshold, so gold/compare.html's cutoff slider can raise it back"
 };
 renderGoldCommand.Options.Add(minConfidenceOption);
+var heatmapsOption = new Option<bool>("--heatmaps")
+{
+    Description = "With a model, also write heatmaps.json: each gold tag's raw heatmap over the image (before refinement), for a viewer that draws the region instead of the boxes extracted from it"
+};
+renderGoldCommand.Options.Add(heatmapsOption);
 renderGoldCommand.Options.Add(deviceOption);
 renderGoldCommand.Options.Add(batchSizeOption);
 renderGoldCommand.SetAction(parseResult => RenderGoldCommandHandler.Run(
@@ -180,7 +193,9 @@ renderGoldCommand.SetAction(parseResult => RenderGoldCommandHandler.Run(
     parseResult.GetValue(goldScoresOption),
     parseResult.GetValue(minConfidenceOption),
     parseResult.GetRequiredValue(deviceOption),
-    parseResult.GetRequiredValue(batchSizeOption)));
+    parseResult.GetRequiredValue(batchSizeOption),
+    parseResult.GetValue(heatmapsOption),
+    parseResult.GetRequiredValue(boxBelowPeakOption)));
 
 var resultsOption = new Option<string>("--out")
 {
@@ -207,6 +222,7 @@ detectBatchCommand.Options.Add(boxPercentileOption);
 detectBatchCommand.Options.Add(minHeatmapRangeOption);
 detectBatchCommand.Options.Add(minBoxFractionOption);
 detectBatchCommand.Options.Add(maxBoxesPerTagOption);
+detectBatchCommand.Options.Add(boxBelowPeakOption);
 detectBatchCommand.SetAction(parseResult => DetectBatchCommandHandler.Run(
     parseResult.GetRequiredValue(modelDirOption),
     parseResult.GetRequiredValue(directoryArgument),
@@ -222,7 +238,8 @@ detectBatchCommand.SetAction(parseResult => DetectBatchCommandHandler.Run(
     parseResult.GetRequiredValue(boxPercentileOption),
     parseResult.GetRequiredValue(minHeatmapRangeOption),
     parseResult.GetRequiredValue(minBoxFractionOption),
-    parseResult.GetRequiredValue(maxBoxesPerTagOption)));
+    parseResult.GetRequiredValue(maxBoxesPerTagOption),
+    parseResult.GetRequiredValue(boxBelowPeakOption)));
 
 var rootCommand = new RootCommand("unbooru-tagger inference CLI")
 {

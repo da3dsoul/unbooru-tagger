@@ -671,6 +671,11 @@ built the corpus around:
   - Per-tag percentile thresholding (`--box-percentile`) cuts within each
     tag's own heatmap range instead of one global absolute cutoff, so a
     box tightens around a tag's own peak.
+  - **From 2026-11-04 the cut is in log-odds, 4 below the tag's own peak (`--box-below-peak`, `TagScorer.DefaultBoxBelowPeak`).**
+    Drawn as regions over the gold images (`render-gold --heatmaps`, `gold/compare.html` outside git, docs/EXAMPLES.md), the maps
+    mostly peak on their objects, but the probability-range cut kept about a fifth of the image for every tag. On run 4 at 2.12M:
+    box precision 0.08 -> 0.19, recall 0.12 -> 0.25, small objects 0 -> 0.11 / 0.14 (minimum region 0.2% -> 0.05% of the map).
+    The gold evaluation also reports region precision/recall at that cut (`GoldResult.RegionPrecision`), charted by size.
   - A joint bilateral filter (`HeatmapRefiner`) uses the source image's own
     edges as a guide to snap the heatmap boundary to real object
     contours — the label-free version of the CAM+DenseCRF refinement trick

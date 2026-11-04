@@ -34,8 +34,12 @@ public sealed record GoldImage(int CacheIndex, LetterboxBox Content, IReadOnlyLi
 /// <param name="TolerantPointing">Pointing with the pointing game's tolerance (Zhang et al. 2016, 15px): the peak within
 /// <see cref="LocalizationEvaluator.PointingTolerance"/> canvas pixels of a certain or group box (4 map cells at stride 4), so a peak
 /// one cell off a small box isn't a miss. The gap to <paramref name="PointingAccuracy"/> is near-misses.</param>
+/// <param name="RegionPrecision">The heatmap's region (cells within <see cref="TagScorer.DefaultBoxBelowPeak"/> log-odds of its peak, the cut
+/// detect's boxes come from): mean share of its cells inside certain or group boxes, ignore regions left out. 2026-11-04: judges the
+/// map itself, without the box extraction's merging and filtering.</param>
+/// <param name="RegionRecall">Mean share of the certain and group boxes' cells inside that region.</param>
 public sealed record GoldResult(string Name, int Pairs, int GoldInstances, double PointingAccuracy, double EnergyInBox, double InstancePrecision, double InstanceRecall, double MeanCountError,
-    double TolerantPointing = double.NaN);
+    double TolerantPointing = double.NaN, double RegionPrecision = double.NaN, double RegionRecall = double.NaN);
 
 /// <param name="DeletionGap">Mean drop in a tag's whole-image confidence when its top-heatmap cells are blanked, minus the drop from blanking the same number of random cells. Larger = the heatmap points at what the prediction actually depends on.</param>
 /// <param name="DeletionWinRate">Fraction of pairs where blanking the heatmap's top cells hurt more than blanking random cells (0.5 = chance).</param>
@@ -361,8 +365,8 @@ public sealed class LocalizationEvaluator(
     /// <summary>Running totals for one tag or stratum.</summary>
     private sealed class GoldTally
     {
-        public int Pairs, GoldInstances, PointingCounted, PointingHits, TolerantCounted, TolerantHits, ScoredExtracted, MatchedExtracted, RecallItems, RecalledItems, CountPairs;
-        public double Energy, CountError;
+        public int Pairs, GoldInstances, PointingCounted, PointingHits, TolerantCounted, TolerantHits, ScoredExtracted, MatchedExtracted, RecallItems, RecalledItems, CountPairs, RegionPairs;
+        public double Energy, CountError, RegionPrecision, RegionRecall;
 
         public void Add(PairScore score)
         {
@@ -381,6 +385,12 @@ public sealed class LocalizationEvaluator(
                     TolerantHits++;
             }
             Energy += score.Energy;
+            if (score.RegionPrecision is double regionPrecision && score.RegionRecall is double regionRecall)
+            {
+                RegionPairs++;
+                RegionPrecision += regionPrecision;
+                RegionRecall += regionRecall;
+            }
             ScoredExtracted += score.ScoredExtracted;
             MatchedExtracted += score.MatchedExtracted;
             RecallItems += score.RecallItems;
@@ -399,7 +409,9 @@ public sealed class LocalizationEvaluator(
             ScoredExtracted > 0 ? (double)MatchedExtracted / ScoredExtracted : 0,
             RecallItems > 0 ? (double)RecalledItems / RecallItems : 0,
             CountPairs > 0 ? CountError / CountPairs : 0,
-            TolerantCounted > 0 ? (double)TolerantHits / TolerantCounted : double.NaN);
+            TolerantCounted > 0 ? (double)TolerantHits / TolerantCounted : double.NaN,
+            RegionPairs > 0 ? RegionPrecision / RegionPairs : double.NaN,
+            RegionPairs > 0 ? RegionRecall / RegionPairs : double.NaN);
     }
 
     /// <summary>The tolerant pointing's reach (<see cref="GoldResult.TolerantPointing"/>), in canvas pixels.</summary>
@@ -407,7 +419,8 @@ public sealed class LocalizationEvaluator(
 
     /// <summary>One (image, tag) pair's gold scoring. <see cref="PeakHit"/> is null when the peak fell in an ignore region; <see cref="CountError"/> is null when the pair has group or ignore boxes.
     /// <see cref="NearHit"/> is the same with <see cref="PointingTolerance"/>.</summary>
-    public readonly record struct PairScore(bool? PeakHit, double Energy, int ScoredExtracted, int MatchedExtracted, int RecallItems, int RecalledItems, int? CountError, bool? NearHit = null);
+    public readonly record struct PairScore(bool? PeakHit, double Energy, int ScoredExtracted, int MatchedExtracted, int RecallItems, int RecalledItems, int? CountError, bool? NearHit = null,
+        double? RegionPrecision = null, double? RegionRecall = null);
 
     /// <summary>
     /// Scores one (image, tag) pair against its gold boxes with group/ignore semantics:
@@ -499,12 +512,11 @@ public sealed class LocalizationEvaluator(
                     var extracted = DetectBoxes(map, boxes[i])
                         .Select(b => new[] { b.X, b.Y, b.Width, b.Height }).ToList();
                     var peak = PeakCellCenterInContent(map, boxes[i]);
-                    var score = ScorePair(
-                        instances, peak,
-                        EnergyInBoxes(map, boxes[i],
-                            instances.Where(x => x.Kind != GoldKind.Ignore).Select(x => x.Box).ToList(),
-                            instances.Where(x => x.Kind == GoldKind.Ignore).Select(x => x.Box).ToList()),
-                        extracted);
+                    var boxedInstances = instances.Where(x => x.Kind != GoldKind.Ignore).Select(x => x.Box).ToList();
+                    var ignoredInstances = instances.Where(x => x.Kind == GoldKind.Ignore).Select(x => x.Box).ToList();
+                    var region = RegionInBoxes(map, boxes[i], boxedInstances, ignoredInstances);
+                    var score = ScorePair(instances, peak, EnergyInBoxes(map, boxes[i], boxedInstances, ignoredInstances), extracted)
+                        with { RegionPrecision = region?.Precision, RegionRecall = region?.Recall };
 
                     if (PointingPairs is not null)
                     {
@@ -1451,7 +1463,7 @@ public sealed class LocalizationEvaluator(
     /// <summary>Boxes as <c>detect</c> extracts them (its defaults), in content pixels; without its edge-guided refinement, which needs the source image.</summary>
     private List<BoundingBox> DetectBoxes(float[,] map, LetterboxBox content) =>
         TagScorer.DetectBoxes(map, TagScorer.DefaultBoxThreshold, TagScorer.DefaultBoxPercentile, content, inputSize, content.Width, content.Height,
-            TagScorer.DefaultMinHeatmapRange, TagScorer.DefaultMinBoxFraction, TagScorer.DefaultMaxBoxesPerTag);
+            TagScorer.DefaultMinHeatmapRange, TagScorer.DefaultMinBoxFraction, TagScorer.DefaultMaxBoxesPerTag, TagScorer.DefaultBoxBelowPeak);
 
     /// <summary>The best map cell inside <paramref name="boxes"/> (cell centres, content pixels), as the share of the content's cells at or below it.</summary>
     private double BoxBestRank(float[,] map, LetterboxBox content, int[][] boxes)
@@ -1557,6 +1569,49 @@ public sealed class LocalizationEvaluator(
     }
 
     /// <summary>Share of the tag's normalized heatmap mass inside <paramref name="goldBoxes"/>, with cells inside <paramref name="ignoreBoxes"/> left out of both sides.</summary>
+    /// <summary>
+    /// <see cref="GoldResult.RegionPrecision"/> and <see cref="GoldResult.RegionRecall"/> for one pair: the content cells within
+    /// <see cref="TagScorer.DefaultBoxBelowPeak"/> log-odds of the map's peak, against the boxes' cells (by cell centre). Null when no
+    /// box covers a cell centre (a box smaller than a cell).
+    /// </summary>
+    private (double Precision, double Recall)? RegionInBoxes(float[,] map, LetterboxBox content, IReadOnlyList<int[]> goldBoxes, IReadOnlyList<int[]> ignoreBoxes)
+    {
+        var h = map.GetLength(0);
+        var w = map.GetLength(1);
+        var valid = ImagePreprocessing.ComputeSpatialValidity(content, inputSize, h, w);
+        var max = float.MinValue;
+        for (var y = 0; y < h; y++)
+            for (var x = 0; x < w; x++)
+                if (valid[y, x]) max = Math.Max(max, map[y, x]);
+        var peak = Math.Clamp(max, 1e-7f, 1 - 1e-7f);
+        var cut = 1 / (1 + MathF.Exp(-(MathF.Log(peak / (1 - peak)) - TagScorer.DefaultBoxBelowPeak)));
+        int region = 0, regionInside = 0, boxCells = 0, boxCellsInRegion = 0;
+        var cellW = inputSize / (float)w;
+        var cellH = inputSize / (float)h;
+        for (var y = 0; y < h; y++)
+            for (var x = 0; x < w; x++)
+            {
+                if (!valid[y, x])
+                    continue;
+                var cx = (x + 0.5f) * cellW - content.X;
+                var cy = (y + 0.5f) * cellH - content.Y;
+                var inRegion = map[y, x] >= cut;
+                var inBox = goldBoxes.Any(b => cx >= b[0] && cx < b[0] + b[2] && cy >= b[1] && cy < b[1] + b[3]);
+                if (inBox)
+                {
+                    boxCells++;
+                    if (inRegion) boxCellsInRegion++;
+                }
+                if (inRegion && (inBox || !ignoreBoxes.Any(b => cx >= b[0] && cx < b[0] + b[2] && cy >= b[1] && cy < b[1] + b[3])))
+                {
+                    region++;
+                    if (inBox) regionInside++;
+                }
+            }
+
+        return boxCells == 0 ? null : (region > 0 ? (double)regionInside / region : 0, (double)boxCellsInRegion / boxCells);
+    }
+
     private double EnergyInBoxes(float[,] map, LetterboxBox content, IReadOnlyList<int[]> goldBoxes, IReadOnlyList<int[]> ignoreBoxes)
     {
         var h = map.GetLength(0);

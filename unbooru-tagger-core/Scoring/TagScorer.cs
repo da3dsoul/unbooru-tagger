@@ -14,10 +14,18 @@ public static class TagScorer
     /// evaluator kept every region (no minimum size or count), so on a 128x128 map each above-cutoff speck was a box: about
     /// 150-190 boxes against a couple of gold boxes per pair, box precision 0.1-0.3% in every run.
     /// </summary>
+    /// <remarks>
+    /// 2026-11-04: boxes are cut <see cref="DefaultBoxBelowPeak"/> log-odds below the tag's own peak, not at a share of its
+    /// probability range. Drawn as regions over the gold images, the maps peak on the objects, but the probability cut kept about a
+    /// fifth of the image for every tag, an earring as much as a coat. On run 4 at 2.12M over the gold set's object tags: box
+    /// precision 0.08 -> 0.19, recall 0.12 -> 0.25, small objects 0 -> 0.11 / 0.14 (with the minimum region lowered from 0.2% to
+    /// 0.05% of the map, below which a small object's region fell). Cuts of 2.5-3 suit small objects, 4-5 large ones.
+    /// </remarks>
     public const float DefaultBoxThreshold = 0.5f;
     public const float DefaultBoxPercentile = 0.6f;
+    public const float DefaultBoxBelowPeak = 4f;
     public const float DefaultMinHeatmapRange = 0.05f;
-    public const float DefaultMinBoxFraction = 0.002f;
+    public const float DefaultMinBoxFraction = 0.0005f;
     public const int DefaultMaxBoxesPerTag = 3;
 
     /// <summary>Confidence that <paramref name="tagEmbedding"/> applies to the whole image. <paramref name="scaling"/> defaults to <see cref="LogitScaling.Identity"/> (plain <c>sigmoid(dot)</c>) for a model bundle exported before <see cref="LogitScaling"/> existed.</summary>
@@ -74,10 +82,13 @@ public static class TagScorer
     /// </param>
     /// <param name="minComponentFraction">Drops connected regions covering fewer than this fraction of the grid's cells — isolated specks, not localization. 0 keeps every region.</param>
     /// <param name="maxBoxes">Keeps only this many boxes, highest peak confidence first. 0 keeps every box.</param>
+    /// <param name="belowPeak">When above 0, cut this many log-odds below the heatmap's peak instead of at
+    /// <paramref name="relativePercentile"/> of its probability range (<paramref name="threshold"/> then only decides whether the
+    /// tag gets boxes at all: its peak must reach it).</param>
     public static List<BoundingBox> DetectBoxes(
         float[,] heatmap, float threshold, float relativePercentile,
         LetterboxBox content, int canvasSize, int imageWidth, int imageHeight, float minRange = 0.05f,
-        float minComponentFraction = 0f, int maxBoxes = 0)
+        float minComponentFraction = 0f, int maxBoxes = 0, float belowPeak = 0f)
     {
         var height = heatmap.GetLength(0);
         var width = heatmap.GetLength(1);
@@ -93,7 +104,18 @@ public static class TagScorer
         if (max - min < minRange)
             return [];
 
-        var effectiveThreshold = Math.Max(threshold, min + relativePercentile * (max - min));
+        float effectiveThreshold;
+        if (belowPeak > 0)
+        {
+            if (max < threshold)
+                return [];
+            var peak = Math.Clamp(max, 1e-7f, 1 - 1e-7f);
+            effectiveThreshold = Sigmoid(MathF.Log(peak / (1 - peak)) - belowPeak);
+        }
+        else
+        {
+            effectiveThreshold = Math.Max(threshold, min + relativePercentile * (max - min));
+        }
 
         var visited = new bool[height, width];
 

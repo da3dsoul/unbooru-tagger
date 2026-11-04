@@ -17,16 +17,16 @@ ONNX Runtime, from one command-line tool. There is no Python in the repository.
 
 ### Example
 
-Run 4's epoch-4 model on one image from the hand-checked gold set. The gold set mostly overlaps run 4's training
-split, so this shows what the output looks like, not held-out accuracy. Artwork by **hiyuu (hiyualice)**
-([Danbooru post 6776791](https://danbooru.donmai.us/posts/6776791)).
+Run 4's model on one image from the hand-checked gold set: the gold boxes (left) and the model's heatmap for each of
+the image's tags (right; one hue per tag, opaque at its strongest evidence, + at its peak). The gold set mostly overlaps
+run 4's training split, so this shows what the output looks like, not held-out accuracy. Artwork by **hiyuu (hiyualice)**
+([Danbooru post 6776791](https://danbooru.donmai.us/posts/6776791)). Twelve more, failures included:
+[docs/EXAMPLES.md](docs/EXAMPLES.md).
 
-<p>
-  <img src="docs/images/example.jpg" alt="Example image: Flandre Scarlet" height="320">
-  <img src="docs/images/example-heatmap-hat.jpg" alt="Heatmap for the tag hat" height="320">
-</p>
+![Gold boxes beside the model's heatmaps for hat, shoes and wings](docs/images/example-heatmaps.jpg)
 
-`tag` output (the top 24 of the 55 tags it reports; each tag uses its own calibrated threshold):
+`tag` output on the same image from run 4's epoch-4 model (the top 24 of the 55 tags it reports; each tag uses its own
+calibrated threshold):
 
 ```
 rating  General
@@ -40,11 +40,8 @@ rating  General
 0.897   short_sleeves               0.801   looking_at_viewer           0.745   simple_background
 ```
 
-Right of the image above: the heatmap for `hat` (`heatmap`). Below: the gold boxes (left) and the model's boxes for
-the same tags (right, `render-gold --png`). The boxes are approximate. Here the shoes are found, the hat's box
-covers the hat and the face, and the wings, which are thin and spread across the image, get one large box.
-
-![Gold boxes beside the model's boxes](docs/images/example-boxes.jpg)
+The hat's evidence sits on the hat, the shoes' on the shoes, and the wings' on the crystals hanging from them. `detect` cuts
+its boxes from these maps, 4 log-odds below each tag's peak; they are approximate.
 
 ## Contents
 
@@ -225,6 +222,8 @@ unbooru-tagger-inference render-gold ./gold/gold.json --out-dir ./gold/renders -
   - `--all-tags` shows every detected tag, not only the gold ones.
   - `--min-confidence F` keeps the gold tags down to `F`, for a page with a live cutoff.
   - `--scores` takes per-pair scores from a training-side evaluation dump.
+  - `--heatmaps` also writes `heatmaps.json`: each gold tag's raw heatmap over the image, in log-odds, for a page that draws
+    the maps themselves (overlay, mask or region) instead of boxes. [docs/EXAMPLES.md](docs/EXAMPLES.md) is made from it.
 - **Without a model:** draws the gold boxes alone.
 
 ### Options shared by the commands
@@ -233,10 +232,11 @@ unbooru-tagger-inference render-gold ./gold/gold.json --out-dir ./gold/renders -
 |---|---|---|---|
 | `--model-dir` | `./model` | all | The model bundle. |
 | `--threshold` | the tag's calibrated threshold, else 0.5 | tag, tag-batch, detect, detect-batch, render-gold | Minimum confidence to report a tag. |
-| `--box-threshold` | 0.5 | detect, detect-batch, render-gold | Minimum per-cell confidence for a cell to join a box. |
-| `--box-percentile` | 0.6 | same | Also cut within each tag's own heatmap range (0 = its weakest cell, 1 = only its peak), to tighten boxes. |
+| `--box-threshold` | 0.5 | detect, detect-batch, render-gold | A tag gets boxes only if its heatmap's peak reaches this (with `--box-below-peak 0`: the minimum confidence for a cell to join a box). |
+| `--box-below-peak` | 4 | same | Cut each tag's heatmap this many log-odds below its own peak to form boxes. 0 = the old cut, at `--box-percentile` of its probability range. |
+| `--box-percentile` | 0.6 | same | With `--box-below-peak 0`: cut within each tag's own heatmap range (0 = its weakest cell, 1 = only its peak). |
 | `--min-heatmap-range` | 0.05 | same | No boxes for a tag whose heatmap is flatter than this. |
-| `--min-box-fraction` | 0.002 | same | Drop regions smaller than this fraction of the map. |
+| `--min-box-fraction` | 0.0005 | same | Drop regions smaller than this fraction of the map. |
 | `--max-boxes-per-tag` | 3 | same | Keep the strongest N boxes per tag; 0 = all. |
 | `--batch-size` | 16 | tag-batch, detect-batch, render-gold | Images per model run. |
 | `--workers` | 0 (half the logical CPUs) | tag-batch, detect-batch | Threads for decoding, and for per-image scoring and boxes. |

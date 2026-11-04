@@ -22,11 +22,11 @@ public static class DetectCommandHandler
 
     public static int Run(
         string modelDir, string imagePath, float? threshold, float boxThreshold, float boxPercentile, float minHeatmapRange,
-        float minBoxFraction, int maxBoxesPerTag, string? outputPath)
+        float minBoxFraction, int maxBoxesPerTag, string? outputPath, float boxBelowPeak = TagScorer.DefaultBoxBelowPeak)
     {
         using var model = ModelBundle.Load(modelDir);
 
-        var detections = Detect(model, imagePath, threshold, boxThreshold, boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag);
+        var detections = Detect(model, imagePath, threshold, boxThreshold, boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag, boxBelowPeak: boxBelowPeak);
 
         Console.WriteLine(JsonSerializer.Serialize(detections, new JsonSerializerOptions { WriteIndented = true }));
 
@@ -61,12 +61,13 @@ public static class DetectCommandHandler
     /// </summary>
     public static List<TagDetection> Detect(
         ModelBundle model, string imagePath, float? threshold, float boxThreshold, float boxPercentile, float minHeatmapRange = 0.05f,
-        float minBoxFraction = 0f, int maxBoxesPerTag = 0, IReadOnlyDictionary<string, float>? scores = null, IReadOnlySet<string>? onlyTags = null)
+        float minBoxFraction = 0f, int maxBoxesPerTag = 0, IReadOnlyDictionary<string, float>? scores = null, IReadOnlySet<string>? onlyTags = null,
+        float boxBelowPeak = TagScorer.DefaultBoxBelowPeak)
     {
         using var bitmap = SKBitmap.Decode(imagePath)
             ?? throw new InvalidDataException($"Could not decode image at '{imagePath}'.");
         var encoding = model.ImageEncoder.EncodeBatch([ImagePreprocessing.Normalize(bitmap, model.ImageEncoder.InputSize)])[0];
-        return Detect(model, encoding, RefinementGuide.From(bitmap), threshold, boxThreshold, boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag, scores, onlyTags);
+        return Detect(model, encoding, RefinementGuide.From(bitmap), threshold, boxThreshold, boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag, scores, onlyTags, boxBelowPeak: boxBelowPeak);
     }
 
     /// <summary>What box refinement needs from the source image, so a caller can drop the decoded bitmap early.</summary>
@@ -80,7 +81,7 @@ public static class DetectCommandHandler
     public static List<TagDetection> Detect(
         ModelBundle model, ImageEncoding encoding, RefinementGuide guide, float? threshold, float boxThreshold, float boxPercentile,
         float minHeatmapRange = 0.05f, float minBoxFraction = 0f, int maxBoxesPerTag = 0, IReadOnlyDictionary<string, float>? scores = null,
-        IReadOnlySet<string>? onlyTags = null)
+        IReadOnlySet<string>? onlyTags = null, IDictionary<string, float[,]>? heatmaps = null, float boxBelowPeak = TagScorer.DefaultBoxBelowPeak)
     {
         var spatialFeatures = encoding.SpatialFeatures
             ?? throw new ArgumentException("Detection needs the encoding's spatial features (EncodeBatch with withHeatmapFeatures: true).", nameof(encoding));
@@ -97,10 +98,11 @@ public static class DetectCommandHandler
 
             var tagEmbedding = model.Embeddings.GetRow(row);
             var heatmap = TagScorer.Heatmap(tagEmbedding, spatialFeatures, model.LogitScaling);
+            heatmaps?.Add(tag, heatmap);
             var refinedHeatmap = HeatmapRefiner.Refine(heatmap, guide.Guide);
             var boxes = TagScorer.DetectBoxes(
                 refinedHeatmap, boxThreshold, boxPercentile, guide.Content, RefinementSize, guide.ImageWidth, guide.ImageHeight, minHeatmapRange,
-                minBoxFraction, maxBoxesPerTag);
+                minBoxFraction, maxBoxesPerTag, boxBelowPeak);
             detections.Add(new TagDetection(model.Vocabulary.GetByRowIndex(row).Tag, confidence, boxes));
         }
 

@@ -390,3 +390,26 @@ given (`--hires-store a,b`, one per long side); a row is read from the smallest 
 rows a pull appends while training runs are picked up every 5 minutes. A scale trained only on stored rows (2048) is skipped while no
 store holds any at that size. The plan: gather stores strategically, per tag and per kind of image (collages and comics at 2,048), as
 evaluations show what is weak.
+
+### Heatmaps as regions, and where boxes are cut (2026-11-04)
+
+The user: the output looked like garbage, but "a single bad point in the heatmap could make the box look like garbage". So
+`render-gold --heatmaps` writes each gold tag's raw map, and a viewer (`gold/compare.html`, outside git) draws it over the image:
+each tag in its own hue, opacity rising over the top 4 log-odds, + at the peak. Most maps peak on their objects
+([docs/EXAMPLES.md](../docs/EXAMPLES.md)). The boxes were the problem: `detect` kept every cell above
+max(0.5, 60% of the tag's probability range), a median 18-23% of the image for every tag, an earring as much as a coat.
+
+Run 4 at 2.12M, the gold set's object tags, regions by cell (precision: share of the region inside the tag's boxes, ignore
+boxes included; area: median share of the image):
+
+| Region cut | small P / R / area | medium | large |
+|---|---|---|---|
+| detect's (probability range) | 0.04 / 0.89 / 23% | 0.12 / 0.74 / 19% | 0.36 / 0.51 / 23% |
+| peak − 2 log-odds | 0.34 / 0.29 / 0.3% | 0.62 / 0.13 / 0.4% | 0.72 / 0.04 / 0.7% |
+| peak − 4 log-odds | 0.19 / 0.60 / 2.4% | 0.47 / 0.36 / 1.8% | 0.62 / 0.21 / 4.2% |
+
+Boxes from those cuts (components ≥ 0.05% of the map, at most 3, IoU ≥ 0.3 with a certain box; `review/regions/tune*.py`):
+percentile cut P 0.08 / R 0.12 (small 0 / 0), peak − 4 P 0.19 / R 0.25 (small 0.11 / 0.14). Smaller cuts suit small objects
+(peak − 2.5: 0.24 / 0.24), larger ones large objects (peak − 5: 0.20 / 0.35); `detect` doesn't know the size, so it uses 4. The
+0.2% minimum region had discarded every small object's box. `TagScorer.DefaultBoxBelowPeak` = 4, `DefaultMinBoxFraction` = 0.0005;
+the evaluator's box metrics follow, and it reports region precision/recall at that cut (`GoldResult.RegionPrecision`).

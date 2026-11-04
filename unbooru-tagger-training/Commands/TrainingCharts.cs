@@ -96,6 +96,20 @@ public static class TrainingCharts
             (size, color) => new SplitLine(size.Short, p => EvaluationPoint.Get(p.At1024?.AutoBySize, size.Short), p => EvaluationPoint.Get(p.At1024?.AutoTolerantBySize, size.Short), color)),
     ];
 
+    // Region precision by size, recall dashed (GoldResult.RegionPrecision: the map within 4 log-odds of its peak, what detect's boxes
+    // are cut from): whether the map's hot region is the object, without the box extraction in between.
+    private static readonly SplitLine[] RegionBySize =
+    [
+        .. EvaluationPoint.SizeRows.Skip(1).Zip(SizeColors.Skip(1),
+            (size, color) => new SplitLine(size.Short, p => EvaluationPoint.Get(p.RegionPrecisionBySize, size.Short), p => EvaluationPoint.Get(p.RegionRecallBySize, size.Short), color)),
+    ];
+
+    private static readonly SplitLine[] AutoRegionBySize1024 =
+    [
+        .. EvaluationPoint.SizeRows.Skip(1).Zip(SizeColors.Skip(1),
+            (size, color) => new SplitLine(size.Short, p => EvaluationPoint.Get(p.At1024?.AutoRegionPrecisionBySize, size.Short), p => EvaluationPoint.Get(p.At1024?.AutoRegionRecallBySize, size.Short), color)),
+    ];
+
     private static readonly Metric[] Metrics =
     [
         new("held-out mAP", p => p.MeanAveragePrecision, false, false),
@@ -117,6 +131,8 @@ public static class TrainingCharts
         new("gold-auto pointing by size @1024", p => p.At1024?.AutoPointing ?? double.NaN, false, true, AutoPointingBySize1024),
         new("gold-small pointing @1024", p => p.At1024?.SmallGoldPointing ?? double.NaN, false, true),
         new("object effect @1024 (log-odds)", p => p.At1024?.ObjectEffect ?? double.NaN, false, false),
+        new("gold region precision by size (dashed: recall)", p => EvaluationPoint.Get(p.RegionPrecisionBySize, "medium"), false, true, RegionBySize),
+        new("gold-auto region precision @1024 (dashed: recall)", p => EvaluationPoint.Get(p.At1024?.AutoRegionPrecisionBySize, "medium"), false, true, AutoRegionBySize1024),
     ];
 
     /// <summary>Panels per row; the loss takes the first two.</summary>

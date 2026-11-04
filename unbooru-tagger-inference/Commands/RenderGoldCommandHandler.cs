@@ -29,11 +29,64 @@ public static class RenderGoldCommandHandler
 {
     private const int HeaderHeight = 24;
     public const string BoxesFileName = "boxes.json";
+    public const string HeatmapsFileName = "heatmaps.json";
+
+    /// <summary>
+    /// One tag's raw heatmap (before detect's edge-guided refinement) for heatmaps.json: the grid cells over the image's content
+    /// only, row-major, each a log-odds as a byte (0-255 over the content's range), base64; plus where detect would cut it into boxes
+    /// (<see cref="TagScorer.DetectBoxes"/>'s cutoff: the higher of the box threshold and the percentile of the map's own range,
+    /// letterbox bars included, as detect computes it). A viewer maps the cells linearly onto the gold image, which is the content.
+    /// </summary>
+    private static object HeatmapEntry(float[,] heatmap, LetterboxBox content, int inputSize, float boxThreshold, float boxPercentile, float boxBelowPeak)
+    {
+        var (gridH, gridW) = (heatmap.GetLength(0), heatmap.GetLength(1));
+        var (cellW, cellH) = (inputSize / (double)gridW, inputSize / (double)gridH);
+        var x0 = (int)Math.Floor(content.X / cellW);
+        var y0 = (int)Math.Floor(content.Y / cellH);
+        var x1 = Math.Min(gridW, (int)Math.Ceiling((content.X + content.Width) / cellW));
+        var y1 = Math.Min(gridH, (int)Math.Ceiling((content.Y + content.Height) / cellH));
+        var (min, max) = (float.MaxValue, float.MinValue);
+        foreach (var v in heatmap)
+            (min, max) = (Math.Min(min, v), Math.Max(max, v));
+        // Stored as log-odds, linear between the content's lowest and highest: as probabilities, everything near a peak is
+        // squashed into the last few byte values. The heatmap is sigmoid output, so logits beyond about +-16 come back clamped.
+        var logits = new float[y1 - y0, x1 - x0];
+        var (lo, hi) = (float.MaxValue, float.MinValue);
+        for (var y = y0; y < y1; y++)
+            for (var x = x0; x < x1; x++)
+            {
+                var p = Math.Clamp(heatmap[y, x], 1e-7f, 1 - 1e-7f);
+                var logit = MathF.Log(p / (1 - p));
+                logits[y - y0, x - x0] = logit;
+                (lo, hi) = (Math.Min(lo, logit), Math.Max(hi, logit));
+            }
+        var bytes = new byte[(x1 - x0) * (y1 - y0)];
+        for (var y = 0; y < y1 - y0; y++)
+            for (var x = 0; x < x1 - x0; x++)
+                bytes[y * (x1 - x0) + x] = (byte)Math.Round(hi > lo ? (logits[y, x] - lo) / (hi - lo) * 255 : 0);
+        return new
+        {
+            width = x1 - x0,
+            height = y1 - y0,
+            // The cropped cells' extent in content pixels (the first and last cells can stick out past the content's edges).
+            left = x0 * cellW - content.X,
+            top = y0 * cellH - content.Y,
+            cell = new[] { cellW, cellH },
+            // The content's size in canvas pixels: a viewer scales by the image's own size over this.
+            content = new[] { content.Width, content.Height },
+            detectCutoff = boxBelowPeak > 0 ? 1 / (1 + MathF.Exp(-(MathF.Log(Math.Clamp(max, 1e-7f, 1 - 1e-7f) / (1 - Math.Clamp(max, 1e-7f, 1 - 1e-7f))) - boxBelowPeak)))
+                : Math.Max(boxThreshold, min + boxPercentile * (max - min)),
+            // values: byte b is the log-odds lo + b / 255 * (hi - lo).
+            logitRange = new[] { lo, hi },
+            values = Convert.ToBase64String(bytes),
+        };
+    }
 
     public static int Run(
         string goldPath, string outputDirectory, string? modelDir, float? threshold,
         float boxThreshold, float boxPercentile, float minHeatmapRange, float minBoxFraction, int maxBoxesPerTag, bool allTags = false, bool png = false,
-        string? scoresPath = null, float? minConfidence = null, InferenceDevice device = InferenceDevice.Cpu, int batchSize = 16)
+        string? scoresPath = null, float? minConfidence = null, InferenceDevice device = InferenceDevice.Cpu, int batchSize = 16, bool writeHeatmaps = false,
+        float boxBelowPeak = TagScorer.DefaultBoxBelowPeak)
     {
         var goldDirectory = Path.GetDirectoryName(Path.GetFullPath(goldPath))!;
         using var document = JsonDocument.Parse(File.ReadAllText(goldPath));
@@ -45,6 +98,7 @@ public static class RenderGoldCommandHandler
 
         var count = 0;
         var boxes = new Dictionary<string, object>();
+        var heatmapEntries = new Dictionary<string, object>();
         var writePng = model is null || png;
         var images = document.RootElement.GetProperty("images").EnumerateArray()
             .Where(i => !(i.TryGetProperty("excluded", out var excluded) && excluded.ValueKind == JsonValueKind.True))
@@ -69,6 +123,7 @@ public static class RenderGoldCommandHandler
                 }
                 // Heatmaps and boxes are CPU work per image, so the batch's images run in parallel.
                 var detected = new List<TagDetection>[chunk.Length];
+                var tagHeatmaps = new Dictionary<string, float[,]>[chunk.Length];
                 if (model is not null)
                 {
                     boxTime.Start();
@@ -78,10 +133,11 @@ public static class RenderGoldCommandHandler
                         // those: down to a low floor, every vocabulary row would cost a heatmap.
                         var targets = allTags ? null
                             : chunk[c].GetProperty("targets").EnumerateArray().Select(t => t.GetString()!.Replace(' ', '_')).ToHashSet(StringComparer.Ordinal);
+                        tagHeatmaps[c] = new Dictionary<string, float[,]>();
                         detected[c] = DetectCommandHandler.Detect(
                             model, encodings![c], DetectCommandHandler.RefinementGuide.From(bitmaps[c]), minConfidence ?? threshold, boxThreshold,
                             boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag, scores?.GetValueOrDefault(chunk[c].GetProperty("cacheIndex").GetInt32()),
-                            targets);
+                            targets, writeHeatmaps ? tagHeatmaps[c] : null, boxBelowPeak);
                     });
                     boxTime.Stop();
                 }
@@ -116,6 +172,9 @@ public static class RenderGoldCommandHandler
                             threshold = model.Vocabulary.TryGet(d.Tag, out var record) ? model.ThresholdFor(record.RowIndex, threshold) : (float?)null,
                             boxes = d.Boxes.Select(b => new[] { b.X, b.Y, b.Width, b.Height, b.Confidence }),
                         });
+                        if (writeHeatmaps)
+                            heatmapEntries[index.ToString()] = tagHeatmaps[c].ToDictionary(t => t.Key,
+                                t => HeatmapEntry(t.Value, encodings![c].Content, model.ImageEncoder.InputSize, boxThreshold, boxPercentile, boxBelowPeak));
                         if (writePng)
                         {
                             // A PNG can't move its cutoff, so it keeps the tags' thresholds.
@@ -148,6 +207,8 @@ public static class RenderGoldCommandHandler
 
         if (model is not null)
             File.WriteAllText(Path.Combine(outputDirectory, BoxesFileName), JsonSerializer.Serialize(new { model = ModelName(modelDir!), images = boxes }));
+        if (model is not null && writeHeatmaps)
+            File.WriteAllText(Path.Combine(outputDirectory, HeatmapsFileName), JsonSerializer.Serialize(new { model = ModelName(modelDir!), images = heatmapEntries }));
         if (model is not null)
             Console.WriteLine($"Model {encodeTime.Elapsed.TotalSeconds:F1}s, heatmaps and boxes {boxTime.Elapsed.TotalSeconds:F1}s, over {count} images.");
         Console.WriteLine(writePng

@@ -22,7 +22,7 @@ public static class DetectBatchCommandHandler
     public static int Run(
         string modelDir, string directory, string outputPath, string? renderDirectory, bool boxes, bool recursive,
         int batchSize, int workers, InferenceDevice device, float? threshold, float boxThreshold, float boxPercentile,
-        float minHeatmapRange, float minBoxFraction, int maxBoxesPerTag)
+        float minHeatmapRange, float minBoxFraction, int maxBoxesPerTag, float boxBelowPeak = TagScorer.DefaultBoxBelowPeak)
     {
         using var model = ModelBundle.Load(modelDir, device: device);
         var images = BatchPipeline.FindImages(directory, recursive);
@@ -45,7 +45,7 @@ public static class DetectBatchCommandHandler
                     (item, encoding) =>
                     {
                         var detections = boxes
-                            ? DetectCommandHandler.Detect(model, encoding, item.Guide!, threshold, boxThreshold, boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag)
+                            ? DetectCommandHandler.Detect(model, encoding, item.Guide!, threshold, boxThreshold, boxPercentile, minHeatmapRange, minBoxFraction, maxBoxesPerTag, boxBelowPeak: boxBelowPeak)
                             : TagCommandHandler.Score(model, encoding, threshold).Select(s => new TagDetection(s.Tag, s.Confidence, [])).ToList();
                         var rating = TagCommandHandler.PredictRating(model, detections.Select(d => (d.Tag, d.Confidence)).ToList());
                         var relative = Path.GetRelativePath(directory, item.Path);
