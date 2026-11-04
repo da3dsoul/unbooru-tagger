@@ -198,6 +198,8 @@ See [experiments-window-labels.md](experiments-window-labels.md).
 - **11-04 13:13:** run 4 moved to mixed scales (`--train-scales`: 512/768/1,024/2,048 per micro-batch) with the store,
   and a second pull was queued: 38K collage/crowd/comic images at 2,048, 310K small-object images at 1,024 (the six
   tags plus ~19 more), 36K medium-object images at 768. Snapshot evaluations add the gold checks at 1,024.
+- **11-04 17:00:** the A4000's evaluation queue backed up (three waiting): each snapshot's evaluation took ~22 minutes,
+  14 of them the 1,024 checks, against a snapshot every ~29. The 1,024 checks now run every 20,000 steps.
 
 See [experiments-localization.md](experiments-localization.md#aliasing-or-resolution-the-gold-originals-2026-11-04).
 

@@ -554,7 +554,8 @@ In a terminal, `train` shows a full-width panel. It covers:
   - the occlusion object effect;
   - the context gaps;
   - the labelled context check's log-odds;
-  - the gold checks at 1,024px, when the evaluation command wrote them (`at1024/`, `at1024-auto/`): gold and
+  - the gold checks at 1,024px, when the evaluation command wrote them (`at1024/`, `at1024-auto/`; run 4: every
+    20,000 steps): gold and
     gold-auto pointing by size, gold-small pointing and the object effect;
   - region precision by size, recall dashed, at 512 (gold) and at 1,024 (gold-auto).
 
@@ -612,8 +613,14 @@ Run 4's real one (`xpu-test/evaluate-on-cuda.sh`, outside git) adds:
   `at1024-auto/`). It re-runs itself under `flock`, so the 1,024 checks hold the lock too, and writes
   `evaluate-on-cuda.done`: a restarted trainer relaunches its unfinished evaluations while the old trainer's copies
   still wait on the lock, and whichever runs second stops there.
+- From 2026-11-04 17:00, the 1,024 checks run only on snapshots at multiples of 20,000 steps (and every epoch
+  evaluation). On the A4000 a snapshot evaluation took ~22 minutes, 14 of them the 1,024 checks (gold-auto alone
+  ~9.5), while mixed-scale training made a snapshot every ~29; after one long experiment held the GPU, three
+  evaluations were queued at once. Every other snapshot averages ~15 minutes. The charts skip snapshots without them.
 
 Evaluations of experiments should wait while a run's own evaluations are queued, or the trend charts fall hours behind.
+Keep a snapshot's evaluation well under the time between snapshots too, or the queue never empties and the experiments
+waiting behind it never run.
 
 **Snapshot evaluations.** `--snapshot-evaluation-steps N` (needs `--evaluation-command`) also evaluates a
 model-only snapshot every N global steps, for the trend charts.

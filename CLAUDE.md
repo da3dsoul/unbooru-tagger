@@ -655,7 +655,7 @@ built the corpus around:
   proportion to the store's coverage of it (wristband 0.47 -> 0.61 at 53%); a model trained on enlarged images alone gained
   nothing from real pixels at test time. Run 4 trains this way from ~2.09M (`512:10:0.3,768:5:0.3:0.2,1024:3:0.3:0.3,2048:1:0.1:1`;
   2,048 only on stored rows). `ScaleStats` logs what each size did; the snapshot evaluations add the gold checks at 1,024
-  (`HigherScalePoint`, four chart panels). The plan: gather resolution where evaluations show weakness, by tag and by kind of image.
+  (`HigherScalePoint`, four chart panels; every 20,000 steps, since at every snapshot the A4000's queue fell behind). The plan: gather resolution where evaluations show weakness, by tag and by kind of image.
 
 ## Localization — implemented: heatmap, and (beyond the original scope) approximate boxes
 - **Heatmap** (`TagScorer.Heatmap`; `unbooru-tagger-inference heatmap`
