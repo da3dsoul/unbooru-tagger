@@ -62,6 +62,8 @@ Each of these rules shaped which experiments were allowed:
 | **Judge context-shortcut fixes on the context gaps and the object, not on mAP alone.** | Run 3 review (2026-10-26) and the overnight brief of 2026-10-30. | An mAP drop was acceptable if it recovered with more training. Arms were extended to 12K and 18K steps to check that. |
 | **Training and evaluation must run the same model forward.** | The deleted first glimpse run (2026-10-31). | Window choice in evaluation must be the model's own, as in training. |
 | **Measure design choices before a multi-day run depends on them.** | Same incident. | Run 5's window budget was measured against gold boxes with `glimpse-frames` before launch. |
+| **No full re-pull at higher resolution; gather it strategically.** | 2026-11-04: at most a day of downloading at first, for a few weak tags, stored compactly (JPEG); then "we can gather mixed resolutions strategically over time to up specific things that are having issues". | Hi-res stores per long side (768/1,024/2,048), filled by tag and by kind of image, and mixed-scale training that reads them. |
+| **Evaluations must not pile up.** | 2026-11-04. | Experiment evaluations wait while the run's own are queued; restarts don't leave duplicate evaluations behind. |
 
 Not every rule has a recorded date. Where a date is given above, it comes from the memory notes and the
 review notes listed in [README.md](README.md#sources).

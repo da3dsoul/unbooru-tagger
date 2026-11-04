@@ -116,6 +116,7 @@ public sealed record TrainingTargetOptions(
     bool GlimpseFramedPositivePooling = false,
     bool SeparateGlimpseTower = false,
     float GlimpseTowerLearningRateScale = 1f,
+    bool FineLocalization = false,
     int ContextPairsPerBatch = 0,
     float ContextPairMargin = 1f,
     float ContextPairWeight = 0f,
@@ -128,6 +129,12 @@ public sealed record TrainingTargetOptions(
     float TwinWeight = 1f,
     bool TwinDetachScaling = false,
     int TwinPaste = 0,
+    float SelfMapWeight = 0f,
+    bool SelfMapDetachScaling = false,
+    string SelfMapNegatives = "none",
+    float SelfMapNegativeWeight = 1f,
+    int MosaicLargeGrid = 0,
+    int MosaicLargeGridEvery = 2,
     int? GlimpsePoolMinZoom = null,
     bool HillNegatives = false,
     float GlimpseProposalWeight = 1f,
@@ -182,7 +189,11 @@ public sealed record TrainingTargetOptions(
     int SnapshotEvaluationSteps = 0,
     IReadOnlyList<string>? ChartReferences = null,
     bool TextDashboard = false,
-    IReadOnlyList<string>? ChartComparisons = null)
+    IReadOnlyList<string>? ChartComparisons = null,
+    int? TrainInputSize = null,
+    string? HiResStore = null,
+    IReadOnlyList<string>? FocusTagNames = null,
+    string? TrainScales = null)
 {
     public IReadOnlyList<OcclusionFill> ErasureFills => ErasureFillNames is { Count: > 0 } fills ? fills : OcclusionFills.Training;
 

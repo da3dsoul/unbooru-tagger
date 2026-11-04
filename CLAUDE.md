@@ -645,6 +645,17 @@ built the corpus around:
   (`evaluate --gold-images --gold-input-size`, Real-ESRGAN anime 6B or bicubic) raised small-object pointing 6-12 points on
   all three sets and cost medium/large 2-20: the object's pixels, not the grid, limit small objects. Next candidate:
   multi-scale training views. Run 4's epoch 4 (1,939,684): mAP 0.801, gold pointing 67.7%, gold-auto 65.9%.
+- **Resolution and mixed-scale training (2026-11-04, `research/experiments-localization.md`).** The cache's 512px shrink is
+  nearest-neighbour, but the gold originals showed the limit is resolution, not aliasing (a clean 512px shrink scored like the
+  cache; real 768/1,024px pixels +10 to +16 points on small objects). Fine-tuning at 1,024 kept mAP, gained 15-20 points on small
+  objects and lost up to 7 on large ones; 768 was balanced. Chosen rows are re-downloaded into side stores (`HiResImageStore`,
+  core: JPEGs at a long side, written by `review/hires/pull*.py` outside git), and training draws each micro-batch at one of
+  several sizes with its own batch (`--train-scales size:batch:share[:stored]`, `TrainingScales`; `--hires-store a,b` reads rows
+  from the smallest store reaching the size, refreshed every 5 minutes while a pull writes). Real pixels raised a tag's AP in
+  proportion to the store's coverage of it (wristband 0.47 -> 0.61 at 53%); a model trained on enlarged images alone gained
+  nothing from real pixels at test time. Run 4 trains this way from ~2.09M (`512:10:0.3,768:5:0.3:0.2,1024:3:0.3:0.3,2048:1:0.1:1`;
+  2,048 only on stored rows). `ScaleStats` logs what each size did; the snapshot evaluations add the gold checks at 1,024
+  (`HigherScalePoint`, four chart panels). The plan: gather resolution where evaluations show weakness, by tag and by kind of image.
 
 ## Localization — implemented: heatmap, and (beyond the original scope) approximate boxes
 - **Heatmap** (`TagScorer.Heatmap`; `unbooru-tagger-inference heatmap`

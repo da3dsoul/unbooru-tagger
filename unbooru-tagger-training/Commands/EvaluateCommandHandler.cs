@@ -1,6 +1,8 @@
+using SkiaSharp;
 using System.Diagnostics;
 using Spectre.Console;
 using UnbooruTagger.Core.Dataset;
+using UnbooruTagger.Core.Encoding;
 using UnbooruTagger.Core.Scoring;
 using UnbooruTagger.Core.Vocabulary;
 using UnbooruTagger.Training.Checkpoints;
@@ -26,11 +28,22 @@ public static class EvaluateCommandHandler
         string? goldPath = null, int localizationSamples = 300, float mapScoreTemperature = 0.25f, IReadOnlyList<string>? dumpTags = null,
         string? tagParentagePath = null, string? smallGoldPath = null, bool dumpOcclusion = false, OcclusionFill occlusionFill = OcclusionFill.Zero,
         string? contextCheckPath = null, string precision = "fp32", bool glimpseGrid = false, bool cropTeacher = true,
-        string? localityPriorOut = null, int localityPriorImages = 20000, bool glimpseObjectOnly = false, string? twinCheckOut = null)
+        string? localityPriorOut = null, int localityPriorImages = 20000, bool glimpseObjectOnly = false, string? twinCheckOut = null, string? mapWindowCheckOut = null,
+        string? peakWindowScoresOut = null, string? goldImagesDir = null, int? goldInputSize = null,
+        int? heldOutInputSize = null, string? hiResStore = null)
     {
         var contextCheck = contextCheckPath is not null ? LabelledContextCheck.Load(contextCheckPath) : null;
         var device = DeviceSelector.Best();
         using var cacheReader = new PreprocessedDatasetCacheReader(cacheDir);
+        // --input-size / --hires-store: held-out images scored at another input size (a model fine-tuned at 1024), cached rows
+        // rescaled and the hi-res store's rows read from it, as training does (ImageResize.Adapt).
+        using var hiRes = hiResStore is not null ? HiResImageStore.Open(hiResStore) : null;
+        var heldOutSize = heldOutInputSize ?? cacheReader.InputSize;
+        EncodedImage[] ReadCache(IReadOnlyList<int> ids, int size) => size == cacheReader.InputSize && hiRes is null
+            ? cacheReader.ReadEncoded(ids)
+            : ImageResize.Adapt(cacheReader.ReadEncoded(ids), ids, cacheReader.InputSize, size, hiRes);
+        if (heldOutSize != cacheReader.InputSize && goldImagesDir is null && (goldPath is not null || smallGoldPath is not null))
+            throw new ArgumentException("--input-size with --gold needs --gold-images: the gold boxes are in the cache's pixels.");
         var (imageTower, config, vocabulary, embeddings, logitScaleBias) = Checkpoint.Load(checkpointDir, device);
         if (precision is "tf32" or "bf16")
             TorchSharp.torch.backends.cuda.matmul.allow_tf32 = true;
@@ -118,6 +131,29 @@ public static class EvaluateCommandHandler
             AnsiConsole.MarkupLineInterpolated(
                 $"Classification pooling: {classificationPooledRows.shape[0]:N0} localizable tags scored per tag at temperature {imageTower.ClassificationPoolingTemperature}{(imageTower.ClassificationPoolingTopK > 0 ? $", the mean of the top {imageTower.ClassificationPoolingTopK}" : "")}.");
 
+        if (mapWindowCheckOut is not null)
+        {
+            // Only the map-made window labels' check, on the gold sets (MapWindowCheck).
+            var mapGold = new List<GoldImage>();
+            foreach (var path in new[] { goldPath, smallGoldPath }.OfType<string>())
+                mapGold.AddRange(LocalizationEvaluator.LoadGold(path).Where(g => mapGold.All(x => x.CacheIndex != g.CacheIndex)));
+            MapWindowCheck.Run(imageTower, Enumerable.Range(0, embeddings.RowCount).SelectMany(i => embeddings.GetRow(i).ToArray()).ToArray(), config.EmbeddingDim,
+                mapGold, vocabulary, localizability, cacheReader, device, mapWindowCheckOut);
+            Took("map window check");
+            return 0;
+        }
+
+        if (peakWindowScoresOut is not null)
+        {
+            // Only the whole-image and peak windows' scores of the --dump-scores tags on the held-out images (PeakWindowScores).
+            if (dumpTags is not { Count: > 0 })
+                throw new ArgumentException("--peak-window-scores needs --dump-scores <tags>.");
+            PeakWindowScores.Run(imageTower, Enumerable.Range(0, embeddings.RowCount).SelectMany(i => embeddings.GetRow(i).ToArray()).ToArray(), config.EmbeddingDim,
+                heldOut, imageTagRows, dumpTags, vocabulary, contextCheck, logitScaleBias.ToLogitScaling(), cacheReader, device, batchSize, peakWindowScoresOut);
+            Took("peak window scores");
+            return 0;
+        }
+
         if (twinCheckOut is not null)
         {
             // Only the matched twins' window check, on the gold sets (TwinCheck).
@@ -165,10 +201,10 @@ public static class EvaluateCommandHandler
                 {
                     (var loss, pooled, scores) = TrainCommandHandler.Evaluate(
                         imageTower, tagTower, logitScaleBias,
-                        indices => TrainCommandHandler.LoadCacheBatch(cacheReader, indices, cacheReader.InputSize),
-                        imageTagRows, heldOut, allTagIndices, vocabulary.Records.Count, device, batchSize, cacheReader.InputSize,
+                        indices => TrainCommandHandler.LoadEncodedBatch(ReadCache(indices, heldOutSize), heldOutSize),
+                        imageTagRows, heldOut, allTagIndices, vocabulary.Records.Count, device, batchSize, heldOutSize,
                         onBatchComplete: done => task.Value = done,
-                        readWindow: ids => cacheReader.ReadEncoded(ids), classificationPooledRows: classificationPooledRows);
+                        readWindow: ids => ReadCache(ids, heldOutSize), classificationPooledRows: classificationPooledRows);
                     AnsiConsole.MarkupLineInterpolated($"mean validation loss (old metric) {loss:G4}");
                     if (embeddingsCachePath is not null)
                         SaveEmbeddings(embeddingsCachePath, pooled);
@@ -210,19 +246,40 @@ public static class EvaluateCommandHandler
         {
             AnsiConsole.MarkupLine("Measuring localization...");
             var tagEmbeddingArray = Enumerable.Range(0, embeddings.RowCount).SelectMany(i => embeddings.GetRow(i).ToArray()).ToArray();
+            // --gold-images: gold images from <dir>/<cache index>.png (e.g. upscaled), letterboxed at --gold-input-size, instead of
+            // the cache; images without one (the label-free checks' held-out images) still come from the cache.
+            var evaluatorInputSize = goldImagesDir is not null ? goldInputSize ?? heldOutSize : heldOutSize;
+            string? GoldImage(int id) => goldImagesDir is not null && File.Exists(Path.Combine(goldImagesDir, $"{id}.png")) ? Path.Combine(goldImagesDir, $"{id}.png") : null;
+            Func<IReadOnlyList<int>, EncodedImage[]> readImages = goldImagesDir is null
+                ? ids => ReadCache(ids, evaluatorInputSize)
+                : ids =>
+                {
+                    var fromCache = ids.Where(id => GoldImage(id) is null).ToList();
+                    var cached = fromCache.Count > 0 ? ReadCache(fromCache, evaluatorInputSize) : [];
+                    var next = 0;
+                    return ids.Select(id => GoldImage(id) is { } file ? ImagePreprocessing.LoadAndEncode(file, evaluatorInputSize) : cached[next++]).ToArray();
+                };
+            // The gold boxes are in the image's own pixels; its content box is wherever the letterbox puts it at that size.
+            List<GoldImage> WithGoldImages(List<GoldImage> set) => goldImagesDir is null ? set : set.Select(g =>
+            {
+                var file = GoldImage(g.CacheIndex) ?? throw new FileNotFoundException($"--gold-images has no {g.CacheIndex}.png");
+                using var codec = SKCodec.Create(file);
+                return g with { Content = ImagePreprocessing.ComputeLetterboxBox(codec.Info.Width, codec.Info.Height, evaluatorInputSize) };
+            }).ToList();
             var evaluator = new LocalizationEvaluator(
                 imageTower, tagEmbeddingArray, config.EmbeddingDim, logitScaleBias.ToLogitScaling(),
-                ids => cacheReader.ReadEncoded(ids), cacheReader.InputSize, device)
+                readImages, evaluatorInputSize, device)
             {
                 MapScoreTemperature = mapScoreTemperature > 0 ? mapScoreTemperature : null,
                 ClassificationPooledTags = vocabulary.Records.OrderBy(r => r.RowIndex).Select(r => localizability.IsLocalizable(r.Tag)).ToArray(),
                 OcclusionPairs = dumpOcclusion ? [] : null,
+                PointingPairs = dumpOcclusion ? [] : null,
                 GlimpsePairs = dumpOcclusion ? [] : null,
                 GlimpseEmbeddingDump = dumpOcclusion ? [] : null,
                 OcclusionFill = occlusionFill,
                 CropTeacher = cropTeacher,
             };
-            var gold = goldPath is not null ? LocalizationEvaluator.LoadGold(goldPath) : null;
+            var gold = goldPath is not null ? WithGoldImages(LocalizationEvaluator.LoadGold(goldPath)) : null;
             if (gold is not null && families is not null)
                 gold = LocalizationEvaluator.ExpandFamilies(gold, families, vocabulary);
             localization = evaluator.Evaluate(vocabulary, imageTagRows, heldOut, gold, localizability, Math.Max(localizationSamples, 1), seed);
@@ -234,7 +291,7 @@ public static class EvaluateCommandHandler
             // its gold scoring, crop teacher and occlusion: the label-free checks are already in the main report.
             if (smallGoldPath is not null)
             {
-                var smallGold = LocalizationEvaluator.LoadGold(smallGoldPath);
+                var smallGold = WithGoldImages(LocalizationEvaluator.LoadGold(smallGoldPath));
                 if (families is not null)
                     smallGold = LocalizationEvaluator.ExpandFamilies(smallGold, families, vocabulary);
                 smallLocalization = evaluator.Evaluate(vocabulary, imageTagRows, heldOut, smallGold, localizability, seed: seed, labelFreeChecks: false);
@@ -255,9 +312,9 @@ public static class EvaluateCommandHandler
             if (localization.GoldTags.Count > 0)
             {
                 var table = new Table().Title("Gold-set localization by tag (worst pointing first)")
-                    .AddColumns("tag", "pairs", "gold boxes", "pointing", "energy in box", "box precision", "box recall", "count error");
+                    .AddColumns("tag", "pairs", "gold boxes", "pointing", $"within {LocalizationEvaluator.PointingTolerance}px", "energy in box", "box precision", "box recall", "count error");
                 foreach (var t in localization.GoldTags)
-                    table.AddRow(Markup.Escape(t.Name), t.Pairs.ToString(), t.GoldInstances.ToString(), t.PointingAccuracy.ToString("F2"),
+                    table.AddRow(Markup.Escape(t.Name), t.Pairs.ToString(), t.GoldInstances.ToString(), t.PointingAccuracy.ToString("F2"), t.TolerantPointing.ToString("F2"),
                         t.EnergyInBox.ToString("F2"), t.InstancePrecision.ToString("F2"), t.InstanceRecall.ToString("F2"), t.MeanCountError.ToString("F2"));
                 AnsiConsole.Write(table);
             }
@@ -339,6 +396,13 @@ public static class EvaluateCommandHandler
             return;
         File.WriteAllLines(path, pairs.Select(p => System.Text.Json.JsonSerializer.Serialize(p)));
         pairs.Clear();
+        // Each gold pair's pointing (pointing_pairs.jsonl, pointing_pairs_small.jsonl).
+        if (evaluator.PointingPairs is { } pointing)
+        {
+            File.WriteAllLines(Path.Combine(Path.GetDirectoryName(path)!, Path.GetFileName(path).Replace("occlusion_pairs", "pointing_pairs")),
+                pointing.Select(p => System.Text.Json.JsonSerializer.Serialize(p)));
+            pointing.Clear();
+        }
         // The glimpse funnel's windows for the same gold set, beside it (glimpse_pairs.jsonl, glimpse_pairs_small.jsonl).
         if (evaluator.GlimpsePairs is { } glimpses)
         {
@@ -439,13 +503,13 @@ public static class EvaluateCommandHandler
 
     internal static string DescribeGold(GoldResult g) =>
         Markup.Escape(
-            $"gold localization ({g.Name}, {g.Pairs} pairs): pointing {g.PointingAccuracy:P1}, energy in box {g.EnergyInBox:F3}, " +
+            $"gold localization ({g.Name}, {g.Pairs} pairs): pointing {g.PointingAccuracy:P1} (within {LocalizationEvaluator.PointingTolerance}px {g.TolerantPointing:P1}), energy in box {g.EnergyInBox:F3}, " +
             $"box precision {g.InstancePrecision:P2} / recall {g.InstanceRecall:P1}, count error {g.MeanCountError:F1}");
 
     internal static string DescribeLocalization(LocalizationReport r) =>
         Markup.Escape(
             string.Concat(r.Gold.Select(g =>
-                $"gold {g.Name} ({g.Pairs} image-tag pairs): pointing {g.PointingAccuracy:P1}, energy in box {g.EnergyInBox:P1}, box precision {g.InstancePrecision:P1}, box recall {g.InstanceRecall:P1}, count error {g.MeanCountError:F2} | ")) +
+                $"gold {g.Name} ({g.Pairs} image-tag pairs): pointing {g.PointingAccuracy:P1} (within {LocalizationEvaluator.PointingTolerance}px {g.TolerantPointing:P1}), energy in box {g.EnergyInBox:P1}, box precision {g.InstancePrecision:P1}, box recall {g.InstanceRecall:P1}, count error {g.MeanCountError:F2} | ")) +
             $"deletion gap {r.DeletionGap:F4} (top beats random {r.DeletionWinRate:P1}, {r.DeletionPairs} pairs) | " +
             $"two characters: heatmap correlation {r.TwoCharacterCorrelation:F3}, distinct peaks {r.TwoCharacterDistinctPeaks:P1} ({r.TwoCharacterImages} images) | " +
             $"crop consistency {r.CropConsistency:F3} ({r.CropPairs} pairs) | solo once-per-person tags with exactly one box {r.SoloSingleInstanceRate:P1} ({r.SoloPairs} pairs)");

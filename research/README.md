@@ -16,7 +16,7 @@ For using the tagger, see the [README](../README.md). For training it, see [docs
 | [goals.md](goals.md) | The original goals, why a dual encoder, and the maintainer's rules that shaped the research. |
 | [timeline.md](timeline.md) | The story from the first commit through run 1, run 2, run 3, run 4, run 5 (glimpses) and the current work. |
 | [datasets-and-evaluation.md](datasets-and-evaluation.md) | The crawled dataset, label corrections (ratings, implications, site coverage, tag parentage), the gold sets (gold, gold-small, gold-auto), the labelled context check and the missing-labels pass. |
-| [experiments-localization.md](experiments-localization.md) | Heatmaps and boxes, the localization loss, tower fusion, the separate map, crop consistency, background suppression, mosaics. |
+| [experiments-localization.md](experiments-localization.md) | Heatmaps and boxes, the localization loss, tower fusion, the separate map, crop consistency, background suppression, mosaics, resolution (aliasing vs resolution, hi-res stores, mixed-scale training). |
 | [experiments-context-shortcut.md](experiments-context-shortcut.md) | Deliberate targets, context negatives, negative gamma, context prior, classification pooling, out-of-context and excluder sampling, the context-margin and refit checks. |
 | [experiments-erased-views.md](experiments-erased-views.md) | Erased-view (occlusion) training, its patch-cue artifact and the anchor term. |
 | [experiments-glimpses.md](experiments-glimpses.md) | Run 5's model-chosen glimpses, locality negatives and the glimpse pooling investigation. |

@@ -25,7 +25,7 @@ var epochsOption = new Option<int>("--epochs") { Description = "Maximum number o
 var batchSizeOption = new Option<int>("--batch-size") { DefaultValueFactory = _ => 16 };
 var learningRateOption = new Option<double>("--lr") { DefaultValueFactory = _ => 1e-4 };
 var validationFractionOption = new Option<double>("--validation-fraction") { Description = "Fraction of the dataset held out for early-stopping evaluation", DefaultValueFactory = _ => 0.1 };
-var earlyStoppingPatienceOption = new Option<int>("--early-stopping-patience") { Description = "Epochs without validation-loss improvement before stopping", DefaultValueFactory = _ => 3 };
+var earlyStoppingPatienceOption = new Option<int>("--early-stopping-patience") { Description = "Epoch evaluations without an improvement in held-out mean per-tag AP (1 - mAP is what is tracked) before stopping", DefaultValueFactory = _ => 3 };
 var localizationWeightOption = new Option<double>("--localization-weight")
 {
     Description = "Weight of the per-location (MIL/log-sum-exp) auxiliary loss that directly rewards sharp spatial responses instead of leaving localization as a side effect of pooling. 0 disables it.",
@@ -444,6 +444,33 @@ var separateGlimpseTowerOption = new Option<bool>("--separate-glimpse-tower")
     Description = "With --classification-glimpses: embed glimpses with a separate copy of the image tower (made from the current weights the first time, its own optimizer, saved as glimpse_tower.dat and used by evaluate) instead of the tower the whole image goes through."
 };
 trainCommand.Options.Add(separateGlimpseTowerOption);
+var fineLocalizationOption = new Option<bool>("--fine-localization")
+{
+    Description = "Add a stride-2 level under the localization map (a small branch from the pixels and the stem's features, its output added to the 2x-upsampled map; starts at zero, so the model scores as before). Saved as fine_localization.dat with its own optimizer and kept on resume; ONNX export doesn't support it yet."
+};
+trainCommand.Options.Add(fineLocalizationOption);
+var trainInputSizeOption = new Option<int?>("--train-input-size")
+{
+    Description = "With --cache-dir: train at this input size instead of the cache's (e.g. 1024 to fine-tune at a higher resolution). Cached images are rescaled (Mitchell cubic to enlarge); rows in --hires-store come from it."
+};
+trainCommand.Options.Add(trainInputSizeOption);
+var hiResStoreOption = new Option<string?>("--hires-store")
+{
+    Description = "Hi-res side stores, comma-separated (HiResImageStore: JPEGs of some cache rows at a larger long side, e.g. one at 1024 and one at 2048). Their rows are read from them instead of the cache, fitted to the input size: from the smallest store that reaches it, else the largest. Rows a pull appends while training runs are picked up every few minutes."
+};
+trainCommand.Options.Add(hiResStoreOption);
+var trainScalesOption = new Option<string?>("--train-scales")
+{
+    Description = "Mixed-scale training: comma-separated size:batch:share[:stored], e.g. 512:10:0.3,1024:4:0.5:0.25,2048:1:0.2:1. Each micro-batch is drawn at one size with its own batch size; 'stored' is the share of its images drawn from rows the hi-res stores hold at that size or larger. Each image counts the same in the loss whatever its batch size (relative to --batch-size, which still sets the epoch length). The checkpoint keeps --train-input-size (or the cache's) as its input size."
+};
+trainCommand.Options.Add(trainScalesOption);
+var focusTagsOption = new Option<string[]>("--focus-tags")
+{
+    Description = "With --focus-share: draw the focus anchors from these tags (comma-separated) instead of the ones the latest epoch evaluation picks.",
+    AllowMultipleArgumentsPerToken = true,
+    CustomParser = r => r.Tokens.SelectMany(t => t.Value.Split(',', StringSplitOptions.RemoveEmptyEntries)).ToArray()
+};
+trainCommand.Options.Add(focusTagsOption);
 var glimpseTowerLearningRateScaleOption = new Option<float>("--glimpse-tower-lr-scale")
 {
     Description = "With --separate-glimpse-tower: its learning rate as a multiple of the run's (it has to leave the 512px solution; the main tower doesn't).",
@@ -512,6 +539,31 @@ var twinPasteOption = new Option<int>("--twin-paste")
     DefaultValueFactory = _ => 0
 };
 trainCommand.Options.Add(twinPasteOption);
+var selfMapWeightOption = new Option<float>("--self-map-weight")
+{
+    Description = "Window labels from the model's own localization map (SelfMapWindows; review/open-vocab-research PLAN #1): per labelled localizable positive, the 64/128px windows at the tag's map peak are a \"yes\" and two of its bottom-40% 64px windows a \"no\", each window embedded as a 64px glimpse by the image tower and trained by a per-window BCE at this weight. Image-level losses unchanged. 0 = off.",
+    DefaultValueFactory = _ => 0f
+};
+trainCommand.Options.Add(selfMapWeightOption);
+var selfMapDetachScalingOption = new Option<bool>("--self-map-detach-scaling") { Description = "The self-map window term sends no gradient into the shared logit scale and bias." };
+trainCommand.Options.Add(selfMapDetachScalingOption);
+var selfMapNegativesOption = new Option<string>("--self-map-negatives")
+{
+    Description = "With --self-map-weight, also windows on images WITHOUT the tag (SAM 3's supervised-negatives row): per image, up to 4 localizable tags it is a certain negative for, the 64/128px windows at that tag's map peak (where the model would look for it) are a \"no\". certain = hard negatives, exclusive groups and excludes rules; all = those plus context negatives (--context-negative-weight); none = off.",
+    DefaultValueFactory = _ => "none"
+};
+selfMapNegativesOption.AcceptOnlyFromAmong("none", "certain", "all");
+trainCommand.Options.Add(selfMapNegativesOption);
+var selfMapNegativeWeightOption = new Option<float>("--self-map-negative-weight") { Description = "With --self-map-negatives: the negative windows' term weight.", DefaultValueFactory = _ => 1f };
+trainCommand.Options.Add(selfMapNegativeWeightOption);
+var mosaicLargeGridOption = new Option<int>("--mosaic-large-grid")
+{
+    Description = "On every --mosaic-large-grid-every'th step, one canvas of N x N batch images shrunk 4x instead of the 2x2 mosaics (review/open-vocab-research PLAN #3, after OWLv2's mixed grids): smaller objects, more tiles to say \"not here\". Needs --batch-size >= N². 0 = off.",
+    DefaultValueFactory = _ => 0
+};
+trainCommand.Options.Add(mosaicLargeGridOption);
+var mosaicLargeGridEveryOption = new Option<int>("--mosaic-large-grid-every") { Description = "With --mosaic-large-grid: the large canvas on every Nth step, the 2x2 mosaics on the rest.", DefaultValueFactory = _ => 2 };
+trainCommand.Options.Add(mosaicLargeGridEveryOption);
 var negativeLossOption = new Option<string>("--negative-loss")
 {
     Description = "Deliberate targets: the unverified negatives' loss: asl (the asymmetric loss, --negative-gamma / --negative-clip) or hill ((1.5 - p) p^2, robust to missing labels).",
@@ -648,6 +700,7 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         GlimpseFramedPositivePooling: parseResult.GetValue(glimpseFramedPositivePoolingOption),
         SeparateGlimpseTower: parseResult.GetValue(separateGlimpseTowerOption),
         GlimpseTowerLearningRateScale: parseResult.GetValue(glimpseTowerLearningRateScaleOption),
+        FineLocalization: parseResult.GetValue(fineLocalizationOption),
         ContextPairsPerBatch: parseResult.GetValue(contextPairsPerBatchOption),
         ContextPairMargin: parseResult.GetValue(contextPairMarginOption),
         ContextPairWeight: parseResult.GetValue(contextPairWeightOption),
@@ -660,6 +713,12 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         TwinWeight: parseResult.GetValue(twinWeightOption),
         TwinDetachScaling: parseResult.GetValue(twinDetachScalingOption),
         TwinPaste: parseResult.GetValue(twinPasteOption),
+        SelfMapWeight: parseResult.GetValue(selfMapWeightOption),
+        SelfMapDetachScaling: parseResult.GetValue(selfMapDetachScalingOption),
+        SelfMapNegatives: parseResult.GetRequiredValue(selfMapNegativesOption),
+        SelfMapNegativeWeight: parseResult.GetValue(selfMapNegativeWeightOption),
+        MosaicLargeGrid: parseResult.GetValue(mosaicLargeGridOption),
+        MosaicLargeGridEvery: parseResult.GetValue(mosaicLargeGridEveryOption),
         GlimpsePoolMinZoom: parseResult.GetValue(glimpsePoolMinZoomOption),
         HillNegatives: parseResult.GetValue(negativeLossOption) == "hill",
         GlimpseProposalWeight: parseResult.GetValue(glimpseProposalWeightOption),
@@ -681,7 +740,11 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         SnapshotEvaluationSteps: parseResult.GetRequiredValue(snapshotEvaluationStepsOption),
         ChartReferences: parseResult.GetValue(chartReferenceOption) ?? [],
         TextDashboard: parseResult.GetValue(textDashboardOption),
-        ChartComparisons: parseResult.GetValue(chartCompareOption) ?? []),
+        ChartComparisons: parseResult.GetValue(chartCompareOption) ?? [],
+        TrainInputSize: parseResult.GetValue(trainInputSizeOption),
+        HiResStore: parseResult.GetValue(hiResStoreOption),
+        FocusTagNames: parseResult.GetValue(focusTagsOption),
+        TrainScales: parseResult.GetValue(trainScalesOption)),
     parseResult.GetRequiredValue(ioParallelismOption),
     parseResult.GetRequiredValue(prefetchBatchesOption),
     new TowerOptions(
@@ -761,7 +824,7 @@ var evaluateMaxImagesOption = new Option<int>("--max-images")
     Description = "Evaluate at most this many held-out images (a fixed prefix of the validation split). 0 = the whole split.",
     DefaultValueFactory = _ => 20000
 };
-var evaluateBatchSizeOption = new Option<int>("--batch-size") { Description = "Held-out images per forward pass; 32 runs out of memory on a 16 GB GPU with the ConvNeXt-T tower.", DefaultValueFactory = _ => 10 };
+var evaluateBatchSizeOption = new Option<int>("--batch-size") { Description = "Held-out images per forward pass. 32 fits a 16 GB GPU (A4000) for run 4's tower since the forwards have their own dispose scopes; before that, 32 ran out of memory.", DefaultValueFactory = _ => 10 };
 var evaluateOutDirOption = new Option<string?>("--out-dir") { Description = "Where to write tag_thresholds.json and evaluation_report.json. Defaults to --checkpoint-dir, where export-onnx picks the thresholds up." };
 var embeddingsCacheOption = new Option<string?>("--embeddings-cache")
 {
@@ -845,6 +908,16 @@ var twinCheckOption = new Option<string?>("--twin-check")
     Description = "Only check the matched twins' \"no\" windows (--twin-every) against the gold boxes (--gold, --gold-small): how often they hold the object. Writes each pair to this JSONL file."
 };
 evaluateCommand.Options.Add(twinCheckOption);
+var mapWindowCheckOption = new Option<string?>("--map-window-check")
+{
+    Description = "Only check window labels read off this checkpoint's own localization map against the gold boxes (--gold, --gold-small): the peak window's and the top 15%'s precision, the bottom 40%'s contamination, the map's window AUC. Writes each pair to this JSONL file."
+};
+evaluateCommand.Options.Add(mapWindowCheckOption);
+var peakWindowScoresOption = new Option<string?>("--peak-window-scores")
+{
+    Description = "Only write, for every held-out image and each --dump-scores tag, the whole-image score and the glimpse scores of the 64px and 128px windows at the tag's map peak (as --self-map-weight picks them), with the label and the --context-check label, to this JSONL file."
+};
+evaluateCommand.Options.Add(peakWindowScoresOption);
 var noCropTeacherOption = new Option<bool>("--no-crop-teacher")
 {
     Description = "Leave the crop-teacher check out of the gold checks. It only tells crop consistency whether to trust the classifier, and on a glimpse checkpoint it is ~40% of the gold checks' time."
@@ -861,6 +934,17 @@ var localityPriorImagesOption = new Option<int>("--locality-prior-images")
     DefaultValueFactory = _ => 20000
 };
 evaluateCommand.Options.Add(localityPriorImagesOption);
+var goldImagesOption = new Option<string?>("--gold-images")
+{
+    Description = "Read the gold sets' images from this directory (<cache index>.png, e.g. upscaled copies) instead of the cache, letterboxed at --gold-input-size. The gold.json boxes must be in those images' pixels."
+};
+evaluateCommand.Options.Add(goldImagesOption);
+var goldInputSizeOption = new Option<int?>("--gold-input-size") { Description = "With --gold-images: the input size the gold images are scored at (default: the cache's)." };
+evaluateCommand.Options.Add(goldInputSizeOption);
+var evaluateInputSizeOption = new Option<int?>("--input-size") { Description = "Score the held-out images (and the gold sets, with --gold-images) at this input size instead of the cache's: cached images rescaled, --hires-store rows from it (as train --train-input-size)." };
+evaluateCommand.Options.Add(evaluateInputSizeOption);
+var evaluateHiResOption = new Option<string?>("--hires-store") { Description = "A hi-res side store whose rows are read instead of the cache's (as train --hires-store)." };
+evaluateCommand.Options.Add(evaluateHiResOption);
 evaluateCommand.SetAction(parseResult => EvaluateCommandHandler.Run(
     parseResult.GetRequiredValue(checkpointDirOption),
     parseResult.GetRequiredValue(evaluateCacheDirOption),
@@ -886,7 +970,13 @@ evaluateCommand.SetAction(parseResult => EvaluateCommandHandler.Run(
     parseResult.GetValue(localityPriorOutOption),
     parseResult.GetRequiredValue(localityPriorImagesOption),
     parseResult.GetValue(glimpseObjectOnlyOption),
-    parseResult.GetValue(twinCheckOption)));
+    parseResult.GetValue(twinCheckOption),
+    parseResult.GetValue(mapWindowCheckOption),
+    parseResult.GetValue(peakWindowScoresOption),
+    parseResult.GetValue(goldImagesOption),
+    parseResult.GetValue(goldInputSizeOption),
+    parseResult.GetValue(evaluateInputSizeOption),
+    parseResult.GetValue(evaluateHiResOption)));
 
 var chartsEpochsOption = new Option<int>("--epochs") { Description = "The run's --epochs, for the step axis and epoch markers", DefaultValueFactory = _ => 6 };
 var chartsReferenceOption = new Option<string[]>("--reference")

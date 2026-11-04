@@ -23,8 +23,11 @@ public class LocalizationPairSelectorTests
 
         using var pairs = LocalizationPairSelector.Select(targets, logits, localizable, minedNegatives: 2);
 
-        Assert.Equal(new long[] { 0, 1, 3, 4 }, pairs.TagRows.data<long>().ToArray());
-        Assert.Equal(new float[] { 0, 0, 1, 1 }, pairs.FocalMask.data<float>().ToArray());
+        // Rows are padded to LocalizationPairSelector.WidthMultiple with weight-0 pairs.
+        Assert.Equal(new long[] { 1, LocalizationPairSelector.WidthMultiple }, pairs.TagRows.shape);
+        var real = pairs.Weights.data<float>().ToArray().Select((w, k) => (w, k)).Where(x => x.w > 0).Select(x => x.k).ToArray();
+        Assert.Equal(new long[] { 0, 1, 3, 4 }, real.Select(k => pairs.TagRows.data<long>()[k]).ToArray());
+        Assert.Equal(new float[] { 0, 0, 1, 1 }, real.Select(k => pairs.FocalMask.data<float>()[k]).ToArray());
         Assert.Equal(1f, pairs.PositiveWeightSum);
     }
 
@@ -34,8 +37,12 @@ public class LocalizationPairSelectorTests
         using var targets = Targets([1, 1, -1, 1, -1, -1], [1, 1, 1, 1, 1, 1], [0, 0, 0, 0, 1, 1], 2, 3);
         using var pairs = LocalizationPairSelector.Select(targets, new float[6], [true, true, true], minedNegatives: 0);
 
-        Assert.Equal(new long[] { 2, 3 }, pairs.TagRows.shape);
-        Assert.Equal(new float[] { 1, 1, 1, 1, 0, 0 }, pairs.Weights.data<float>().ToArray());
+        var width = LocalizationPairSelector.WidthMultiple;
+        Assert.Equal(new long[] { 2, width }, pairs.TagRows.shape);
+        var weights = pairs.Weights.data<float>().ToArray();
+        Assert.Equal(new float[] { 1, 1, 1 }, weights.Take(3));
+        Assert.Equal(new float[] { 1, 0, 0 }, weights.Skip(width).Take(3));
+        Assert.Equal(4f, weights.Sum()); // every padding slot at weight 0
     }
 
     [Fact]
@@ -125,5 +132,21 @@ public class LocalizationPairSelectorTests
             .Select(i => Enumerable.Range(i * width, width).Where(k => weights[k] > 0)
                 .ToDictionary(k => rows[k], k => (labels[k], MathF.Round(weights[k], 4), focal[k])))
             .ToList();
+    }
+
+    [Fact]
+    public void CapLabelled_KeepsEveryPositive_AndScalesTheSampledNegativesToTheirTotal()
+    {
+        // 10 positives and 290 certain negatives in a 300-tag image; capped at 50.
+        var labels = Enumerable.Range(0, 300).Select(t => t < 10 ? 1f : -1f).ToArray();
+        var pairs = Enumerable.Range(0, 300).ToList();
+        var (kept, scale) = LocalizationPairSelector.CapLabelled(pairs, labels, 0, 50);
+        Assert.Equal(50, kept.Count);
+        Assert.All(Enumerable.Range(0, 10), t => Assert.Contains(t, kept));
+        Assert.Equal(290f, kept.Count(t => labels[t] < 0) * scale, 3); // the kept negatives weigh as much as all of them did
+
+        var (small, one) = LocalizationPairSelector.CapLabelled(pairs.Take(40).ToList(), labels, 0, 50);
+        Assert.Equal(40, small.Count);
+        Assert.Equal(1f, one);
     }
 }

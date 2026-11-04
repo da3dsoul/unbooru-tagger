@@ -44,6 +44,24 @@ public class MosaicTests
     }
 
     [Fact]
+    public void LargeGrid_PutsNineQuarterSizeImagesOnACanvas()
+    {
+        const int size = 8;
+        var pixels = new float[10 * 3 * size * size];
+        for (var i = 0; i < 10; i++)
+            Array.Fill(pixels, i + 1f, i * 3 * size * size, 3 * size * size);
+        int[] order = [9, 8, 7, 6, 5, 4, 3, 2, 1];
+        using var canvas = Mosaic.Compose(tensor(pixels, [10, 3, size, size]), order, size, tileSize: size / 4, grid: 3);
+        Assert.Equal([1L, 3, 6, 6], canvas.shape);
+        var values = canvas.data<float>().ToArray();
+        for (var k = 0; k < 9; k++)
+            Assert.Equal(order[k] + 1f, values[2 * 36 + (k / 3 * 2 + 1) * 6 + k % 3 * 2]); // tile k, row-major, channel 2
+        Assert.Equal(new LetterboxBox(256, 128 + 16, 128, 96), Mosaic.TileBox(new LetterboxBox(0, 64, 512, 384), 5, 512, tileSize: 128, grid: 3));
+        var tiles = Mosaic.PickTiles(10, 1, new Random(0), grid: 3);
+        Assert.Equal(9, tiles.Distinct().Count());
+    }
+
+    [Fact]
     public void PickTiles_UsesDistinctImages_AndOnlyWholeMosaics()
     {
         var tiles = Mosaic.PickTiles(10, 3, new Random(0));

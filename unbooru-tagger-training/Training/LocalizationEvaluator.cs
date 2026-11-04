@@ -31,7 +31,11 @@ public sealed record GoldImage(int CacheIndex, LetterboxBox Content, IReadOnlyLi
 /// <param name="InstancePrecision">Extracted boxes that match a certain box (IoU ≥ 0.3), over extracted boxes not excused by a group or ignore region.</param>
 /// <param name="InstanceRecall">Certain boxes matched plus group boxes touched, over certain plus group boxes.</param>
 /// <param name="MeanCountError">Mean |extracted − certain| box count, over pairs with only certain boxes.</param>
-public sealed record GoldResult(string Name, int Pairs, int GoldInstances, double PointingAccuracy, double EnergyInBox, double InstancePrecision, double InstanceRecall, double MeanCountError);
+/// <param name="TolerantPointing">Pointing with the pointing game's tolerance (Zhang et al. 2016, 15px): the peak within
+/// <see cref="LocalizationEvaluator.PointingTolerance"/> canvas pixels of a certain or group box (4 map cells at stride 4), so a peak
+/// one cell off a small box isn't a miss. The gap to <paramref name="PointingAccuracy"/> is near-misses.</param>
+public sealed record GoldResult(string Name, int Pairs, int GoldInstances, double PointingAccuracy, double EnergyInBox, double InstancePrecision, double InstanceRecall, double MeanCountError,
+    double TolerantPointing = double.NaN);
 
 /// <param name="DeletionGap">Mean drop in a tag's whole-image confidence when its top-heatmap cells are blanked, minus the drop from blanking the same number of random cells. Larger = the heatmap points at what the prediction actually depends on.</param>
 /// <param name="DeletionWinRate">Fraction of pairs where blanking the heatmap's top cells hurt more than blanking random cells (0.5 = chance).</param>
@@ -114,6 +118,17 @@ public sealed record OcclusionResult(
     string Name, int Pairs, double StillYesRate, double ObjectDrop, double ControlDrop, double WinRate,
     int ScoredPairs = 0, double ObjectEffect = double.NaN, double ObjectEffectMedian = double.NaN);
 
+/// <summary>
+/// One gold pair's pointing (<c>evaluate --dump-occlusion</c>, pointing_pairs.jsonl): where the tag's map peaks (content pixels), its
+/// distance to the nearest certain/group box (0 inside), and how high the map gets inside the boxes: the best in-box cell's rank among
+/// the content's cells (1 = it is the peak; near 1 = the map responds to the object but another spot wins; -1 = no cell centre in a box), and
+/// <paramref name="PeaksAbove"/>: how many separate peaks (local maxima of a 9x9-cell window, outside the boxes) are higher than that
+/// best in-box cell (0 = the object holds the map's highest peak; 1 = one other spot wins); <paramref name="TopPeaks"/>: the map's 5
+/// highest such local maxima anywhere, [x, y] in content pixels, highest first.
+/// </summary>
+public sealed record PointingPair(int CacheIndex, string Tag, string Stratum, string Size, float PeakX, float PeakY, double Distance, bool? Hit, bool? NearHit,
+    double BoxBestRank, int[][] Boxes, int PeaksAbove = -1, int[][]? TopPeaks = null);
+
 /// <summary>One gold pair of the (pooled) occlusion check: the confidence on the full image, with the object blanked, and with the control blanked.</summary>
 public sealed record OcclusionPair(int CacheIndex, string Tag, string Stratum, string Size, float Full, float Occluded, float Control);
 
@@ -178,6 +193,9 @@ public sealed class LocalizationEvaluator(
 
     /// <summary>With a list, every pair of the pooled occlusion check is added to it (<c>evaluate --dump-occlusion</c>).</summary>
     public List<OcclusionPair>? OcclusionPairs { get; init; }
+
+    /// <summary>With a list, every scored gold pair's pointing is added to it (<c>evaluate --dump-occlusion</c>).</summary>
+    public List<PointingPair>? PointingPairs { get; init; }
 
     /// <summary>When set, the glimpse funnel adds each gold pair's windows and logits here (<c>evaluate --dump-occlusion</c>).</summary>
     public List<GlimpsePair>? GlimpsePairs { get; init; }
@@ -343,7 +361,7 @@ public sealed class LocalizationEvaluator(
     /// <summary>Running totals for one tag or stratum.</summary>
     private sealed class GoldTally
     {
-        public int Pairs, GoldInstances, PointingCounted, PointingHits, ScoredExtracted, MatchedExtracted, RecallItems, RecalledItems, CountPairs;
+        public int Pairs, GoldInstances, PointingCounted, PointingHits, TolerantCounted, TolerantHits, ScoredExtracted, MatchedExtracted, RecallItems, RecalledItems, CountPairs;
         public double Energy, CountError;
 
         public void Add(PairScore score)
@@ -355,6 +373,12 @@ public sealed class LocalizationEvaluator(
                 PointingCounted++;
                 if (hit)
                     PointingHits++;
+            }
+            if (score.NearHit is bool near)
+            {
+                TolerantCounted++;
+                if (near)
+                    TolerantHits++;
             }
             Energy += score.Energy;
             ScoredExtracted += score.ScoredExtracted;
@@ -374,11 +398,16 @@ public sealed class LocalizationEvaluator(
             Pairs > 0 ? Energy / Pairs : 0,
             ScoredExtracted > 0 ? (double)MatchedExtracted / ScoredExtracted : 0,
             RecallItems > 0 ? (double)RecalledItems / RecallItems : 0,
-            CountPairs > 0 ? CountError / CountPairs : 0);
+            CountPairs > 0 ? CountError / CountPairs : 0,
+            TolerantCounted > 0 ? (double)TolerantHits / TolerantCounted : double.NaN);
     }
 
-    /// <summary>One (image, tag) pair's gold scoring. <see cref="PeakHit"/> is null when the peak fell in an ignore region; <see cref="CountError"/> is null when the pair has group or ignore boxes.</summary>
-    public readonly record struct PairScore(bool? PeakHit, double Energy, int ScoredExtracted, int MatchedExtracted, int RecallItems, int RecalledItems, int? CountError);
+    /// <summary>The tolerant pointing's reach (<see cref="GoldResult.TolerantPointing"/>), in canvas pixels.</summary>
+    public const int PointingTolerance = 16;
+
+    /// <summary>One (image, tag) pair's gold scoring. <see cref="PeakHit"/> is null when the peak fell in an ignore region; <see cref="CountError"/> is null when the pair has group or ignore boxes.
+    /// <see cref="NearHit"/> is the same with <see cref="PointingTolerance"/>.</summary>
+    public readonly record struct PairScore(bool? PeakHit, double Energy, int ScoredExtracted, int MatchedExtracted, int RecallItems, int RecalledItems, int? CountError, bool? NearHit = null);
 
     /// <summary>
     /// Scores one (image, tag) pair against its gold boxes with group/ignore semantics:
@@ -393,6 +422,9 @@ public sealed class LocalizationEvaluator(
         var ignore = instances.Where(x => x.Kind == GoldKind.Ignore).Select(x => x.Box).ToList();
 
         bool? peakHit = certain.Concat(groups).Any(b => Contains(b, peak.X, peak.Y)) ? true
+            : ignore.Any(b => Contains(b, peak.X, peak.Y)) ? null
+            : false;
+        bool? nearHit = certain.Concat(groups).Any(b => Distance(b, peak.X, peak.Y) <= PointingTolerance) ? true
             : ignore.Any(b => Contains(b, peak.X, peak.Y)) ? null
             : false;
 
@@ -421,10 +453,18 @@ public sealed class LocalizationEvaluator(
 
         var recalled = certain.Count(g => extracted.Any(e => IoU(e, g) >= 0.3)) + groupsFound.Count(f => f);
         int? countError = groups.Count == 0 && ignore.Count == 0 ? Math.Abs(extracted.Count - certain.Count) : null;
-        return new PairScore(peakHit, energy, scored, matched, certain.Count + groups.Count, recalled, countError);
+        return new PairScore(peakHit, energy, scored, matched, certain.Count + groups.Count, recalled, countError, nearHit);
     }
 
     private static bool Contains(int[] b, float x, float y) => x >= b[0] && x < b[0] + b[2] && y >= b[1] && y < b[1] + b[3];
+
+    /// <summary>A point's distance to a box (0 inside it).</summary>
+    private static double Distance(int[] b, float x, float y)
+    {
+        var dx = Math.Max(0, Math.Max(b[0] - x, x - (b[0] + b[2])));
+        var dy = Math.Max(0, Math.Max(b[1] - y, y - (b[1] + b[3])));
+        return Math.Sqrt(dx * dx + dy * dy);
+    }
 
     private static double FractionInside(int[] inner, int[] outer)
     {
@@ -440,7 +480,7 @@ public sealed class LocalizationEvaluator(
     {
         var perTag = new Dictionary<string, GoldTally>();
         var perStratum = new Dictionary<string, GoldTally> { ["all"] = new() };
-        foreach (var chunk in gold.Chunk(16))
+        foreach (var chunk in gold.Chunk(ImagesPerPass))
         {
             var tagsPerImage = chunk.Select(g => g.Targets
                 .Where(t => !g.NotVisible.Contains(t) && rowOf.ContainsKey(t)
@@ -458,13 +498,21 @@ public sealed class LocalizationEvaluator(
                     var map = heatmaps[i][k];
                     var extracted = DetectBoxes(map, boxes[i])
                         .Select(b => new[] { b.X, b.Y, b.Width, b.Height }).ToList();
+                    var peak = PeakCellCenterInContent(map, boxes[i]);
                     var score = ScorePair(
-                        instances, PeakCellCenterInContent(map, boxes[i]),
+                        instances, peak,
                         EnergyInBoxes(map, boxes[i],
                             instances.Where(x => x.Kind != GoldKind.Ignore).Select(x => x.Box).ToList(),
                             instances.Where(x => x.Kind == GoldKind.Ignore).Select(x => x.Box).ToList()),
                         extracted);
 
+                    if (PointingPairs is not null)
+                    {
+                        var boxed = instances.Where(x => x.Kind != GoldKind.Ignore).Select(x => x.Box).ToArray();
+                        PointingPairs.Add(new PointingPair(image.CacheIndex, tag, image.Stratum, SizeBucket(tag, instances), peak.X, peak.Y,
+                            boxed.Min(b => Distance(b, peak.X, peak.Y)), score.PeakHit, score.NearHit, BoxBestRank(map, boxes[i], boxed), boxed,
+                            PeaksAbove(map, boxes[i], boxed), TopPeaks(map, boxes[i], 5)));
+                    }
                     (perTag.TryGetValue(tag, out var tagTally) ? tagTally : perTag[tag] = new()).Add(score);
                     perStratum["all"].Add(score);
                     (perStratum.TryGetValue(image.Stratum, out var stratumTally) ? stratumTally : perStratum[image.Stratum] = new()).Add(score);
@@ -524,7 +572,7 @@ public sealed class LocalizationEvaluator(
         var grid = inputSize / cell;
         var perTag = new Dictionary<string, TeacherTally>();
         var perStratum = new Dictionary<string, TeacherTally> { ["all"] = new() };
-        foreach (var chunk in gold.Chunk(8))
+        foreach (var chunk in gold.Chunk(ImagesPerCheck))
         {
             using var scope = NewDisposeScope();
             var (pixels, boxes) = Load(chunk.Select(g => g.CacheIndex).ToArray());
@@ -658,7 +706,7 @@ public sealed class LocalizationEvaluator(
             if (perTag[t])
                 columnOf[t] = columnOf.Count;
         var tallies = new Dictionary<string, FunnelTally> { ["all"] = new() };
-        foreach (var chunk in gold.Chunk(16))
+        foreach (var chunk in gold.Chunk(ImagesPerPass))
         {
             var tags = chunk.Select(g => g.Targets
                 .Where(t => !g.NotVisible.Contains(t) && rowOf.TryGetValue(t, out var row) && perTag[row]
@@ -840,7 +888,7 @@ public sealed class LocalizationEvaluator(
         var perTag = new Dictionary<string, OcclusionTally>();
         var perStratum = new Dictionary<string, OcclusionTally> { ["all"] = new() };
         var floats = 3 * inputSize * inputSize;
-        foreach (var chunk in gold.Chunk(8))
+        foreach (var chunk in gold.Chunk(ImagesPerCheck))
         {
             using var scope = NewDisposeScope();
             var (pixels, boxes) = Load(chunk.Select(g => g.CacheIndex).ToArray());
@@ -988,7 +1036,7 @@ public sealed class LocalizationEvaluator(
     {
         double gapSum = 0, cropSum = 0;
         int pairs = 0, wins = 0, cropPairs = 0;
-        foreach (var chunk in images.Chunk(16))
+        foreach (var chunk in images.Chunk(ImagesPerPass))
         {
             using var scope = NewDisposeScope();
             var (pixels, boxes) = Load(chunk);
@@ -1049,7 +1097,7 @@ public sealed class LocalizationEvaluator(
     {
         double correlationSum = 0;
         int count = 0, distinct = 0;
-        foreach (var chunk in images.Chunk(16))
+        foreach (var chunk in images.Chunk(ImagesPerPass))
         {
             var tags = chunk.Select(i => imageTagRows[i].Where(characterRows.Contains).Take(2).ToArray()).ToArray();
             var heatmaps = Heatmaps(chunk, tags, out var boxes);
@@ -1081,7 +1129,7 @@ public sealed class LocalizationEvaluator(
             .OrderBy(_ => random.Next()).Take(sampleImages).ToArray();
 
         int pairs = 0, single = 0;
-        foreach (var chunk in candidates.Chunk(16))
+        foreach (var chunk in candidates.Chunk(ImagesPerPass))
         {
             var tags = chunk.Select(i => imageTagRows[i].Where(perPerson.Contains).ToArray()).ToArray();
             var heatmaps = Heatmaps(chunk, tags, out var boxes);
@@ -1099,6 +1147,15 @@ public sealed class LocalizationEvaluator(
     }
 
     // ---- model plumbing ----
+
+    /// <summary>Images per pass in the gold checks: 16 at 512px, fewer at a larger input (<c>evaluate --gold-input-size</c>).</summary>
+    /// <summary>
+    /// Images loaded at once by the crop-teacher and occlusion checks, whose whole-image scores run them in one pass: 8, as
+    /// before, up to 512px, fewer above (8 at 2048px ran the A4000 out of memory).
+    /// </summary>
+    private int ImagesPerCheck => inputSize <= 512 ? 8 : Math.Max(1, 8 * 512 * 512 / inputSize / inputSize);
+
+    private int ImagesPerPass => inputSize <= 512 ? 16 : Math.Max(1, 16 * 512 * 512 / inputSize / inputSize / 4);
 
     private (Tensor Pixels, LetterboxBox[] Boxes) Load(IReadOnlyList<int> indices)
     {
@@ -1121,7 +1178,7 @@ public sealed class LocalizationEvaluator(
     public IReadOnlyList<bool>? ClassificationPooledTags { get; init; }
 
     /// <summary>Images per forward pass in the checks that only need whole-image scores (<see cref="Score"/>).</summary>
-    private const int ScoreBatch = 32;
+    private int ScoreBatch => inputSize <= 512 ? 32 : Math.Max(2, 32 * 512 * 512 / inputSize / inputSize);
 
     /// <summary>
     /// A whole-image scorer alone: the pooled embedding without building the full map (<see cref="ImageTower.ForwardPooled"/>),
@@ -1136,7 +1193,8 @@ public sealed class LocalizationEvaluator(
         using var _ = no_grad();
         using var scope = NewDisposeScope();
         var mask = ContentMask(pixels, content);
-        var pooled = imageTower.ForwardPooled(pixels, mask).Pooled.cpu().data<float>().ToArray();
+        // With a stride-2 localization level, skip its map (the 32-image batch's would be ~6 GB); without, as before.
+        var pooled = (imageTower.Fine is not null ? imageTower.ForwardPooledOnly(pixels, mask) : imageTower.ForwardPooled(pixels, mask).Pooled).cpu().data<float>().ToArray();
         return (image, tag) => Sigmoid(scaling.Apply(Dot(pooled.AsSpan(image * dim, dim), tagEmbeddings.AsSpan(tag * dim, dim))));
     }
 
@@ -1158,12 +1216,22 @@ public sealed class LocalizationEvaluator(
         using var _ = no_grad();
         if (imageTower.ClassificationGlimpses && imageTower.ClassificationPoolingTemperature > 0 && ClassificationPooledTags is not null)
             return GlimpseForward(pixels, content);
+        var temperature = imageTower.ClassificationPoolingTemperature;
+        if (imageTower.Fine is not null && (temperature <= 0 || ClassificationPooledTags is null))
+        {
+            // With a stride-2 localization level the full map would be upsampled to its resolution only to be pooled
+            // (2 GB for 16 images): pool it without building it. Only then, so other towers' numbers stay identical.
+            var (pooledTensor, fineLocalization) = imageTower.ForwardPooled(pixels, ContentMask(pixels, content));
+            float[] finePooled;
+            using (pooledTensor)
+                finePooled = pooledTensor.cpu().data<float>().ToArray();
+            return ((image, tag) => Sigmoid(scaling.Apply(Dot(finePooled.AsSpan(image * dim, dim), tagEmbeddings.AsSpan(tag * dim, dim)))), fineLocalization);
+        }
         // Whole-image scores pool the full map; heatmaps come from the localization map.
         var (spatial, localization) = imageTower.ForwardMaps(pixels);
         float[] pooled;
         using (NewDisposeScope())
             pooled = ImageTower.MaskedPool(spatial, ContentMask(pixels, content)).cpu().data<float>().ToArray();
-        var temperature = imageTower.ClassificationPoolingTemperature;
         if (temperature <= 0 || ClassificationPooledTags is not { } perTag)
             return ((image, tag) => Sigmoid(scaling.Apply(Dot(pooled.AsSpan(image * dim, dim), tagEmbeddings.AsSpan(tag * dim, dim)))), localization);
 
@@ -1384,6 +1452,100 @@ public sealed class LocalizationEvaluator(
     private List<BoundingBox> DetectBoxes(float[,] map, LetterboxBox content) =>
         TagScorer.DetectBoxes(map, TagScorer.DefaultBoxThreshold, TagScorer.DefaultBoxPercentile, content, inputSize, content.Width, content.Height,
             TagScorer.DefaultMinHeatmapRange, TagScorer.DefaultMinBoxFraction, TagScorer.DefaultMaxBoxesPerTag);
+
+    /// <summary>The best map cell inside <paramref name="boxes"/> (cell centres, content pixels), as the share of the content's cells at or below it.</summary>
+    private double BoxBestRank(float[,] map, LetterboxBox content, int[][] boxes)
+    {
+        var valid = ImagePreprocessing.ComputeSpatialValidity(content, inputSize, map.GetLength(0), map.GetLength(1));
+        var cellW = inputSize / (float)map.GetLength(1);
+        var cellH = inputSize / (float)map.GetLength(0);
+        var best = float.NegativeInfinity;
+        for (var y = 0; y < map.GetLength(0); y++)
+            for (var x = 0; x < map.GetLength(1); x++)
+                if (valid[y, x] && boxes.Any(b => Contains(b, (x + 0.5f) * cellW - content.X, (y + 0.5f) * cellH - content.Y)))
+                    best = Math.Max(best, map[y, x]);
+        if (float.IsNegativeInfinity(best))
+            return -1; // a box smaller than a cell, between cell centres (not NaN: JSON can't write it)
+        int below = 0, total = 0;
+        for (var y = 0; y < map.GetLength(0); y++)
+            for (var x = 0; x < map.GetLength(1); x++)
+                if (valid[y, x])
+                {
+                    total++;
+                    if (map[y, x] <= best)
+                        below++;
+                }
+        return (double)below / total;
+    }
+
+    /// <summary>The <paramref name="count"/> highest local maxima (9x9 cells) of the content, as [x, y] cell centres in content pixels.</summary>
+    private int[][] TopPeaks(float[,] map, LetterboxBox content, int count)
+    {
+        var valid = ImagePreprocessing.ComputeSpatialValidity(content, inputSize, map.GetLength(0), map.GetLength(1));
+        var (h, w) = (map.GetLength(0), map.GetLength(1));
+        var cellW = inputSize / (float)w;
+        var cellH = inputSize / (float)h;
+        var maxima = new List<(float Value, int Y, int X)>();
+        for (var y = 0; y < h; y++)
+            for (var x = 0; x < w; x++)
+            {
+                if (!valid[y, x])
+                    continue;
+                var isMax = true;
+                for (var dy = -4; dy <= 4 && isMax; dy++)
+                    for (var dx = -4; dx <= 4; dx++)
+                    {
+                        var (yy, xx) = (y + dy, x + dx);
+                        if ((dy != 0 || dx != 0) && yy >= 0 && yy < h && xx >= 0 && xx < w && valid[yy, xx] && map[yy, xx] > map[y, x])
+                        {
+                            isMax = false;
+                            break;
+                        }
+                    }
+                if (isMax)
+                    maxima.Add((map[y, x], y, x));
+            }
+        return maxima.OrderByDescending(m => m.Value).Take(count)
+            .Select(m => new[] { (int)((m.X + 0.5f) * cellW - content.X), (int)((m.Y + 0.5f) * cellH - content.Y) }).ToArray();
+    }
+
+    /// <summary>Local maxima (9x9 cells) outside <paramref name="boxes"/> higher than the best cell inside them; -1 when no cell centre is inside.</summary>
+    private int PeaksAbove(float[,] map, LetterboxBox content, int[][] boxes)
+    {
+        var valid = ImagePreprocessing.ComputeSpatialValidity(content, inputSize, map.GetLength(0), map.GetLength(1));
+        var (h, w) = (map.GetLength(0), map.GetLength(1));
+        var cellW = inputSize / (float)w;
+        var cellH = inputSize / (float)h;
+        bool Inside(int y, int x) => boxes.Any(b => Contains(b, (x + 0.5f) * cellW - content.X, (y + 0.5f) * cellH - content.Y));
+        var best = float.NegativeInfinity;
+        for (var y = 0; y < h; y++)
+            for (var x = 0; x < w; x++)
+                if (valid[y, x] && Inside(y, x))
+                    best = Math.Max(best, map[y, x]);
+        if (float.IsNegativeInfinity(best))
+            return -1;
+        var count = 0;
+        for (var y = 0; y < h; y++)
+            for (var x = 0; x < w; x++)
+            {
+                if (!valid[y, x] || map[y, x] <= best || Inside(y, x))
+                    continue;
+                var isMax = true;
+                for (var dy = -4; dy <= 4 && isMax; dy++)
+                    for (var dx = -4; dx <= 4; dx++)
+                    {
+                        var (yy, xx) = (y + dy, x + dx);
+                        if ((dy != 0 || dx != 0) && yy >= 0 && yy < h && xx >= 0 && xx < w && valid[yy, xx] && map[yy, xx] > map[y, x])
+                        {
+                            isMax = false;
+                            break;
+                        }
+                    }
+                if (isMax)
+                    count++;
+            }
+        return count;
+    }
 
     private (float X, float Y) PeakCellCenterInContent(float[,] map, LetterboxBox content)
     {

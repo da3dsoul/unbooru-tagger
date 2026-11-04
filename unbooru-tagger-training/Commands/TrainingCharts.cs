@@ -68,12 +68,38 @@ public static class TrainingCharts
     private static readonly SKColor MetricColor = new(0xf2, 0xb1, 0x4c);
     private static readonly SKColor ReferenceColor = new(0xb4, 0x8e, 0xe0);
 
-    private sealed record Metric(string Name, Func<EvaluationPoint, double> Value, bool LowerIsBetter, bool Percent);
+    /// <param name="Split">Draw these lines instead of <paramref name="Value"/>'s (which still gives the title's latest value and change),
+    /// each with an optional faint dashed companion (<c>Tolerant</c>); other runs and references aren't drawn in such a panel.</param>
+    private sealed record Metric(string Name, Func<EvaluationPoint, double> Value, bool LowerIsBetter, bool Percent, SplitLine[]? Split = null);
+
+    private sealed record SplitLine(string Label, Func<EvaluationPoint, double> Value, Func<EvaluationPoint, double>? Tolerant, SKColor Color);
+
+    // Gold pointing by object size: the overall rate is a mix of sizes (characters ~90%, small objects ~38%), so it hides where it moves.
+    private static readonly SplitLine[] PointingBySize =
+    [
+        .. EvaluationPoint.SizeRows.Zip(new SKColor[] { new(0x4f, 0xb3, 0xe8), new(0x4c, 0xc3, 0x7a), new(0xf2, 0xb1, 0x4c), new(0xf0, 0x5d, 0x5d) },
+            (size, color) => new SplitLine(size.Short, p => EvaluationPoint.Get(p.GoldPointingBySize, size.Short), p => EvaluationPoint.Get(p.GoldTolerantBySize, size.Short), color)),
+    ];
+
+    private static readonly SKColor[] SizeColors = [new(0x4f, 0xb3, 0xe8), new(0x4c, 0xc3, 0x7a), new(0xf2, 0xb1, 0x4c), new(0xf0, 0x5d, 0x5d)];
+
+    // The same at 1024px (HigherScalePoint), for mixed-scale training: the gold sets from their originals, and the SAM 3 set.
+    private static readonly SplitLine[] PointingBySize1024 =
+    [
+        .. EvaluationPoint.SizeRows.Zip(SizeColors,
+            (size, color) => new SplitLine(size.Short, p => EvaluationPoint.Get(p.At1024?.GoldBySize, size.Short), p => EvaluationPoint.Get(p.At1024?.GoldTolerantBySize, size.Short), color)),
+    ];
+
+    private static readonly SplitLine[] AutoPointingBySize1024 =
+    [
+        .. EvaluationPoint.SizeRows.Skip(1).Zip(SizeColors.Skip(1),
+            (size, color) => new SplitLine(size.Short, p => EvaluationPoint.Get(p.At1024?.AutoBySize, size.Short), p => EvaluationPoint.Get(p.At1024?.AutoTolerantBySize, size.Short), color)),
+    ];
 
     private static readonly Metric[] Metrics =
     [
         new("held-out mAP", p => p.MeanAveragePrecision, false, false),
-        new("gold pointing", p => p.GoldPointing, false, true),
+        new("gold pointing by size", p => p.GoldPointing, false, true, PointingBySize),
         new("gold-small pointing", p => p.SmallGoldPointing, false, true),
         new("exclusive-tag violations", p => p.ExclusiveViolations, true, true),
         // Object effect, not the still-called rate: that one counts only pairs found at p >= 0.5 and flips on small
@@ -87,6 +113,10 @@ public static class TrainingCharts
         // recalibrated each evaluation, so a few pairs flipping moved the rate by points.
         new("absent objects (labelled)", p => p.LabelledAbsentLogit, true, false),
         new("untagged objects (labelled)", p => p.LabelledPresentLogit, false, false),
+        new("gold pointing by size @1024", p => p.At1024?.GoldPointing ?? double.NaN, false, true, PointingBySize1024),
+        new("gold-auto pointing by size @1024", p => p.At1024?.AutoPointing ?? double.NaN, false, true, AutoPointingBySize1024),
+        new("gold-small pointing @1024", p => p.At1024?.SmallGoldPointing ?? double.NaN, false, true),
+        new("object effect @1024 (log-odds)", p => p.At1024?.ObjectEffect ?? double.NaN, false, false),
     ];
 
     /// <summary>Panels per row; the loss takes the first two.</summary>
@@ -189,6 +219,11 @@ public static class TrainingCharts
             return;
         }
 
+        if (metric.Split is { } split)
+        {
+            DrawSplit(canvas, series, metric, split, plot, xMin, xMax, scale, font);
+            return;
+        }
         var references = series.References.Select(r => (r.Label, Value: metric.Value(r.Point))).Where(r => !double.IsNaN(r.Value)).ToList();
         // Other runs only up to this run's latest evaluation, not the current step: this run's evaluations land a while
         // after their step (they run in another process), so otherwise the other run's newer points come in alone.
@@ -227,6 +262,51 @@ public static class TrainingCharts
             canvas.DrawCircle(point, (endOfEpoch ? 4.5f : 2.8f) * scale, dot);
             if (endOfEpoch)
                 canvas.DrawCircle(point, 6.5f * scale, ring);
+        }
+    }
+
+    /// <summary>One line per <paramref name="split"/> entry, labelled at its end, with its tolerant companion dashed and faint.</summary>
+    private static void DrawSplit(SKCanvas canvas, TrainingSeries series, Metric metric, SplitLine[] split, SKRect plot, double xMin, double xMax, float scale, SKFont font)
+    {
+        List<(double X, double Y, bool EndOfEpoch)> Points(Func<EvaluationPoint, double> value) =>
+            series.Points.Select(p => ((double)p.Step, value(p), p.EndOfEpoch)).Where(p => !double.IsNaN(p.Item2)).ToList();
+        var lines = split.Select(s => (s.Label, s.Color, Strict: Points(s.Value), Tolerant: s.Tolerant is null ? [] : Points(s.Tolerant))).ToList();
+        if (lines.All(l => l.Strict.Count == 0 && l.Tolerant.Count == 0))
+        {
+            // Evaluations without the split (no gold set, or reports from before it): nothing to draw yet.
+            Draw(canvas, "no evaluation yet", plot.MidX, plot.MidY, font, Axis, SKTextAlign.Center);
+            return;
+        }
+        var (yMin, yMax) = Range(lines.SelectMany(l => l.Strict.Concat(l.Tolerant)).Select(p => p.Y), metric.Percent);
+        var area = Axes(canvas, plot, xMin, xMax, yMin, yMax, metric.Percent, series, scale, font);
+        using var small = new SKFont(font.Typeface, font.Size * 0.85f);
+        var placed = new List<float>();
+        foreach (var (label, color, strict, tolerant) in lines)
+        {
+            if (tolerant.Count > 1)
+            {
+                using var dashed = new SKPaint { Color = color.WithAlpha(120), StrokeWidth = 1.4f * scale, IsAntialias = true, Style = SKPaintStyle.Stroke,
+                    PathEffect = SKPathEffect.CreateDash([5 * scale, 4 * scale], 0) };
+                using var path = new SKPath();
+                for (var k = 0; k < tolerant.Count; k++)
+                {
+                    var p = new SKPoint(X(area, tolerant[k].X, xMin, xMax), Y(area, tolerant[k].Y, yMin, yMax));
+                    if (k == 0) path.MoveTo(p); else path.LineTo(p);
+                }
+                canvas.DrawPath(path, dashed);
+            }
+            if (strict.Count == 0)
+                continue;
+            Line(canvas, area, strict.Select(v => (v.X, v.Y)).ToList(), xMin, xMax, yMin, yMax, color, 2f * scale);
+            using var dot = new SKPaint { Color = color, IsAntialias = true };
+            foreach (var (x, y, endOfEpoch) in strict)
+                canvas.DrawCircle(X(area, x, xMin, xMax), Y(area, y, yMin, yMax), (endOfEpoch ? 3.8f : 2.2f) * scale, dot);
+            // The label and latest value above the line's end, where the lines are furthest apart; moved off any label already there.
+            var ly = Y(area, strict[^1].Y, yMin, yMax) - 6 * scale;
+            while (placed.Any(p => Math.Abs(p - ly) < small.Size))
+                ly -= small.Size;
+            placed.Add(ly);
+            Draw(canvas, $"{label} {Format(strict[^1].Y, metric.Percent)}", X(area, strict[^1].X, xMin, xMax) - 4 * scale, ly, small, color, SKTextAlign.Right);
         }
     }
 

@@ -459,9 +459,12 @@ public static class Glimpses
     /// </summary>
     /// <param name="pixels">[B, 3, S, S] canvases.</param>
     /// <param name="contentBoxes">[B, 4] (<see cref="ContentBoxes"/>); glimpses pool over content only, as the whole image does.</param>
-    public static (Tensor Cells, Tensor Valid) Embed(ImageTower tower, Tensor pixels, Tensor contentBoxes, GlimpseChoice choice, int chunk = DefaultChunk)
+    /// <param name="requireZoomCodes">False lets a tower without glimpses (no zoom codes) embed windows as they are: the self-map window
+    /// term on a whole-image run (<see cref="Training.SelfMapWindows"/>) and its evaluation check.</param>
+    public static (Tensor Cells, Tensor Valid) Embed(ImageTower tower, Tensor pixels, Tensor contentBoxes, GlimpseChoice choice, int chunk = DefaultChunk,
+        bool requireZoomCodes = true)
     {
-        if (tower.GlimpseZoomCodes is null)
+        if (tower.GlimpseZoomCodes is null && requireZoomCodes)
             throw new InvalidOperationException("This tower has no glimpse zoom codes (--classification-glimpses).");
         using var scope = NewDisposeScope();
         var device = pixels.device;
@@ -491,7 +494,9 @@ public static class Glimpses
             var length = Math.Min(pass, glimpses - first);
             embedded.Add(GlimpsePath(tower).ForwardPooledOnly(crops.narrow(0, first, length), masks.narrow(0, first, length)));
         }
-        var flat = cat(embedded, 0) + tower.GlimpseZoomCodes.index_select(0, zoom);
+        var flat = cat(embedded, 0);
+        if (tower.GlimpseZoomCodes is not null)
+            flat = flat + tower.GlimpseZoomCodes.index_select(0, zoom);
         var cells = flat.view(batch, count, -1).transpose(1, 2);
         if (tower.GlimpseObjectOnly && tower.GlimpseObjectDims > 0)
             cells = ObjectOnly(cells, tower.GlimpseObjectDims, tower.GlimpseContextMean);

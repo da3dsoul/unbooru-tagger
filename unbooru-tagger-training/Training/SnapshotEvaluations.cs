@@ -23,12 +23,24 @@ namespace UnbooruTagger.Training.Training;
 /// (<see cref="LabelledContextReport.AbsentMeanLogit"/>); NaN without <c>evaluate --context-check</c>. Not the called rate: about 200 pairs
 /// called at thresholds recalibrated each evaluation, so a few pairs flipping moves it by points.</param>
 /// <param name="LabelledPresentLogit">The same for those where it's visible but untagged.</param>
+/// <param name="GoldPointingBySize">Gold pointing per size bucket ("characters", "large", "medium", "small"); empty without a gold set.</param>
+/// <param name="GoldTolerantBySize">The same with <see cref="GoldResult.TolerantPointing"/> (and "all"); empty in reports from before it existed.</param>
+/// <param name="At1024">The gold checks at 1024px (<see cref="HigherScalePoint"/>); null where the evaluation didn't run them.</param>
 public sealed record EvaluationPoint(
     long Step, bool EndOfEpoch, double MeanAveragePrecision, double GoldPointing, double RecallGap, double FalsePositiveGap,
     double OccludedStillCalled, double ExclusiveViolations, double SmallGoldPointing = double.NaN, double SmallOccludedStillCalled = double.NaN,
     double ObjectEffect = double.NaN, double SmallObjectEffect = double.NaN,
-    double LabelledAbsentLogit = double.NaN, double LabelledPresentLogit = double.NaN)
+    double LabelledAbsentLogit = double.NaN, double LabelledPresentLogit = double.NaN,
+    IReadOnlyDictionary<string, double>? GoldPointingBySize = null, IReadOnlyDictionary<string, double>? GoldTolerantBySize = null,
+    HigherScalePoint? At1024 = null)
 {
+    /// <summary>The gold set's size buckets, as <see cref="LocalizationEvaluator.SizeBucket"/> names them, by short name.</summary>
+    public static readonly (string Short, string Row)[] SizeRows =
+        [("characters", "size: characters"), ("large", "size: large >=96px"), ("medium", "size: medium 32-96px"), ("small", "size: small <32px")];
+
+    /// <summary>A per-size value, NaN when missing.</summary>
+    public static double Get(IReadOnlyDictionary<string, double>? values, string key) => values is not null && values.TryGetValue(key, out var v) ? v : double.NaN;
+
     /// <summary>Reads <paramref name="directory"/>'s evaluation_report.json (and localization_report.json, if any); null if there's no report.</summary>
     public static EvaluationPoint? Read(string directory, long step, bool endOfEpoch)
     {
@@ -43,14 +55,17 @@ public sealed record EvaluationPoint(
             var context = root.TryGetProperty(nameof(EvaluationReport.ContextReliance), out var c) && c.ValueKind == JsonValueKind.Object ? c : default;
             var labelled = root.TryGetProperty(nameof(EvaluationReport.LabelledContext), out var l) && l.ValueKind == JsonValueKind.Object ? l : default;
 
-            var (goldPointing, occluded, effect) = Localization(Path.Combine(directory, EvaluateCommandHandler.LocalizationReportFileName));
+            var goldPath = Path.Combine(directory, EvaluateCommandHandler.LocalizationReportFileName);
+            var (goldPointing, occluded, effect) = Localization(goldPath);
+            var (bySize, tolerantBySize) = Sizes(goldPath);
             var (smallPointing, smallOccluded, smallEffect) = Localization(Path.Combine(directory, EvaluateCommandHandler.SmallGoldReportFileName));
 
             return new EvaluationPoint(step, endOfEpoch,
                 Number(root, nameof(EvaluationReport.MeanAveragePrecision)), goldPointing,
                 Number(context, nameof(ContextRelianceReport.MacroRecallGap)), Number(context, nameof(ContextRelianceReport.MacroFalsePositiveGap)),
                 occluded, Number(root, nameof(EvaluationReport.ExclusiveViolationRate)), smallPointing, smallOccluded, effect, smallEffect,
-                Number(labelled, nameof(LabelledContextReport.AbsentMeanLogit)), Number(labelled, nameof(LabelledContextReport.PresentMeanLogit)));
+                Number(labelled, nameof(LabelledContextReport.AbsentMeanLogit)), Number(labelled, nameof(LabelledContextReport.PresentMeanLogit)),
+                bySize, tolerantBySize, HigherScalePoint.Read(directory, 1024));
         }
         catch (Exception e) when (e is JsonException or IOException)
         {
@@ -59,7 +74,7 @@ public sealed record EvaluationPoint(
     }
 
     /// <summary>A localization report's overall gold pointing, occlusion still-called rate and object effect; NaN if it doesn't exist.</summary>
-    private static (double Pointing, double StillCalled, double ObjectEffect) Localization(string path)
+    internal static (double Pointing, double StillCalled, double ObjectEffect) Localization(string path)
     {
         if (!File.Exists(path))
             return (double.NaN, double.NaN, double.NaN);
@@ -67,6 +82,29 @@ public sealed record EvaluationPoint(
         return (All(localization.RootElement, nameof(LocalizationReport.Gold), nameof(GoldResult.PointingAccuracy)),
             All(localization.RootElement, nameof(LocalizationReport.Occlusion), nameof(OcclusionResult.StillYesRate)),
             All(localization.RootElement, nameof(LocalizationReport.Occlusion), nameof(OcclusionResult.ObjectEffect)));
+    }
+
+    /// <summary>A localization report's gold pointing per size bucket, strict and tolerant (the tolerant one with "all" too).</summary>
+    internal static (Dictionary<string, double> Strict, Dictionary<string, double> Tolerant) Sizes(string path)
+    {
+        var (strict, tolerant) = (new Dictionary<string, double>(), new Dictionary<string, double>());
+        if (!File.Exists(path))
+            return (strict, tolerant);
+        using var localization = JsonDocument.Parse(File.ReadAllBytes(path));
+        if (!localization.RootElement.TryGetProperty(nameof(LocalizationReport.Gold), out var rows) || rows.ValueKind != JsonValueKind.Array)
+            return (strict, tolerant);
+        foreach (var row in rows.EnumerateArray())
+        {
+            var name = row.TryGetProperty("Name", out var n) ? n.GetString() : null;
+            var key = name == "all" ? "all" : SizeRows.FirstOrDefault(s => s.Row == name).Short;
+            if (key is null)
+                continue;
+            if (key != "all" && Number(row, nameof(GoldResult.PointingAccuracy)) is var p && !double.IsNaN(p))
+                strict[key] = p;
+            if (Number(row, nameof(GoldResult.TolerantPointing)) is var t && !double.IsNaN(t))
+                tolerant[key] = t;
+        }
+        return (strict, tolerant);
     }
 
     /// <summary>The "all" row's <paramref name="field"/> of a list of per-group results.</summary>
@@ -87,6 +125,45 @@ public sealed record EvaluationPoint(
             : value.ValueKind == JsonValueKind.String && double.TryParse(value.GetString(), System.Globalization.CultureInfo.InvariantCulture, out var parsed) ? parsed
             : double.NaN
             : double.NaN;
+}
+
+/// <summary>
+/// The gold checks at a larger input size, beside an evaluation's own (2026-11-04: training mixes 512-2048px batches,
+/// <c>--train-scales</c>, while the trend evaluations score at the checkpoint's 512px, the size it gains least at). The evaluation
+/// command writes them into <c>at{size}/</c> (gold and gold-small, from the originals shrunk to that size: review/aliasing/area1024)
+/// and <c>at{size}-auto/</c> (gold-auto) beside its own reports.
+/// </summary>
+/// <param name="GoldPointing">Gold pointing over all pairs.</param>
+/// <param name="GoldBySize">Gold pointing per size bucket (as <see cref="EvaluationPoint.GoldPointingBySize"/>; sizes are the 512px ones).</param>
+/// <param name="GoldTolerantBySize">The same within 16px.</param>
+/// <param name="SmallGoldPointing">Gold-small pointing over all pairs.</param>
+/// <param name="ObjectEffect">The gold occlusion object effect.</param>
+/// <param name="AutoPointing">Gold-auto (SAM 3 boxes, 1,020 images) pointing over all pairs.</param>
+/// <param name="AutoBySize">Its pointing per size bucket.</param>
+/// <param name="AutoTolerantBySize">The same within 16px.</param>
+public sealed record HigherScalePoint(
+    double GoldPointing, IReadOnlyDictionary<string, double> GoldBySize, IReadOnlyDictionary<string, double> GoldTolerantBySize,
+    double SmallGoldPointing, double ObjectEffect,
+    double AutoPointing, IReadOnlyDictionary<string, double> AutoBySize, IReadOnlyDictionary<string, double> AutoTolerantBySize)
+{
+    public static string DirectoryName(int size) => $"at{size}";
+
+    public static string AutoDirectoryName(int size) => $"at{size}-auto";
+
+    /// <summary>The checks at <paramref name="size"/> beside an evaluation in <paramref name="directory"/>; null if neither was run.</summary>
+    public static HigherScalePoint? Read(string directory, int size)
+    {
+        var gold = Path.Combine(directory, DirectoryName(size), EvaluateCommandHandler.LocalizationReportFileName);
+        var auto = Path.Combine(directory, AutoDirectoryName(size), EvaluateCommandHandler.LocalizationReportFileName);
+        if (!File.Exists(gold) && !File.Exists(auto))
+            return null;
+        var (goldPointing, _, effect) = EvaluationPoint.Localization(gold);
+        var (goldBySize, goldTolerant) = EvaluationPoint.Sizes(gold);
+        var (smallPointing, _, _) = EvaluationPoint.Localization(Path.Combine(directory, DirectoryName(size), EvaluateCommandHandler.SmallGoldReportFileName));
+        var (autoPointing, _, _) = EvaluationPoint.Localization(auto);
+        var (autoBySize, autoTolerant) = EvaluationPoint.Sizes(auto);
+        return new HigherScalePoint(goldPointing, goldBySize, goldTolerant, smallPointing, effect, autoPointing, autoBySize, autoTolerant);
+    }
 }
 
 /// <summary>

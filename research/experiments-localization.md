@@ -270,3 +270,123 @@ at ~1.79M) scored on all three gold sets from their 512px images, and from 2x co
   bracelet, watch, wristband) stays near 0 at any scale; neckwear, necktie, bow and hair_flower gain 15-30 points.
 
 Next: training on zoomed views (multi-scale), so small objects get the gain without large ones losing it.
+
+### Aliasing or resolution? The gold originals (2026-11-04)
+
+The cache's downscale is nearest-neighbour: `ImagePreprocessing.Encode` and `BuildLetterboxCanvas` resize with
+`SKSamplingOptions.Default`, which in SkiaSharp is nearest with no mipmaps. So the zoom test's upscales started from aliased
+pixels, and it couldn't tell whether small objects lack pixels or the pixels are aliased. With the maintainer's OK, the 1,435
+gold images' originals were re-downloaded (`review/aliasing/`, md5-checked; 34 have a long side ≤ 768, 168 up to 1,024, 729 up
+to 2,048, 504 above) and ctl5 scored from them:
+- `full`: the original, through the evaluator's own nearest resize, as the cache was built. It matched the cache to within a pair
+  per row, so the comparison is clean.
+- `area`: box (area) downscales to 512, 768 and 1,024.
+- `lanczos`: Lanczos downscales to 512 and 1,024.
+
+Strict / 16px, 4,497 pairs common to every run:
+
+| | cache | area 512 | Lanczos 512 | area 768 | area 1024 | Lanczos 1024 | AI 2x of the cache |
+|---|---|---|---|---|---|---|---|
+| gold small (208) | 39.9 / 60.6 | 41.8 / 63.9 | 42.3 / 63.9 | 53.4 / 68.8 | 54.8 / 67.8 | **55.8** / 67.8 | 50.5 / 63.0 |
+| gold-small small (217) | 37.3 / 54.4 | 36.4 / 52.5 | 35.5 / 51.6 | **51.2 / 62.7** | 47.0 / 59.4 | 47.5 / 60.4 | 46.1 / 58.1 |
+| gold-auto small (611) | 42.7 / 61.2 | 40.8 / 61.0 | 42.1 / 62.5 | 52.5 / 64.8 | 52.4 / 62.8 | **52.9** / 62.7 | 48.6 / 58.9 |
+| gold medium (426) | 60.6 / 74.2 | 59.9 / 73.0 | 61.0 / 74.2 | **63.4** / 72.3 | 61.3 / 69.2 | 59.2 / 66.7 | 57.0 / 66.7 |
+| gold-auto medium (1,505) | 69.0 / 75.3 | 69.7 / 76.1 | **69.9 / 76.6** | 68.4 / 72.8 | 59.9 / 64.4 | 60.3 / 64.7 | 58.7 / 64.5 |
+| gold-auto large (600) | **76.0** / 78.7 | 73.8 / 78.8 | 74.3 / 79.2 | 67.7 / 71.7 | 60.7 / 64.8 | 60.5 / 64.7 | 58.3 / 63.0 |
+| gold characters (383) | **90.9 / 92.2** | 89.3 / 90.6 | 88.8 / 90.1 | 87.2 / 88.5 | 84.9 / 85.4 | 83.6 / 84.3 | 86.2 / 86.9 |
+
+- **It is resolution, not aliasing.** A clean 512px downscale is within ±2 points of the cache everywhere. That holds for a model
+  trained on aliased images; one trained on clean ones might differ.
+- **Real pixels beat upscaled ones.** At 1,024, small objects score +10 to +16 strict points over the cache, and 1-5 more than the
+  AI upscale of the cache. Large and medium objects lose much less than with the upscale: gold large 63.8 against 55.8.
+- **768 is the best single scale with no fine-tuning.** Small objects get most of 1,024's gain (+10 to +14), medium is about even
+  and large loses less.
+- **Lanczos and area are within noise.** Lanczos is 0.5-1 point ahead on small objects in all three sets; area is about 2 points
+  ahead on medium in two. Lanczos was chosen for the hi-res pull.
+- By shrink factor (original long side / 512), 768 helps small and medium objects in every band, most at 2-8x.
+
+`results.txt` there has the full table, including the per-shrink breakdown. Next: a hi-res side store
+(`HiResImageStore`, `review/hires/`) and fine-tuning at 1,024 (`train --train-input-size`).
+
+### Fine-tuning at a higher resolution (2026-11-04)
+
+The maintainer expected fine-tuning at a higher input size to be the way forward ("but test"). `train --train-input-size N`
+trains at N from the 512px cache:
+- cached images are enlarged with Mitchell cubic (`ImageResize`);
+- rows in a hi-res side store (`--hires-store`, `HiResImageStore`) are read from it instead.
+
+`evaluate --input-size` scores the held-out images the same way. The arms (`review/hires/ab/`, `compare.py`):
+- all start from run 4 at epoch 4 + 80,270 steps;
+- all use a constant LR of 2.5e-5, the cosine rate run 4 was at, because `--lr-schedule constant` now sets `--lr` on resume and a
+  different batch layout mustn't move the rate;
+- each sees 120K images.
+
+In each arm:
+- the gold sets come from the originals at the arm's input size (`review/aliasing/area*`);
+- held-out images come from the cache, rescaled.
+
+| | ctl512 @512 | ctl512 @768 (untuned) | ctl512 @1024 (untuned) | up768 @768 | up1024 @1024 |
+|---|---|---|---|---|---|
+| held-out mAP | 0.803 | 0.781 | 0.715 | **0.810** | 0.804 |
+| AP ring / wristband / earrings / choker | .379 / .446 / .515 / .594 | .374 / .463 / .508 / .589 | .292 / .415 / .420 / .514 | .402 / .474 / **.542** / **.618** | **.425 / .481** / .540 / .617 |
+| absent objects called | 10.2% | 10.2% | 8.1% | 11.2% | 10.2% |
+| object effect, gold | **1.32** | 0.89 | 0.61 | 1.25 | 1.17 |
+| gold small | 40.9 / 65.4 | 49.5 / 69.2 | 53.8 / 64.4 | 51.0 / 70.2 | **55.8 / 70.7** |
+| gold-small small | 37.3 / 62.7 | 51.2 / 67.3 | 54.8 / 63.1 | 51.6 / 64.5 | **57.1 / 70.0** |
+| gold-auto small | 45.2 / 66.0 | 53.4 / 66.9 | 56.3 / 66.4 | 56.8 / 68.6 | **60.7 / 70.9** |
+| gold medium | 61.7 / 76.9 | 66.7 / 75.0 | 65.7 / 72.6 | 67.1 / 75.7 | **69.5** / 75.2 |
+| gold-auto medium | 70.5 / 76.7 | 71.7 / 76.0 | 64.2 / 68.1 | **73.1 / 77.3** | 70.2 / 74.4 |
+| gold large | 70.9 / 76.4 | 68.3 / 72.4 | 64.3 / 68.8 | **73.4** / 74.9 | 66.8 / 69.8 |
+| gold-auto large | **77.0 / 80.8** | 71.7 / 75.0 | 61.8 / 65.3 | 74.3 / 77.2 | 69.7 / 72.5 |
+| gold characters | **89.4** | 88.8 | 85.7 | **89.4** | 88.6 |
+
+Strict / 16px pointing, 4,494 pairs common to every run; sizes in 512px pixels.
+
+- **Fine-tuning recovers the scale shift.** At 1,024 the untuned model loses 9 mAP points; after 120K images it is level with
+  the control, and at 768 above it.
+- **Small objects gain more than any earlier change:**
+  - +10 to +12 strict points at 768 and +15 to +20 at 1,024 on all three sets, from cache images that were only enlarged;
+  - the gold images were real pixels at those sizes;
+  - the six weak tags' held-out AP rose 2-5 points.
+- **768 is the balanced choice:**
+  - the best mAP, and medium objects up everywhere;
+  - large objects about even;
+  - 2.25x the compute per image (162 ms/step at batch 5, against 141 at 512 batch 10).
+- **1,024** gains 4-6 more points on small objects, loses 4-7 on large ones, and costs about 4x (240 ms/step at batch 4, with
+  VRAM at the B70's 32 GB).
+- **The occlusion object effect falls a little at the higher size** (1.25 and 1.17 against 1.32). The blanked boxes are the same
+  objects, but the effect's scale may depend on input size; this hasn't been checked.
+
+### Real hi-res pixels: the focused pair (2026-11-04)
+
+`review/hires/store1024`: originals of six weak small-object tags' images (ring, wristband, bracelet, earrings, hairclip, choker),
+re-downloaded and shrunk to a 1,024 long side with Lanczos, kept as JPEG (q92, 4:4:4, ~238 KB each). 15,000 steps from the same start
+as above, 30% of the anchors on the six tags (`--focus-share 0.3 --focus-tags`); hrF1024 also read the store, which held ~100K rows
+by then. Held-out AP at 1,024:
+
+| Tag | store coverage | upF1024 (enlarged cache) | hrF1024 (store) |
+|---|---|---|---|
+| wristband | 53% | 0.472 | **0.612** |
+| ring | 31% | 0.390 | **0.444** |
+| bracelet | 18% | 0.464 | 0.468 |
+| earrings | 8% | 0.498 | 0.508 |
+| hairclip | 10% | 0.520 | 0.517 |
+| choker | 10% | 0.585 | 0.584 |
+| held-out mAP | | 0.7996 | 0.7994 |
+
+Small-object pointing (gold / gold-small / gold-auto, strict): 53.6 / 53.9 / 59.6 vs 57.0 / 56.7 / 59.7.
+
+- **The gain follows the store's coverage of each tag.** Real pixels, not the focus or the size, made the difference.
+- **It is the model, not the test input.** The held-out images of a store arm were read from the store too, so both unfocused 1,024
+  arms were re-scored with a frozen 100K-row snapshot of the store (`heldout-with-store.sh`). Wristband AP: up1024 0.481 enlarged,
+  0.473 with real pixels; hr1024 0.556. A model trained only on enlarged images gains nothing from real ones at test time.
+
+### Mixed-scale training (2026-11-04, `--train-scales`)
+
+1,024 helped small objects and cost large ones up to 7 points; 768 was balanced. So each micro-batch is drawn at one of several sizes
+(`size:batch:share[:stored]`), each with the batch that fits, and a share of its images can be drawn from rows a hi-res store holds
+at that size or larger. Each image counts the same in the accumulated gradient whatever its micro-batch's size. Several stores can be
+given (`--hires-store a,b`, one per long side); a row is read from the smallest store that reaches the size, else the largest, and
+rows a pull appends while training runs are picked up every 5 minutes. A scale trained only on stored rows (2048) is skipped while no
+store holds any at that size. The plan: gather stores strategically, per tag and per kind of image (collages and comics at 2,048), as
+evaluations show what is weak.

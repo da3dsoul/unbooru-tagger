@@ -127,6 +127,48 @@ public static class SigmoidContrastiveLoss
     }
 
     /// <summary>
+    /// <see cref="ComputeLocalizedPairs(Tensor, Tensor, LocalizationPairs, float, Tensor?, LogitScaleBias?, float, float, float, float)"/>
+    /// on a map with a fine level, from its parts (<see cref="FineLocalizationMap"/>), with the same value and gradients.
+    /// A location's logit is its coarse cell's <c>e · coarse</c> plus its own <c>(eW) · features + e · b</c>, so the
+    /// log-sum-exp over the fine grid is one over coarse cells of <c>e · coarse + LSE(the cell's four fine logits)</c>:
+    /// the [batch, pairs, 4 x cells] tensor is built once, by a 64-channel multiply, and reduced by one log-sum-exp over
+    /// each cell's four. The dense form built the 512-wide map at 256x256 and kept about six [batch, pairs, locations]
+    /// tensors per step for the backward pass. Masked locations get -1e4 rather than -inf: a coarse cell with all four
+    /// masked would otherwise take a log-sum-exp of nothing (NaN gradients); exp(-1e4) is exactly 0 in fp32.
+    /// </summary>
+    /// <param name="spatialMask">[batch, 1, 2h, 2w], at the fine grid.</param>
+    public static Tensor ComputeLocalizedPairs(
+        FineLocalizationMap map, Tensor tagEmbeddings, LocalizationPairs pairs, float temperature,
+        Tensor spatialMask, LogitScaleBias? scaling, float negativeGamma, float negativeClip)
+    {
+        var batch = map.Coarse.shape[0];
+        var dim = map.Coarse.shape[1];
+        var (height, width) = (map.Coarse.shape[2], map.Coarse.shape[3]);
+        var cells = height * width;
+        var channels = map.Features.shape[1];
+        var pairCount = pairs.TagRows.shape[1];
+
+        var pairEmbeddings = tagEmbeddings.index_select(0, pairs.TagRows.flatten()).reshape([batch, pairCount, dim]);
+        // [B, C, 2h, 2w] -> [B, C, 4 (row in cell, column in cell), h·w], so each coarse cell's four logits share an axis.
+        static Tensor SubCells(Tensor t, long h, long w) =>
+            t.reshape([t.shape[0], t.shape[1], h, 2, w, 2]).permute(0, 1, 3, 5, 2, 4).reshape([t.shape[0], t.shape[1], 4, h * w]);
+        var features = SubCells(map.Features, height, width).reshape([batch, channels, 4 * cells]);
+        var fine = (pairEmbeddings.matmul(map.Weight) / temperature).bmm(features).reshape([batch, pairCount, 4, cells]);
+        var maskCells = SubCells(spatialMask, height, width); // [B, 1, 4, h·w]
+        // In place: bmm's output isn't saved for its backward.
+        fine.add_((maskCells - 1) * 1e4f);
+        var perCell = fine.logsumexp(2)
+            + pairEmbeddings.bmm(map.Coarse.reshape([batch, dim, cells])) / temperature
+            + (pairEmbeddings.matmul(map.Bias) / temperature).unsqueeze(2); // [B, K, h·w]
+        var logValidCount = spatialMask.reshape([batch, 1, 4 * cells]).sum([2]).log(); // [B, 1]
+        var rawPooled = temperature * (perCell.logsumexp(2) - logValidCount);
+        var pooled = scaling?.forward(rawPooled) ?? rawPooled;
+
+        var loss = PairLoss(pooled, pairs.Labels, pairs.Weights, pairs.FocalMask, negativeGamma, negativeClip).sum();
+        return loss / Math.Max(1f, pairs.PositiveWeightSum);
+    }
+
+    /// <summary>
     /// Crop consistency: the classifier teaches localization. <paramref name="teacherLogits"/>
     /// ([B, K], computed without gradients) are the whole-image classifier's logits for each
     /// pair's tag on a crop of the image (<see cref="CropConsistency"/>), i.e. whether the tag

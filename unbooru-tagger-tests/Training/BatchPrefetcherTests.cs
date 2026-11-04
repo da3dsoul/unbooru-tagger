@@ -33,6 +33,35 @@ public class BatchPrefetcherTests
     }
 
     [Fact]
+    public void RequestsAtTheirOwnSizes_AreReadAndDecodedAtThoseSizes_InOrder()
+    {
+        // Mixed-scale training: each request names its canvas; one read per size in a window.
+        static EncodedImage[] ReadAt(IReadOnlyList<int> ids, int size) =>
+            ids.Select(i => new EncodedImage(Enumerable.Repeat((byte)i, size * size * 3).ToArray(), new LetterboxBox(0, 0, size, size))).ToArray();
+        var reads = new List<(int[] Ids, int Size)>();
+        var requests = new[] { new BatchRequest([1, 2]), new BatchRequest([3], InputSize: 4), new BatchRequest([4, 5]), new BatchRequest([6], InputSize: 4) };
+        using var prefetcher = new BatchPrefetcher(requests, (ids, size) => { reads.Add((ids.ToArray(), size)); return ReadAt(ids, size); }, InputSize, windowBatches: 4);
+
+        foreach (var request in requests)
+        {
+            Assert.True(prefetcher.TryTake(out var batch));
+            Assert.Same(request, batch.Request);
+            var size = request.InputSize > 0 ? request.InputSize : InputSize;
+            Assert.Equal(request.Images.Length * 3 * size * size, batch.Pixels.Length);
+            var expected = request.Images.SelectMany(i => ImagePreprocessing.Reconstruct(ReadAt([i], size)[0], size).Pixels).ToArray();
+            Assert.Equal(expected, batch.Pixels);
+        }
+
+        Assert.Equal([([1, 2, 4, 5], InputSize), ([3, 6], 4)], reads.Select(r => (r.Ids, r.Size)).ToArray(), new ReadComparer());
+    }
+
+    private sealed class ReadComparer : IEqualityComparer<(int[] Ids, int Size)>
+    {
+        public bool Equals((int[] Ids, int Size) x, (int[] Ids, int Size) y) => x.Size == y.Size && x.Ids.SequenceEqual(y.Ids);
+        public int GetHashCode((int[] Ids, int Size) obj) => obj.Size;
+    }
+
+    [Fact]
     public void InfiniteRequests_StopCleanlyOnDispose()
     {
         static IEnumerable<BatchRequest> Forever()

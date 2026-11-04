@@ -229,8 +229,28 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
     /// </summary>
     public bool GlimpseGrid { get; set; }
 
-    /// <summary>Input pixels per spatial-map cell: the stem's stride, x2 per downsampling stage, /2 per fused stage.</summary>
-    public int OutputStride { get; }
+    /// <summary>
+    /// Input pixels per spatial-map cell: the stem's stride, x2 per downsampling stage, /2 per fused stage, /2 again with
+    /// <see cref="Fine"/> (whose maps, the full one included, then come at its resolution).
+    /// </summary>
+    public int OutputStride => Fine is null ? _coarseStride : _coarseStride / FineLocalization.Stride;
+
+    private readonly int _coarseStride;
+
+    /// <summary>
+    /// A stride-2 level under the localization map (<see cref="FineLocalization"/>, <c>--fine-localization</c>); null without it.
+    /// Not a registered module: saved in its own file, so checkpoints without it load unchanged. Needs
+    /// <see cref="LocalizationFromFusedOnly"/> with every stage fused, so the localization map's finest level is stage 0's.
+    /// </summary>
+    public FineLocalization? Fine { get; set; }
+
+    /// <summary>A new <see cref="FineLocalization"/> for this tower (zero output until trained).</summary>
+    public FineLocalization NewFineLocalization(Device? device = null)
+    {
+        if (!LocalizationFromFusedOnly || FusedStages != StageChannels.Length - 1 || LocalizationSkippedLaterals != 0)
+            throw new InvalidOperationException("--fine-localization adds a level under the localization map's stage-0 lateral: it needs --localization-map fused and every stage fused.");
+        return new FineLocalization(StageChannels[0], EmbeddingDim, device: device);
+    }
 
     /// <summary>Index into <see cref="Layers"/> of each stage's last layer — where fusion taps stage outputs.</summary>
     private readonly int[] _stageEnds;
@@ -285,7 +305,7 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
                 stride *= 2;
             previousChannels = channels;
         }
-        OutputStride = stride >> fusedStages;
+        _coarseStride = stride >> fusedStages;
         Layers = ModuleList(layers.ToArray());
         Projection = Conv2d(inChannels, embeddingDim, kernel_size: 1, device: device);
         // Laterals[k] projects stage (last - 1 - k) into the embedding space.
@@ -320,8 +340,8 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
     {
         // As in ConvNeXtBlock.forward: block and stage outputs and upsampled maps are freed here, not by the caller.
         using var scope = NewDisposeScope();
-        var stageOutputs = Trunk(input, out var x);
-        var (spatial, localization) = FusedChain(stageOutputs, x);
+        var stageOutputs = Trunk(input, out var x, out var typed);
+        var (spatial, localization) = FusedChain(stageOutputs, x, typed);
         var same = ReferenceEquals(localization, spatial);
         spatial = ToFloat32(spatial);
         localization = same ? spatial : ToFloat32(localization);
@@ -332,7 +352,7 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
     }
 
     /// <summary>The full map and the localization map from the trunk's outputs (<see cref="ForwardMaps"/>).</summary>
-    private (Tensor Spatial, Tensor Localization) FusedChain(Tensor[] stageOutputs, Tensor last)
+    private (Tensor Spatial, Tensor Localization) FusedChain(Tensor[] stageOutputs, Tensor last, Tensor typed)
     {
         var spatial = MixedPrecision.Conv(Projection, last);
         Tensor? localization = null;
@@ -343,6 +363,14 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
             if (LocalizationFromFusedOnly && k > LocalizationSkippedLaterals)
                 localization = localization is null ? lateral : Upsample(localization, lateral) + lateral;
         }
+        if (Fine is not null && localization is not null)
+        {
+            var fine = Fine.forward(typed, stageOutputs[0]);
+            localization = Upsample(localization, fine) + fine;
+            // The full map at the same resolution, so callers' masks (built at OutputStride) fit both; nearest-upsampled, so
+            // its masked pool is unchanged when the mask is too.
+            spatial = Upsample(spatial, fine);
+        }
         return (spatial, localization ?? spatial);
     }
 
@@ -352,10 +380,12 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
         functional.interpolate(map, size: [like.shape[2], like.shape[3]], mode: InterpolationMode.Nearest);
 
     /// <summary>Stem and stages: each stage's output, and the last one in <paramref name="last"/>.</summary>
-    private Tensor[] Trunk(Tensor input, out Tensor last)
+    private Tensor[] Trunk(Tensor input, out Tensor last, out Tensor typed)
     {
-        var typed = ComputeType is { } computeType && computeType != input.dtype ? input.to_type(computeType) : input;
-        var x = MixedPrecision.Conv(Stem, ChannelsLast ? MixedPrecision.ToChannelsLast(typed) : typed);
+        typed = ComputeType is { } computeType && computeType != input.dtype ? input.to_type(computeType) : input;
+        if (ChannelsLast)
+            typed = MixedPrecision.ToChannelsLast(typed);
+        var x = MixedPrecision.Conv(Stem, typed);
         var stageOutputs = new Tensor[StageChannels.Length];
         var nextStage = 0;
         for (var i = 0; i < Layers.Count; i++)
@@ -380,11 +410,41 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
     public (Tensor Pooled, Tensor Localization) ForwardPooled(Tensor input, Tensor mask)
     {
         using var scope = NewDisposeScope();
-        var stageOutputs = Trunk(input, out var x);
-        // Level k (0 = the projection of the last stage, k > 0 = lateral k) is upsampled 2^(FusedStages - k) times.
+        var (pooled, localization) = ForwardPooled(input, mask, factored: false);
+        var map = localization as Tensor ?? ((FineLocalizationMap)localization).Dense();
+        scope.MoveToOuter(pooled);
+        scope.MoveToOuter(map);
+        return (pooled, map);
+    }
+
+    /// <summary>
+    /// <see cref="ForwardPooled(Tensor, Tensor)"/> with <see cref="Fine"/> set, the localization map left in its two parts
+    /// (<see cref="FineLocalizationMap"/>) instead of built at 256x256 x the embedding width.
+    /// </summary>
+    public (Tensor Pooled, FineLocalizationMap Localization) ForwardPooledFine(Tensor input, Tensor mask)
+    {
+        if (Fine is null)
+            throw new InvalidOperationException("ForwardPooledFine needs a fine localization level.");
+        using var scope = NewDisposeScope();
+        var (pooled, localization) = ForwardPooled(input, mask, factored: true);
+        var map = (FineLocalizationMap)localization;
+        scope.MoveToOuter(pooled);
+        scope.MoveToOuter(map.Coarse);
+        scope.MoveToOuter(map.Features);
+        scope.MoveToOuter(map.Weight); // a view of the projection's weight; the bias is the parameter itself
+        return (pooled, map);
+    }
+
+    /// <returns>The pooled embedding and the localization map: a tensor, or with <paramref name="factored"/> a <see cref="FineLocalizationMap"/>.</returns>
+    private (Tensor Pooled, object Localization) ForwardPooled(Tensor input, Tensor mask, bool factored)
+    {
+        var stageOutputs = Trunk(input, out var x, out var typed);
+        // Level k (0 = the projection of the last stage, k > 0 = lateral k) is upsampled 2^(FusedStages - k) times, once more
+        // with the fine level (the mask is then at its resolution).
         Tensor LevelInput(int k) => k == 0 ? x : stageOutputs[StageChannels.Length - 1 - k];
+        var fineLevels = Fine is null ? 0 : 1;
         var exact = LocalizationFromFusedOnly && Enumerable.Range(0, FusedStages + 1).All(k =>
-            LevelInput(k).shape[2] << (FusedStages - k) == mask.shape[2] && LevelInput(k).shape[3] << (FusedStages - k) == mask.shape[3]);
+            LevelInput(k).shape[2] << (FusedStages - k + fineLevels) == mask.shape[2] && LevelInput(k).shape[3] << (FusedStages - k + fineLevels) == mask.shape[3]);
 
         Tensor pooled, localization;
         if (exact)
@@ -397,23 +457,25 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
                 var map = ToFloat32(k == 0 ? MixedPrecision.Conv(Projection, x) : MixedPrecision.Conv(Laterals[k - 1], LevelInput(k)));
                 if (k > LocalizationSkippedLaterals)
                     fused = fused is null ? map : Upsample(fused, map) + map;
-                var factor = 1L << (FusedStages - k);
+                var factor = 1L << (FusedStages - k + fineLevels);
                 var blockMask = factor == 1 ? mask : functional.avg_pool2d(mask, factor) * (factor * factor);
                 var term = (map * blockMask).sum([2, 3]);
                 weightedSum = weightedSum is null ? term : weightedSum + term;
             }
             pooled = weightedSum! / mask.sum([2, 3]).clamp_min(1e-6);
+            if (Fine is not null)
+                return (pooled, FineLocalizationMap.From(fused!, ToFloat32(Fine.Features(typed, stageOutputs[0])), Fine));
             localization = fused!;
         }
         else
         {
-            var (spatial, fullLocalization) = FusedChain(stageOutputs, x);
+            if (factored)
+                throw new InvalidOperationException("The factored fine map needs every level an exact power-of-two multiple of the mask's grid.");
+            var (spatial, fullLocalization) = FusedChain(stageOutputs, x, typed);
             pooled = MaskedPool(ToFloat32(spatial), mask);
             localization = ToFloat32(fullLocalization);
         }
 
-        scope.MoveToOuter(pooled);
-        scope.MoveToOuter(localization);
         return (pooled, localization);
     }
 
@@ -427,10 +489,11 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
     public Tensor ForwardPooledOnly(Tensor input, Tensor mask)
     {
         using var scope = NewDisposeScope();
-        var stageOutputs = Trunk(input, out var x);
+        var stageOutputs = Trunk(input, out var x, out _);
         Tensor LevelInput(int k) => k == 0 ? x : stageOutputs[StageChannels.Length - 1 - k];
+        var fineLevels = Fine is null ? 0 : 1;
         var exact = LocalizationFromFusedOnly && Enumerable.Range(0, FusedStages + 1).All(k =>
-            LevelInput(k).shape[2] << (FusedStages - k) == mask.shape[2] && LevelInput(k).shape[3] << (FusedStages - k) == mask.shape[3]);
+            LevelInput(k).shape[2] << (FusedStages - k + fineLevels) == mask.shape[2] && LevelInput(k).shape[3] << (FusedStages - k + fineLevels) == mask.shape[3]);
         if (!exact)
         {
             var pooledFallback = ForwardPooled(input, mask).Pooled;
@@ -441,7 +504,7 @@ public sealed class ImageTower : Module<Tensor, (Tensor Pooled, Tensor Spatial)>
         for (var k = 0; k <= FusedStages; k++)
         {
             var conv = k == 0 ? Projection : Laterals[k - 1];
-            var factor = 1L << (FusedStages - k);
+            var factor = 1L << (FusedStages - k + fineLevels);
             var blockMask = factor == 1 ? mask : functional.avg_pool2d(mask, factor) * (factor * factor); // fine cells per cell
             var summed = (ToFloat32(LevelInput(k)) * blockMask).sum([2, 3]); // [B, C_k]
             var term = summed.matmul(conv.weight!.flatten(1).t());

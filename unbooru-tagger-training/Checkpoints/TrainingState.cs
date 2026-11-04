@@ -142,4 +142,18 @@ public static class TrainingState
 
     public static void LoadGlimpseTowerOptimizerState(string directory, OptimizerHelper optimizer) =>
         optimizer.load_state_dict(Path.Combine(directory, GlimpseTowerOptimizerFileName));
+
+    private const string FineLocalizationOptimizerFileName = "fine_localization_optimizer.dat";
+
+    /// <summary>The stride-2 localization level's optimizer (<c>ImageTower.Fine</c>), apart from the main one for the same reason.</summary>
+    public static bool HasFineLocalizationOptimizerState(string directory) => File.Exists(Path.Combine(directory, FineLocalizationOptimizerFileName));
+
+    public static void SaveFineLocalizationOptimizerState(string directory, OptimizerHelper optimizer)
+    {
+        Directory.CreateDirectory(directory);
+        optimizer.save_state_dict(Path.Combine(directory, FineLocalizationOptimizerFileName));
+    }
+
+    public static void LoadFineLocalizationOptimizerState(string directory, OptimizerHelper optimizer) =>
+        optimizer.load_state_dict(Path.Combine(directory, FineLocalizationOptimizerFileName));
 }

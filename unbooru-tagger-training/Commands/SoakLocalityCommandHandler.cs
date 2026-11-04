@@ -72,19 +72,5 @@ public static class SoakLocalityCommandHandler
     }
 
     /// <summary>This process's device memory of one kind, summed over its DRM file descriptors (as /proc/self/fdinfo reports it).</summary>
-    private static long DeviceMemoryMb(string key)
-    {
-        long kib = 0;
-        foreach (var file in Directory.GetFiles("/proc/self/fdinfo"))
-        {
-            string[] lines;
-            try { lines = File.ReadAllLines(file); }
-            catch (IOException) { continue; }
-            if (!lines.Any(l => l.StartsWith("drm-driver")))
-                continue;
-            foreach (var line in lines.Where(l => l.StartsWith(key + ":")))
-                kib += long.Parse(line[(key.Length + 1)..].Trim().Split(' ')[0]);
-        }
-        return kib / 1024;
-    }
+    private static long DeviceMemoryMb(string key) => DeviceMemory.Mb(key);
 }

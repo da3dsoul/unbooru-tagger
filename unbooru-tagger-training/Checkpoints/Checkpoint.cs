@@ -17,6 +17,10 @@ public static class Checkpoint
 {
     private const string ImageTowerFileName = "image_tower.dat";
     private const string GlimpseTowerFileName = "glimpse_tower.dat";
+    private const string FineLocalizationFileName = "fine_localization.dat";
+
+    /// <summary>Whether <paramref name="directory"/>'s checkpoint has a stride-2 localization level (<see cref="ImageTower.Fine"/>).</summary>
+    public static bool HasFineLocalization(string directory) => File.Exists(Path.Combine(directory, FineLocalizationFileName));
 
     /// <summary>Whether <paramref name="directory"/>'s checkpoint has a separate glimpse tower (<see cref="ImageTower.GlimpseTower"/>).</summary>
     public static bool HasGlimpseTower(string directory) => File.Exists(Path.Combine(directory, GlimpseTowerFileName));
@@ -40,6 +44,7 @@ public static class Checkpoint
         Directory.CreateDirectory(directory);
         imageTower.save(Path.Combine(directory, ImageTowerFileName));
         imageTower.GlimpseTower?.save(Path.Combine(directory, GlimpseTowerFileName));
+        imageTower.Fine?.save(Path.Combine(directory, FineLocalizationFileName));
         File.WriteAllText(Path.Combine(directory, ConfigFileName), JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }));
         vocabulary.Save(Path.Combine(directory, VocabularyFileName));
         embeddings.Save(Path.Combine(directory, EmbeddingsFileName));
@@ -74,6 +79,11 @@ public static class Checkpoint
         imageTower.GlimpseContextMean = config.GlimpseContextMean;
         imageTower.GlimpseCount = config.GlimpseCount;
         imageTower.load(Path.Combine(directory, ImageTowerFileName));
+        if (HasFineLocalization(directory))
+        {
+            imageTower.Fine = imageTower.NewFineLocalization(device);
+            imageTower.Fine.load(Path.Combine(directory, FineLocalizationFileName));
+        }
         if (HasGlimpseTower(directory))
         {
             var glimpseTower = new ImageTower(config.EmbeddingDim, config.StemChannels, config.StageChannels, config.BlocksPerStage, device, config.FusedStages)

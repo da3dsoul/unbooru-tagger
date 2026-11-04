@@ -354,6 +354,46 @@ The dashboard shows how long each step waited on data. If that isn't near zero, 
 fp32. On the B70 it took a run 4 step from 223 to 199 ms, with mAP and gold pointing unchanged in a 6,000-step
 A/B. **It isn't saved in the checkpoint: pass it on every resume.**
 
+### Higher resolution and mixed scales
+
+The cache stores every image at 512px, shrunk with nearest-neighbour sampling. Small objects lose their lines
+there, and tests on the gold originals showed the limit is resolution, not aliasing: real 768/1,024px pixels raised
+small-object pointing 10 to 16 points, a clean 512px shrink didn't
+([research/experiments-localization.md](../research/experiments-localization.md)). Re-pulling every image is too
+big, so chosen rows are re-downloaded into side stores.
+
+**Hi-res stores** (`HiResImageStore`, `unbooru-tagger-core`): a directory holding `store.json`
+(`{"LongSide": 1024}`), `images.bin` (JPEGs, concatenated) and `index.bin` (24-byte records: row, offset, length,
+width, height). Each image is its letterbox content for a `LongSide` canvas, shrunk with Lanczos and kept as JPEG
+(q92, 4:4:4; ~238 KB at 1,024). They're written by `review/hires/pull.py` / `next/pull2.py` (outside git), which
+re-download originals by the crawl's file URLs, check the md5, and keep the site rate limits.
+
+| Option | Purpose |
+|---|---|
+| `--train-input-size N` | Train at N px instead of the cache's size. Cached images are enlarged (Mitchell cubic). |
+| `--hires-store a,b,...` | Stores to read rows from instead of the cache: the smallest that reaches the size, else the largest. Rows a pull appends while training runs are picked up every 5 minutes. |
+| `--train-scales size:batch:share[:stored],...` | Mixed-scale training (below). |
+| `--focus-tags a,b` | With `--focus-share`, draw that share of the anchors from these tags instead of the evaluation's worst. |
+| `--lr-schedule constant` | A fixed `--lr`, which now also overrides the rate saved in the optimizer on a resume. |
+
+**Mixed scales.** With `--train-scales 512:10:0.3,768:5:0.3:0.2,1024:3:0.3:0.3,2048:1:0.1:1`, each micro-batch
+is drawn at one size, by share, with that size's batch:
+
+- `stored` is the share of a batch drawn from rows a store holds at that size or larger; the rest are sampled as
+  usual, and still come from a store when one holds them.
+- A size with `stored` 1 trains only on real pixels, and is skipped while no store holds rows at that size.
+- Each image counts the same in the gradient whatever its batch size. `--batch-size` still sets the epoch length
+  (in micro-batches), and the checkpoint keeps `--train-input-size` (or the cache's size) as its input size.
+- Mosaics need four images per batch, so a batch of 1-3 has none.
+- Every 2,000 steps the log gets a summary: each size's share drawn against the plan, its fitted ms per
+  micro-batch, its loss, the share of its images from a store, rows per store, img/s and VRAM peak.
+
+B70 batches that fit beside run 4's mosaics: 10 at 512, 5 at 768, 3-4 at 1,024, 1-2 at 2,048 (2,048 at batch 1:
+11.9 GB, 399 ms for the tower alone). 4,096 doesn't fit at batch 1.
+
+`evaluate --input-size N --hires-store <dir>` scores the held-out images at N; `--gold-images <dir>
+--gold-input-size N` scores the gold sets from images prepared at N (`review/aliasing/area1024`, from the originals).
+
 ### Glimpses (run 5; off by default)
 
 `--classification-glimpses` (fresh runs only) scores localizable tags from close looks the model chooses:
@@ -400,6 +440,8 @@ dotnet <xpu-build>/unbooru-tagger-training.dll train \
   --context-negative-weight 3 \
   --negative-gamma 2 \
   --bf16 \
+  --train-scales 512:10:0.3,768:5:0.3:0.2,1024:3:0.3:0.3,2048:1:0.1:1 \
+  --hires-store <store768>,<store1024>,<store2048> \
   --tag-parentage <tag-parentage/rules.json> \
   --gold <gold/gold.json> \
   --evaluation-command <evaluate-on-cuda.sh> \
@@ -418,6 +460,8 @@ dotnet <xpu-build>/unbooru-tagger-training.dll train \
 | ~502K | `--tag-parentage`. |
 | 2026-11-02 | The build with run 5's speed work: 221 → 142 ms/step, same recipe. |
 | ~1.78M | Localization pair rows padded to multiples of 64. |
+| ~1.79M | An image's labelled pairs capped at 192, a mosaic tile's pairs from other tiles at 128. |
+| ~2.09M (2026-11-04) | Mixed scales (`--train-scales`) and the hi-res stores; until the 768 and 2,048 stores held rows, `store1024` alone. 206 ms/step, 48 img/s (512 alone: 142 ms, 70 img/s). |
 
 Evaluations stay on one evaluation build, so the trend charts stay comparable. The A/B results behind each flag
 are in [research/](../research/README.md).
@@ -468,6 +512,8 @@ To `--out-dir`, which defaults to the checkpoint directory:
 | `--context-check <file>` | none | Labelled context negatives (`{cacheIndex, tag, label: present\|absent}`). |
 | `--map-score-temperature T` | 0 (off) | Also run the occlusion check scored from the localization map (slow). |
 | `--no-crop-teacher` | off | Skip the crop-teacher check. |
+| `--gold-images <dir> --gold-input-size N` | none | Score the gold sets from images prepared at N px (e.g. from the originals); the checks' batches shrink with N. |
+| `--input-size N`, `--hires-store <dir>` | the checkpoint's | Score the held-out images at N px, rows a store holds from it. |
 | `--show` | 25 | Worst tags to print. |
 
 Diagnostics used in the research:
@@ -504,7 +550,9 @@ In a terminal, `train` shows a full-width panel. It covers:
   - exclusive violations;
   - the occlusion object effect;
   - the context gaps;
-  - the labelled context check's log-odds.
+  - the labelled context check's log-odds;
+  - the gold checks at 1,024px, when the evaluation command wrote them (`at1024/`, `at1024-auto/`): gold and
+    gold-auto pointing by size, gold-small pointing and the object effect.
 
 In a terminal that shows Sixel images (Konsole, xterm, WezTerm, foot, or tmux 3.4+ built with sixel), the charts
 are drawn as an image. Other terminals get braille text charts, as does `--text-dashboard`. With output
@@ -555,6 +603,13 @@ Run 4's real one (`xpu-test/evaluate-on-cuda.sh`, outside git) adds:
 - `exec setsid flock <a4000.lock> ...`. `setsid` keeps a Ctrl+C in the training window from killing a running
   evaluation, and `flock` runs one evaluation on the GPU at a time.
 - If the trainer runs on XPU, `unset LD_LIBRARY_PATH` in a CUDA evaluation script.
+- From 2026-11-04 (mixed scales): after the 512px evaluation, the gold sets again at 1,024 from the originals
+  (`--gold-images review/aliasing/area1024 --gold-input-size 1024`; gold + gold-small into `at1024/`, gold-auto into
+  `at1024-auto/`). It re-runs itself under `flock`, so the 1,024 checks hold the lock too, and writes
+  `evaluate-on-cuda.done`: a restarted trainer relaunches its unfinished evaluations while the old trainer's copies
+  still wait on the lock, and whichever runs second stops there.
+
+Evaluations of experiments should wait while a run's own evaluations are queued, or the trend charts fall hours behind.
 
 **Snapshot evaluations.** `--snapshot-evaluation-steps N` (needs `--evaluation-command`) also evaluates a
 model-only snapshot every N global steps, for the trend charts.

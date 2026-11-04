@@ -39,6 +39,56 @@ public sealed record LocalizationPairs(Tensor TagRows, Tensor Labels, Tensor Wei
 /// </summary>
 public static class LocalizationPairSelector
 {
+    /// <summary>
+    /// Pair widths are rounded up to a multiple of this (the padding at weight 0, as short rows already are). Unrounded, the width is
+    /// the batch's widest image and changes nearly every step; on the B70 each new size makes the caching allocator reserve new blocks
+    /// it never returns, so VRAM ratchets up until a wide step fails (run 4, 2026-11-03: 12 -> 24 GB in 10 minutes, then
+    /// UR_RESULT_ERROR_OUT_OF_RESOURCES / xe "VM worker error: -12" after 40 minutes; run 5's locality term, 2026-11-01, the same).
+    /// </summary>
+    public const int WidthMultiple = 64;
+
+    /// <summary>The widest unrounded pair row seen in this process (for the dashboard).</summary>
+    public static int WidestSeen;
+
+    /// <summary>
+    /// An image's labelled pairs (positives and certain negatives) are capped at this many: every positive is kept, and the
+    /// certain negatives are sampled down to the room left, their weights scaled by (all / kept) so the image's expected
+    /// negative loss is unchanged. Padding alone didn't bound the peak: some images carry hundreds of certain negatives
+    /// (context negatives of a character with many context targets, an excludes rule over a whole family), the widest row
+    /// seen was 788, and each wider bucket reserved more VRAM (an A/B arm reached 29.4 of 32 GB, 2026-11-03).
+    /// </summary>
+    public const int MaxLabelledPairs = 192;
+
+    /// <summary>Images whose labelled pairs were sampled down by <see cref="CapLabelled"/> in this process.</summary>
+    public static long CappedImages;
+
+    /// <summary>
+    /// <paramref name="pairs"/> capped at <paramref name="cap"/> (see <see cref="MaxLabelledPairs"/>): all positives
+    /// (label &gt; 0 at <paramref name="offset"/>), then a random sample of the rest. Returns the kept pairs and the weight
+    /// scale for the kept non-positives (1 when nothing was dropped).
+    /// </summary>
+    public static (List<int> Kept, float NegativeScale) CapLabelled(List<int> pairs, float[] labels, int offset, int cap = MaxLabelledPairs)
+    {
+        if (pairs.Count <= cap)
+            return (pairs, 1f);
+        var positives = pairs.Where(t => labels[offset + t] > 0).ToList();
+        var negatives = pairs.Where(t => labels[offset + t] <= 0).ToList();
+        var room = Math.Max(0, cap - positives.Count);
+        if (negatives.Count <= room)
+            return (pairs, 1f);
+        Interlocked.Increment(ref CappedImages);
+        var kept = negatives.OrderBy(_ => Random.Shared.Next()).Take(room).ToList();
+        return ([.. positives, .. kept], room > 0 ? (float)negatives.Count / room : 0f);
+    }
+
+    /// <summary><paramref name="width"/> rounded up to <see cref="WidthMultiple"/>, recording the widest seen.</summary>
+    public static int Padded(int width)
+    {
+        if (width > WidestSeen)
+            WidestSeen = width;
+        return (Math.Max(1, width) + WidthMultiple - 1) / WidthMultiple * WidthMultiple;
+    }
+
     /// <param name="targets">This batch's per-pair targets (CPU).</param>
     /// <param name="wholeImageLogits">[batch × vocabulary] whole-image logits, row-major — only used to rank negatives.</param>
     /// <param name="localizable">Per vocabulary row: whether the tag has a region to point at.</param>
@@ -51,6 +101,8 @@ public static class LocalizationPairSelector
         var focal = targets.FocalMask.data<float>().ToArray();
 
         var perImage = new List<int>[batch];
+        var negativeScale = new float[batch];
+        var labelledCount = new int[batch];
         for (var i = 0; i < batch; i++)
         {
             var offset = i * vocabularySize;
@@ -66,6 +118,8 @@ public static class LocalizationPairSelector
                 else
                     candidates.Add(t);
             }
+            (chosen, negativeScale[i]) = CapLabelled(chosen, labels, offset);
+            labelledCount[i] = chosen.Count;
 
             if (minedNegatives > 0 && candidates.Count > 0)
                 chosen.AddRange(candidates
@@ -74,7 +128,7 @@ public static class LocalizationPairSelector
             perImage[i] = chosen;
         }
 
-        var width = Math.Max(1, perImage.Max(p => p.Count));
+        var width = Padded(perImage.Max(p => p.Count));
         var tagRows = new long[batch * width];
         var pairLabels = new float[batch * width];
         var pairWeights = new float[batch * width];
@@ -89,7 +143,8 @@ public static class LocalizationPairSelector
                 var target = i * width + k;
                 tagRows[target] = t;
                 pairLabels[target] = labels[source];
-                pairWeights[target] = weights[source];
+                // Certain negatives sampled down by CapLabelled count for the ones dropped (mined negatives, after them, don't).
+                pairWeights[target] = weights[source] * (k < labelledCount[i] && labels[source] <= 0 ? negativeScale[i] : 1f);
                 pairFocal[target] = focal[source];
                 if (labels[source] > 0)
                     positiveWeightSum += weights[source];
@@ -119,6 +174,7 @@ public static class LocalizationPairSelector
         var device = scores.device;
 
         var perImage = new List<int>[batch];
+        var negativeScale = new float[batch];
         var candidates = new bool[batch * vocabularySize];
         for (var i = 0; i < batch; i++)
         {
@@ -134,9 +190,10 @@ public static class LocalizationPairSelector
                 else
                     candidates[index] = true;
             }
+            (perImage[i], negativeScale[i]) = CapLabelled(perImage[i], labels, offset);
         }
 
-        var width = Math.Max(1, perImage.Max(p => p.Count));
+        var width = Padded(perImage.Max(p => p.Count));
         var tagRows = new long[batch * width];
         var pairLabels = new float[batch * width];
         var pairWeights = new float[batch * width];
@@ -151,7 +208,7 @@ public static class LocalizationPairSelector
                 var target = i * width + k;
                 tagRows[target] = t;
                 pairLabels[target] = labels[source];
-                pairWeights[target] = weights[source];
+                pairWeights[target] = weights[source] * (labels[source] <= 0 ? negativeScale[i] : 1f);
                 pairFocal[target] = focal[source];
                 if (labels[source] > 0)
                     positiveWeightSum += weights[source];
@@ -168,7 +225,10 @@ public static class LocalizationPairSelector
             using var scope = NewDisposeScope();
             using var _ = no_grad();
             var candidateMask = tensor(candidates, [batch, vocabularySize]).Upload(device);
-            var (values, mined) = scores.detach().masked_fill(candidateMask.logical_not(), float.NegativeInfinity).topk(Math.Min(minedNegatives, vocabularySize), 1);
+            // An explicit, scoped Scalar: run 4 died once (2026-11-04, ~2.07M steps) in masked_fill's Scalar::toFloat check, as if
+            // the implicitly converted Scalar had been finalized while the native call still used it.
+            using TorchSharp.Scalar negativeInfinity = float.NegativeInfinity;
+            var (values, mined) = scores.detach().masked_fill(candidateMask.logical_not(), negativeInfinity).topk(Math.Min(minedNegatives, vocabularySize), 1);
             var real = values.isfinite().to_type(ScalarType.Float32);
             var combined = (
                 cat([rows, mined], 1),

@@ -23,6 +23,8 @@ public static class ImageTowerOnnxExporter
 
     public static void Export(ImageTower tower, string outputPath, int inputSize)
     {
+        if (tower.Fine is not null)
+            throw new NotSupportedException("No ONNX export is defined for the stride-2 localization level (--fine-localization) yet.");
         var graph = new GraphProto { Name = "image_tower" };
         var names = new NameAllocator();
 

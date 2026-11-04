@@ -19,6 +19,12 @@ public static class Mosaic
 {
     public const int TilesPerMosaic = 4;
 
+    /// <summary>Tiles on a <paramref name="grid"/> x <paramref name="grid"/> canvas (<c>--mosaic-large-grid</c>: 3x3 canvases of quarter-size images).</summary>
+    public static int TilesOf(int grid) => grid * grid;
+
+    /// <summary>A tile's pairs from the other tiles' positives are capped at this many (<see cref="LocalizationPairSelector.CapLabelled"/>).</summary>
+    public const int MaxOtherTilePairs = 128;
+
     /// <summary>
     /// Distinct batch images for up to <paramref name="mosaics"/> mosaics, four per mosaic in
     /// tile order (top-left, top-right, bottom-left, bottom-right); fewer mosaics if the
@@ -27,45 +33,70 @@ public static class Mosaic
     /// tile, not on her".
     /// </summary>
     /// <param name="sampled">Why each batch image is there, in batch order; null = pick at random.</param>
-    public static int[] PickTiles(int batchSize, int mosaics, Random random, IReadOnlyList<SampledImage>? sampled = null, IReadOnlySet<int>? focus = null)
+    public static int[] PickTiles(int batchSize, int mosaics, Random random, IReadOnlyList<SampledImage>? sampled = null, IReadOnlySet<int>? focus = null, int grid = 2)
     {
-        var count = Math.Min(mosaics, batchSize / TilesPerMosaic) * TilesPerMosaic;
+        var perMosaic = TilesOf(grid);
+        var count = Math.Min(mosaics, batchSize / perMosaic) * perMosaic;
         IEnumerable<int> order = Enumerable.Range(0, batchSize).OrderBy(_ => random.Next()).ToList();
         if (sampled is not null && focus is { Count: > 0 })
             order = order.OrderBy(i => focus.Contains(sampled[i].AnchorTag) ? 0 : 1)
                 .ThenBy(i => focus.Contains(sampled[i].AnchorTag) ? sampled[i].AnchorTag : 0)
                 .ThenBy(i => sampled[i].IsHardNegative ? 1 : 0);
         // Each canvas's tiles in random places, so a group's positives don't always sit top-left.
-        return order.Take(count).Chunk(TilesPerMosaic).SelectMany(tiles => tiles.OrderBy(_ => random.Next())).ToArray();
+        return order.Take(count).Chunk(perMosaic).SelectMany(tiles => tiles.OrderBy(_ => random.Next())).ToArray();
     }
 
     /// <summary>
-    /// Where an image's content lands on the canvas as tile <paramref name="tile"/> (0-3, row-major),
-    /// each tile <paramref name="tileSize"/> pixels square (half the input size, or all of it).
+    /// Where an image's content lands on the canvas as tile <paramref name="tile"/> (0-3 on a 2x2 grid, row-major),
+    /// each tile <paramref name="tileSize"/> pixels square (half the input size, or all of it; a quarter on a 3x3 grid).
     /// </summary>
-    public static LetterboxBox TileBox(LetterboxBox content, int tile, int inputSize, int? tileSize = null)
+    public static LetterboxBox TileBox(LetterboxBox content, int tile, int inputSize, int? tileSize = null, int grid = 2)
     {
         var size = tileSize ?? inputSize / 2;
-        var (offsetX, offsetY) = (tile % 2 * size, tile / 2 * size);
+        var (offsetX, offsetY) = (tile % grid * size, tile / grid * size);
         return new LetterboxBox(offsetX + content.X * size / inputSize, offsetY + content.Y * size / inputSize,
             Math.Max(1, content.Width * size / inputSize), Math.Max(1, content.Height * size / inputSize));
     }
 
     /// <summary>
-    /// [mosaics, 3, 2·tile, 2·tile] canvases from <paramref name="pixels"/> ([batch, 3, size, size]): each
-    /// image 2x2 average-pooled into its tile (<paramref name="tileSize"/> = half the input, the default),
-    /// or at full size on a canvas twice the input's side.
+    /// [mosaics, 3, grid·tile, grid·tile] canvases from <paramref name="pixels"/> ([batch, 3, size, size]): each
+    /// image average-pooled into its tile (<paramref name="tileSize"/> = half the input, the default, or a quarter),
+    /// or at full size on a canvas <paramref name="grid"/> times the input's side.
     /// </summary>
-    public static Tensor Compose(Tensor pixels, int[] tileImages, int inputSize, int? tileSize = null)
+    public static Tensor Compose(Tensor pixels, int[] tileImages, int inputSize, int? tileSize = null, int grid = 2)
     {
-        var mosaics = tileImages.Length / TilesPerMosaic;
+        var mosaics = tileImages.Length / TilesOf(grid);
         var size = tileSize ?? inputSize / 2;
-        if (size != inputSize && size * 2 != inputSize)
-            throw new ArgumentException($"A tile is half the input size or all of it, not {size} of {inputSize}.", nameof(tileSize));
+        if (size != inputSize && size * 2 != inputSize && size * 4 != inputSize)
+            throw new ArgumentException($"A tile is all of the input, half or a quarter of it, not {size} of {inputSize}.", nameof(tileSize));
         var selected = pixels.index_select(0, tensor(tileImages.Select(i => (long)i).ToArray()).Upload(pixels.device));
-        var tiles = size == inputSize ? selected : nn.functional.avg_pool2d(selected, 2);
-        // [M*4, 3, t, t] -> [M, 2 rows, 2 cols, 3, t, t] -> [M, 3, 2 rows, t, 2 cols, t] -> [M, 3, 2t, 2t]
-        return tiles.reshape([mosaics, 2, 2, 3, size, size]).permute(0, 3, 1, 4, 2, 5).reshape([mosaics, 3, 2 * size, 2 * size]);
+        var tiles = size == inputSize ? selected : nn.functional.avg_pool2d(selected, inputSize / size);
+        // [M*g², 3, t, t] -> [M, g rows, g cols, 3, t, t] -> [M, 3, g rows, t, g cols, t] -> [M, 3, gt, gt]
+        return tiles.reshape([mosaics, grid, grid, 3, size, size]).permute(0, 3, 1, 4, 2, 5).reshape([mosaics, 3, grid * size, grid * size]);
+    }
+
+    /// <summary>
+    /// Each tile's own square of its canvas's map (tile k is on canvas k / g², row-major), and of <paramref name="tileMask"/>
+    /// ([tiles, 1, side, side], zero outside each tile's square), for the localization loss: the same loss as over the whole
+    /// canvas, since the mask leaves only the tile's locations, over a g²-th of them.
+    /// </summary>
+    public static (FineLocalizationMap Maps, Tensor Mask) TileCrops(FineLocalizationMap canvases, Tensor tileMask, int grid = 2)
+    {
+        var side = canvases.Features.shape[2];
+        var cells = side / grid;
+        var tiles = tileMask.shape[0];
+        var maps = new List<FineLocalizationMap>();
+        var masks = new List<Tensor>();
+        for (var k = 0; k < tiles; k++)
+        {
+            var position = k % TilesOf(grid);
+            var (top, left) = (position / grid * cells, position % grid * cells);
+            maps.Add(canvases.Crop(k / TilesOf(grid), top, left, cells));
+            masks.Add(tileMask.narrow(0, k, 1).narrow(2, top, cells).narrow(3, left, cells));
+        }
+        var first = maps[0];
+        return (first with { Coarse = cat(maps.Select(m => m.Coarse).ToList(), 0), Features = cat(maps.Select(m => m.Features).ToList(), 0) },
+            cat(masks, 0));
     }
 
     /// <summary>
@@ -90,8 +121,9 @@ public static class Mosaic
     /// targets row (usually a negative; a positive if this image carries the tag too; skipped
     /// if its weight is 0, e.g. a likely-missing label). All on the CPU, [tiles, width].
     /// </summary>
-    public static LocalizationPairs TilePairs(LocalizationPairs imagePairs, PairTargets targets, int[] tileImages)
+    public static LocalizationPairs TilePairs(LocalizationPairs imagePairs, PairTargets targets, int[] tileImages, int grid = 2)
     {
+        var perMosaic = TilesOf(grid);
         var width = (int)imagePairs.TagRows.shape[1];
         var vocabularySize = (int)targets.Labels.shape[1];
         var rows = imagePairs.TagRows.data<long>().ToArray();
@@ -104,21 +136,27 @@ public static class Mosaic
         List<int> Positives(int image) => Own(image).Where(t => labels[image * vocabularySize + t] > 0).ToList();
 
         var perTile = new List<int>[tileImages.Length];
+        var scale = new float[tileImages.Length];
+        var ownCount = new int[tileImages.Length];
         for (var k = 0; k < tileImages.Length; k++)
         {
             var image = tileImages[k];
             var tags = Own(image);
             var seen = tags.ToHashSet();
-            var first = k / TilesPerMosaic * TilesPerMosaic;
-            for (var other = first; other < first + TilesPerMosaic; other++)
+            var others = new List<int>();
+            var first = k / perMosaic * perMosaic;
+            for (var other = first; other < first + perMosaic; other++)
                 if (other != k)
                     foreach (var t in Positives(tileImages[other]))
                         if (weights[image * vocabularySize + t] > 0 && seen.Add(t))
-                            tags.Add(t);
+                            others.Add(t);
+            (others, scale[k]) = LocalizationPairSelector.CapLabelled(others, labels, image * vocabularySize, MaxOtherTilePairs);
+            ownCount[k] = tags.Count;
+            tags.AddRange(others);
             perTile[k] = tags;
         }
 
-        var tileWidth = Math.Max(1, perTile.Max(p => p.Count));
+        var tileWidth = LocalizationPairSelector.Padded(perTile.Max(p => p.Count));
         var tagRows = new long[tileImages.Length * tileWidth];
         var tileLabels = new float[tileImages.Length * tileWidth];
         var tileWeights = new float[tileImages.Length * tileWidth];
@@ -133,7 +171,7 @@ public static class Mosaic
                 var target = k * tileWidth + j;
                 tagRows[target] = t;
                 tileLabels[target] = labels[source];
-                tileWeights[target] = weights[source];
+                tileWeights[target] = weights[source] * (j >= ownCount[k] && labels[source] <= 0 ? scale[k] : 1f);
                 tileFocal[target] = focal[source];
                 if (labels[source] > 0)
                     positiveWeightSum += weights[source];
@@ -150,8 +188,9 @@ public static class Mosaic
     /// out on the CPU; one of its mined negatives repeated as another tile's positive gets weight 0 on the device.
     /// </summary>
     /// <param name="imageLabelled">Each image's labelled pairs (positives and certain negatives).</param>
-    public static LocalizationPairs TilePairsOnDevice(LocalizationPairs imagePairs, List<int>[] imageLabelled, PairTargets cpuTargets, int[] tileImages)
+    public static LocalizationPairs TilePairsOnDevice(LocalizationPairs imagePairs, List<int>[] imageLabelled, PairTargets cpuTargets, int[] tileImages, int grid = 2)
     {
+        var perMosaic = TilesOf(grid);
         var device = imagePairs.TagRows.device;
         var vocabularySize = (int)cpuTargets.Labels.shape[1];
         var labels = cpuTargets.Labels.data<float>().ToArray();
@@ -160,6 +199,7 @@ public static class Mosaic
         List<int> Positives(int image) => imageLabelled[image].Where(t => labels[image * vocabularySize + t] > 0).ToList();
 
         var extra = new List<int>[tileImages.Length];
+        var scale = new float[tileImages.Length];
         var positiveWeightSum = 0f;
         for (var k = 0; k < tileImages.Length; k++)
         {
@@ -167,19 +207,19 @@ public static class Mosaic
             positiveWeightSum += Positives(image).Sum(t => weights[image * vocabularySize + t]);
             var seen = imageLabelled[image].ToHashSet();
             extra[k] = [];
-            var first = k / TilesPerMosaic * TilesPerMosaic;
-            for (var other = first; other < first + TilesPerMosaic; other++)
+            var first = k / perMosaic * perMosaic;
+            for (var other = first; other < first + perMosaic; other++)
                 if (other != k)
                     foreach (var t in Positives(tileImages[other]))
                         if (weights[image * vocabularySize + t] > 0 && seen.Add(t))
-                        {
                             extra[k].Add(t);
-                            if (labels[image * vocabularySize + t] > 0)
-                                positiveWeightSum += weights[image * vocabularySize + t];
-                        }
+            (extra[k], scale[k]) = LocalizationPairSelector.CapLabelled(extra[k], labels, image * vocabularySize, MaxOtherTilePairs);
+            foreach (var t in extra[k])
+                if (labels[image * vocabularySize + t] > 0)
+                    positiveWeightSum += weights[image * vocabularySize + t];
         }
 
-        var extraWidth = Math.Max(1, extra.Max(p => p.Count));
+        var extraWidth = LocalizationPairSelector.Padded(extra.Max(p => p.Count));
         var tagRows = new long[tileImages.Length * extraWidth];
         var tileLabels = new float[tileImages.Length * extraWidth];
         var tileWeights = new float[tileImages.Length * extraWidth];
@@ -193,7 +233,7 @@ public static class Mosaic
                 var target = k * extraWidth + j;
                 tagRows[target] = t;
                 tileLabels[target] = labels[source];
-                tileWeights[target] = weights[source];
+                tileWeights[target] = weights[source] * (labels[source] <= 0 ? scale[k] : 1f);
                 tileFocal[target] = focal[source];
             }
 

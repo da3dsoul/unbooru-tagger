@@ -184,15 +184,29 @@ had it deleted ("V5 was a mistake"). See [experiments-glimpses.md](experiments-g
 
 See [experiments-window-labels.md](experiments-window-labels.md).
 
-## Current work (11-03)
+## Resolution, not aliasing: hi-res stores and mixed scales (11-03 to 11-04)
 
-- Run 4 is training on the B70, under the watchdog.
-- Measurement work:
-  - pointing split by size, with a 16px-tolerant variant;
-  - where the misses land;
-  - a SAM 3 pass over 3,243 held-out images to measure missing labels. In progress: 1,793 images had SAM 3 boxes
-    when this was written; no analysis results are recorded yet.
+- **11-03:** a 2x zoom of the gold images at evaluation raised small-object pointing 6-12 points: the object's pixels,
+  not the map's grid, limit small objects.
+- **11-04 night:** the gold originals (1,435, downloaded with the maintainer's approval) separated the cache's
+  nearest-neighbour aliasing from resolution. A clean 512px shrink scored like the cache; real 768/1,024px pixels
+  gained 10-16 points. Lanczos was chosen for the stores.
+- **11-04:** fine-tuning run 4 at 768/1,024 (from the cache, enlarged) kept mAP and gained 10-20 points on small
+  objects, losing up to 7 on large ones. A ≤1-day pull of six weak small-object tags' originals at 1,024
+  (`store1024`, ~192K rows) raised those tags' AP in proportion to coverage (wristband 0.47 → 0.61). A model
+  trained only on enlarged images gained nothing from real pixels at test time.
+- **11-04 13:13:** run 4 moved to mixed scales (`--train-scales`: 512/768/1,024/2,048 per micro-batch) with the store,
+  and a second pull was queued: 38K collage/crowd/comic images at 2,048, 310K small-object images at 1,024 (the six
+  tags plus ~19 more), 36K medium-object images at 768. Snapshot evaluations add the gold checks at 1,024.
 
-  See [experiments-measurement.md](experiments-measurement.md#pointing-by-size-tolerant-pointing-and-where-misses-land).
-- The self-map, map-window-check and peak-window-score code (`SelfMapWindows.cs`, `MapWindowCheck.cs`,
-  `PeakWindowScores.cs`) is in the working tree, uncommitted, at the time of writing.
+See [experiments-localization.md](experiments-localization.md#aliasing-or-resolution-the-gold-originals-2026-11-04).
+
+## Current work (11-04)
+
+- Run 4 is training on mixed scales on the B70, under the watchdog. The 768 and 2,048 stores join it once the second
+  pull has rows in them.
+- The plan is to gather resolution where evaluations show weakness: by tag (small objects at 1,024, medium at 768)
+  and by kind of image (collages, comics, crowds at 2,048), and to adjust the scale mix as the 1,024 trend charts
+  and per-tag AP move.
+- Open: whether 2,048 gains over 1,024 on the gold images that have originals that large (scoring in progress); the
+  occlusion object effect falls a little at higher input sizes (1.32 → 1.17), not yet explained.

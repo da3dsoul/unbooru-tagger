@@ -6,7 +6,10 @@ using UnbooruTagger.Training.Training;
 namespace UnbooruTagger.Training.Data;
 
 /// <summary>A batch to load: dataset image indices, plus (for tag-centric training) why each image was sampled.</summary>
-public sealed record BatchRequest(int[] Images, SampledImage[]? Sampled = null);
+/// <param name="InputSize">The canvas to load it at (mixed-scale training, <see cref="Training.TrainingScales"/>); 0 = the prefetcher's.</param>
+/// <param name="FromStore">How many of its images a hi-res store holds (read from it, not the cache); for the dashboard.</param>
+/// <param name="DrawnStored">How many were drawn from stored rows (<see cref="Training.TrainingScale.StoredShare"/>) rather than sampled.</param>
+public sealed record BatchRequest(int[] Images, SampledImage[]? Sampled = null, int InputSize = 0, int FromStore = 0, int DrawnStored = 0);
 
 /// <summary>A loaded batch: NCHW pixels (normalized, padded) and each image's letterbox content box.</summary>
 /// <param name="Pinned">With the prefetcher's <c>pin</c>: the pixels as a pinned host tensor instead ([batch, 3, S, S]; <see cref="Pixels"/> is
@@ -40,6 +43,19 @@ public sealed class BatchPrefetcher : IDisposable
     public BatchPrefetcher(
         IEnumerable<BatchRequest> requests,
         Func<IReadOnlyList<int>, EncodedImage[]> readWindow,
+        int inputSize,
+        int windowBatches = 8,
+        int capacityBatches = 16,
+        bool pin = false)
+        : this(requests, (images, _) => readWindow(images), inputSize, windowBatches, capacityBatches, pin)
+    {
+    }
+
+    /// <param name="readWindow">Reads images letterboxed for the given canvas size: a request's
+    /// <see cref="BatchRequest.InputSize"/>, or <paramref name="inputSize"/> when it has none.</param>
+    public BatchPrefetcher(
+        IEnumerable<BatchRequest> requests,
+        Func<IReadOnlyList<int>, int, EncodedImage[]> readWindow,
         int inputSize,
         int windowBatches = 8,
         int capacityBatches = 16,
@@ -87,9 +103,8 @@ public sealed class BatchPrefetcher : IDisposable
         return false;
     }
 
-    private void Produce(IEnumerable<BatchRequest> requests, Func<IReadOnlyList<int>, EncodedImage[]> readWindow, int inputSize, int windowBatches)
+    private void Produce(IEnumerable<BatchRequest> requests, Func<IReadOnlyList<int>, int, EncodedImage[]> readWindow, int defaultSize, int windowBatches)
     {
-        var imageFloats = 3 * inputSize * inputSize;
         try
         {
             using var enumerator = requests.GetEnumerator();
@@ -102,23 +117,25 @@ public sealed class BatchPrefetcher : IDisposable
                 if (window.Count == 0)
                     break;
 
-                var allImages = window.SelectMany(r => r.Images).ToArray();
-                var encoded = readWindow(allImages);
-
-                var cursor = 0;
+                // One read per canvas size in the window (one in all unless training mixes scales), in request order.
+                var encodedBySize = window.GroupBy(SizeOf).ToDictionary(g => g.Key, g => readWindow(g.SelectMany(r => r.Images).ToArray(), g.Key));
+                var cursors = encodedBySize.Keys.ToDictionary(size => size, _ => 0);
                 foreach (var request in window)
                 {
+                    var inputSize = SizeOf(request);
+                    var imageFloats = 3 * inputSize * inputSize;
+                    var encoded = encodedBySize[inputSize];
                     var count = request.Images.Length;
                     var pixels = new float[count * imageFloats];
                     var boxes = new LetterboxBox[count];
-                    var first = cursor;
+                    var first = cursors[inputSize];
                     Parallel.For(0, count, i =>
                     {
                         var image = encoded[first + i];
                         boxes[i] = image.Content;
                         ImagePreprocessing.ReconstructInto(image, inputSize, pixels.AsSpan(i * imageFloats, imageFloats));
                     });
-                    cursor += count;
+                    cursors[inputSize] += count;
 
                     // Pinned here, off the training thread: copying 31 MB into pinned memory took ~12 ms of a step's CPU time,
                     // while the device sat idle after each read back.
@@ -141,6 +158,8 @@ public sealed class BatchPrefetcher : IDisposable
         {
             _ready.CompleteAdding();
         }
+
+        int SizeOf(BatchRequest request) => request.InputSize > 0 ? request.InputSize : defaultSize;
     }
 
     public void Dispose()
