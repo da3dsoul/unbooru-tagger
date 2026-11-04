@@ -18,7 +18,8 @@ ONNX Runtime, from one command-line tool. There is no Python in the repository.
 ### Example
 
 Run 4's model on one image from the hand-checked gold set: the gold boxes (left) and the model's heatmap for each of
-the image's tags (right; one hue per tag, opaque at its strongest evidence, + at its peak). The gold set mostly overlaps
+the image's tags (right; one hue per tag, opaque at its strongest evidence and mixed where tags overlap, + at its peak, the
+gold boxes on top). The gold set mostly overlaps
 run 4's training split, so this shows what the output looks like, not held-out accuracy. Artwork by **hiyuu (hiyualice)**
 ([Danbooru post 6776791](https://danbooru.donmai.us/posts/6776791)). Twelve more, failures included:
 [docs/EXAMPLES.md](docs/EXAMPLES.md).

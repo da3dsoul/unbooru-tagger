@@ -2,11 +2,12 @@
 
 Twelve images from the hand-checked gold set, scored by run 4 at step 2.12M (`model-v4-s2.12M`, the first hours of
 mixed-scale training). Left: the gold boxes (solid: certain, dashed: unsure, dotted: a group). Right: the model's heatmap
-for each of the image's gold tags, drawn over the image.
+for each of the image's gold tags, drawn over the image, with the same gold boxes on top.
 
 How to read them:
 
-- **Each tag has its own hue**, the same in both panels, spread over the spectrum in name order.
+- **Each tag has its own hue**, the same in both panels, spread over the spectrum in name order. Where two tags' maps overlap,
+  their hues mix by strength (blush over glasses reads yellow-green).
 - **Opacity is the tag's evidence near its peak:** a cell is opaque at the tag's highest log-odds and clear 4 log-odds below
   it. This is the band `detect` now cuts its boxes from (see below).
 - **+ marks each tag's peak.** Pointing (does the peak land in a gold box?) is the headline localization number in the
