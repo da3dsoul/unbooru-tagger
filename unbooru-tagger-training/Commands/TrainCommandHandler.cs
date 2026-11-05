@@ -376,6 +376,8 @@ public static class TrainCommandHandler
                 (targetOptions.ErasurePairsPerStep > 0, "--erasure-pairs-per-step"),
                 (targetOptions.TwinPaste > 0, "--twin-paste"),
                 (targetOptions.SelfMapWeight > 0, "--self-map-weight"),
+                (targetOptions.CharacterExtentWeight > 0, "--character-extent-weight"),
+                (targetOptions.CharacterHideWeight > 0, "--character-hide-weight"),
             };
             if (readers.FirstOrDefault(r => r.On) is { On: true } reader)
                 throw new ArgumentException($"--fine-localization doesn't support {reader.Option}: it reads the localization map, which training keeps in parts with a fine level.");
@@ -601,6 +603,25 @@ public static class TrainCommandHandler
                 $", weight {targetOptions.ErasureWeight}" + (targetOptions.ErasureAnchorWeight > 0 ? $", control held to the unblanked score at weight {targetOptions.ErasureAnchorWeight}" : "") + $", filled with {string.Join("/", targetOptions.ErasureFills).ToLowerInvariant()}."));
         }
 
+        var isCharacter = vocabulary.Records.OrderBy(r => r.RowIndex).Select(r => TagScorer.IsCharacter(r.Tag)).ToArray();
+        var soloRow = vocabulary.TryGet("solo", out var soloRecord) ? soloRecord.RowIndex : -1;
+        if (targetOptions.CharacterExtentWeight > 0 || targetOptions.CharacterHideWeight > 0)
+        {
+            if (!targetOptions.DeliberateTargets || localizationWeight <= 0 || imageTower.ClassificationGlimpses)
+                throw new ArgumentException("--character-extent-weight / --character-hide-weight train the localization map: they need deliberate targets, --localization-weight > 0 and no --classification-glimpses.");
+            if (soloRow < 0)
+                throw new ArgumentException("--character-extent-weight / --character-hide-weight pick images labelled solo, which isn't in the vocabulary.");
+            if (targetOptions.CharacterExtentWeight > 0)
+                AnsiConsole.MarkupLine(Markup.Escape(
+                    $"Character extent: on images labelled solo with one character, the cells within {CharacterExtent.FigureBand} log-odds of one of its other labelled localizable tags' peaks are the figure; " +
+                    $"the character's map is pushed to hold them within {CharacterExtent.ExtentBand} of its peak and the rest below (a {CharacterExtent.IgnoreRing}-cell ring ignored), weight {targetOptions.CharacterExtentWeight}."));
+            if (targetOptions.CharacterHideWeight > 0)
+                AnsiConsole.MarkupLine(Markup.Escape(
+                    $"Character hide-and-seek: up to {targetOptions.CharacterHidePerStep} solo one-character images per micro-batch with the region the character's map points at blanked (at most {ErasureContrast.MaxAreaFraction:P0} of the image), the character a positive bag on that view's map, weight {targetOptions.CharacterHideWeight}."));
+        }
+        long characterExtentImages = 0, characterHiddenImages = 0;
+        var characterRandom = new Random();
+
         if (targetOptions.TwinPaste > 0 && targetOptions.TwinEvery <= 0)
             throw new ArgumentException("--twin-paste pastes into matched twins; it needs --twin-every > 0.");
         if (targetOptions.SelfMapWeight > 0)
@@ -707,7 +728,7 @@ public static class TrainCommandHandler
                     if (added > 0)
                     {
                         storedPools = null;
-                        prefetcherLog.Enqueue(Markup.Escape($"hi-res stores: {added:N0} new rows ({string.Join(", ", hiResStores.Select(store => $"{store.LongSide}px {store.Count:N0}"))})"));
+                        prefetcherLog.Enqueue(Markup.Escape($"hi-res stores: {added:N0} rows added or skipped ({string.Join(", ", hiResStores.Select(store => $"{store.LongSide}px {store.Count:N0}"))})"));
                     }
                 }
 
@@ -1451,6 +1472,63 @@ public static class TrainCommandHandler
                         sparseLocalized = localized;
                         profiler?.Mark("localization loss", loss);
 
+                        // Characters' maps cover the character, not only the face (CharacterExtent).
+                        if (targetOptions.CharacterExtentWeight > 0)
+                        {
+                            var extentImages = CharacterExtent.Select(cpuTargets, localizable, isCharacter, soloRow, max: 0, needOthers: true, characterRandom);
+                            if (extentImages.Count > 0)
+                            {
+                                loss += targetOptions.CharacterExtentWeight * CharacterExtent.ExtentTerm(localizationMap, spatialMask, tagEmbeddings, logitScaleBias, extentImages);
+                                characterExtentImages += extentImages.Count;
+                            }
+                            profiler?.Mark("character extent", loss);
+                        }
+                        if (targetOptions.CharacterHideWeight > 0)
+                        {
+                            var hideImages = CharacterExtent.Select(cpuTargets, localizable, isCharacter, soloRow, targetOptions.CharacterHidePerStep, needOthers: false, characterRandom);
+                            if (hideImages.Count > 0)
+                            {
+                                // The region comes from the character's own map, detached (read back: the rectangles are cut on the CPU).
+                                var grid = (int)localizationMap.shape[2];
+                                var cells = grid * grid;
+                                var cellSize = stepSize / grid;
+                                float[] heat;
+                                using (no_grad())
+                                {
+                                    using var images = tensor(hideImages.Select(h => (long)h.Image).ToArray(), device: device);
+                                    using var rows = tensor(hideImages.Select(h => (long)h.Character).ToArray(), device: device);
+                                    heat = (localizationMap.detach().index_select(0, images) * tagEmbeddings.detach().index_select(0, rows).unsqueeze(2).unsqueeze(3))
+                                        .sum(1).to_type(ScalarType.Float32).cpu().data<float>().ToArray();
+                                }
+                                using var cpuMask = SpatialMask.Build(boxes, stepSize, grid, grid);
+                                var validCells = cpuMask.data<float>().ToArray();
+                                var kept = new List<CharacterExtentImage>();
+                                var regions = new List<int[]>();
+                                for (var k = 0; k < hideImages.Count; k++)
+                                {
+                                    var image = hideImages[k].Image;
+                                    var content = new[] { boxes[image].X, boxes[image].Y, boxes[image].Width, boxes[image].Height };
+                                    var valid = validCells.AsSpan(image * cells, cells).ToArray().Select(v => v > 0).ToArray();
+                                    if (ErasureContrast.Region(heat.AsSpan(k * cells, cells).ToArray(), valid, grid, cellSize, content) is { } region)
+                                    {
+                                        kept.Add(hideImages[k]);
+                                        regions.Add(region);
+                                    }
+                                }
+                                if (kept.Count > 0)
+                                {
+                                    using var hidden = CharacterExtent.Hidden(pixelBatch, kept, regions, stepSize,
+                                        kept.Select(_ => OcclusionFills.Training[characterRandom.Next(OcclusionFills.Training.Length)]).ToList());
+                                    using var hiddenRows = tensor(kept.Select(h => (long)h.Image).ToArray(), device: device);
+                                    using var hiddenMask = spatialMask.index_select(0, hiddenRows);
+                                    var (_, hiddenMap) = imageTower.ForwardPooled(hidden, hiddenMask);
+                                    loss += targetOptions.CharacterHideWeight * CharacterExtent.HideTerm(hiddenMap, hiddenMask, tagEmbeddings, logitScaleBias, kept, (float)localizationTemperature);
+                                    characterHiddenImages += kept.Count;
+                                }
+                            }
+                            profiler?.Mark("character hide-and-seek", loss);
+                        }
+
                         // Crop consistency: the classifier, shown a crop without gradients, says
                         // whether each positive tag is inside that window; the localization map
                         // pooled over the window learns to agree (ComputeWindowConsistency).
@@ -1759,6 +1837,8 @@ public static class TrainCommandHandler
                             dashboard.Log(Markup.Escape($"localization pairs: widest row {LocalizationPairSelector.WidestSeen} so far (rows padded to multiples of {LocalizationPairSelector.WidthMultiple}; {LocalizationPairSelector.CappedImages:N0} image or tile rows sampled down to the cap)"));
                         if (erasureTotal > 0)
                             dashboard.Log(Markup.Escape($"erased views: {erasureTotal:N0} pairs so far, {(double)erasureOnOther / erasureTotal:P0} with the control on another tag"));
+                        if (targetOptions.CharacterExtentWeight > 0 || targetOptions.CharacterHideWeight > 0)
+                            dashboard.Log(Markup.Escape($"characters: {characterExtentImages:N0} solo images trained for extent, {characterHiddenImages:N0} hidden views so far"));
                         if (targetOptions.SelfMapWeight > 0)
                             dashboard.Log(Markup.Escape($"self-map windows: {selfMapSteps:N0} steps with window labels from the map (weight {targetOptions.SelfMapWeight}){(targetOptions.SelfMapNegatives != "none" ? $", {selfMapNegativeTags:N0} negative tags looked at" : "")}"));
                         if (tagCentricSampler is { TwinEvery: > 0 } twinSampler)

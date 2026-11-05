@@ -278,6 +278,7 @@ public static class EvaluateCommandHandler
                 GlimpseEmbeddingDump = dumpOcclusion ? [] : null,
                 OcclusionFill = occlusionFill,
                 CropTeacher = cropTeacher,
+                FigureThresholds = FigureThresholds(vocabulary, report!),
             };
             var gold = goldPath is not null ? WithGoldImages(LocalizationEvaluator.LoadGold(goldPath)) : null;
             if (gold is not null && families is not null)
@@ -524,5 +525,15 @@ public static class EvaluateCommandHandler
                 t.AveragePrecision.ToString("F3"), double.IsNaN(t.HardAveragePrecision) ? "-" : t.HardAveragePrecision.ToString("F3"),
                 double.IsNaN(t.HeldOutF1) ? "-" : t.HeldOutF1.ToString("F3"), t.Threshold.ToString("F3"));
         AnsiConsole.Write(table);
+    }
+
+    /// <summary>Each vocabulary row's calibrated threshold from <paramref name="report"/> (0.5 where it has none), for character figures.</summary>
+    private static float[] FigureThresholds(TagVocabulary vocabulary, EvaluationReport report)
+    {
+        var byTag = report.Tags.ToDictionary(t => t.Tag, t => t.Threshold, StringComparer.Ordinal);
+        var thresholds = new float[vocabulary.Records.Count];
+        foreach (var record in vocabulary.Records)
+            thresholds[record.RowIndex] = byTag.TryGetValue(record.Tag, out var t) && float.IsFinite(t) ? t : 0.5f;
+        return thresholds;
     }
 }

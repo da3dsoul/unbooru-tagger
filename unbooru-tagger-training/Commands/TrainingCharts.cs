@@ -135,10 +135,10 @@ public static class TrainingCharts
         new("gold-auto region precision @1024 (dashed: recall)", p => EvaluationPoint.Get(p.At1024?.AutoRegionPrecisionBySize, "medium"), false, true, AutoRegionBySize1024),
     ];
 
-    /// <summary>Panels per row; the loss takes the first two.</summary>
+    /// <summary>Panels per row; the loss takes the whole first row.</summary>
     private const int Columns = 4;
 
-    private const int LossColumns = 2;
+    private const int LossColumns = 4;
 
     /// <summary>A snapshot evaluation's dot radius (before scaling): just wider than the line, so a point shows without hiding it.</summary>
     private const float SnapshotDot = 1.5f;

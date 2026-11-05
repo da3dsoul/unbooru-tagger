@@ -366,7 +366,10 @@ big, so chosen rows are re-downloaded into side stores.
 (`{"LongSide": 1024}`), `images.bin` (JPEGs, concatenated) and `index.bin` (24-byte records: row, offset, length,
 width, height). Each image is its letterbox content for a `LongSide` canvas, shrunk with Lanczos and kept as JPEG
 (q92, 4:4:4; ~238 KB at 1,024). They're written by `review/hires/pull.py` / `next/pull2.py` (outside git), which
-re-download originals by the crawl's file URLs, check the md5, and keep the site rate limits.
+re-download originals by the crawl's file URLs, check the md5, and keep the site rate limits. An optional `skip.txt`
+(cache rows, one per line, `#` comments) leaves rows out as if the store didn't hold them, without deleting the download;
+it's re-read at every refresh, so a selection can change while training runs. Run 4's 2,048 store skips large
+single-figure images (`review/hires/next/collage_rule.py`): that size is for collages and wide scenes.
 
 | Option | Purpose |
 |---|---|
@@ -542,11 +545,12 @@ In a terminal, `train` shows a full-width panel. It covers:
 - the phase, epoch and whole-run progress with finish times;
 - ms/step and the data wait;
 - the loss, both this step and a 1,000-step mean;
-- the learning rate, checkpoints, the last evaluation and recent events.
+- the learning rate, checkpoints, the last evaluation and the last two events, one line each (all of them are
+  printed when training stops).
 
 **Charts below the panel:**
 
-- the loss over the whole run (`loss_history.json`, kept across resumes);
+- the loss over the whole run (`loss_history.json`, kept across resumes), across the whole first row;
 - at every epoch and snapshot evaluation:
   - held-out mAP;
   - gold and gold-small pointing (also split by size);
@@ -617,6 +621,10 @@ Run 4's real one (`xpu-test/evaluate-on-cuda.sh`, outside git) adds:
   evaluation). On the A4000 a snapshot evaluation took ~22 minutes, 14 of them the 1,024 checks (gold-auto alone
   ~9.5), while mixed-scale training made a snapshot every ~29; after one long experiment held the GPU, three
   evaluations were queued at once. Every other snapshot averages ~15 minutes. The charts skip snapshots without them.
+- From 2026-11-04 23:00: every snapshot also scores `gold-characters/gold.json` at 512 (`characters/`, ~1.5 minutes;
+  strata popular-distinct / popular-diverse / unpopular), and the 20,000-step ones `gold-collage` at 1,024 and 2,048 from its
+  2,048px images (`collage1024/`, `collage2048/`; `gold-collage/tools/at_size.py` writes the set's boxes at each input size,
+  since the evaluator compares peaks with boxes in that size's content pixels). `review/collage/trend.py` prints the trend.
 
 Evaluations of experiments should wait while a run's own evaluations are queued, or the trend charts fall hours behind.
 Keep a snapshot's evaluation well under the time between snapshots too, or the queue never empties and the experiments

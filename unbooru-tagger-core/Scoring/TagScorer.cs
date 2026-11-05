@@ -35,6 +35,29 @@ public static class TagScorer
     public const float DefaultMinHeatmapRange = 0.05f;
     public const float DefaultMinBoxFraction = 0.0005f;
     public const int DefaultMaxBoxesPerTag = 3;
+    /// <summary>
+    /// A character is boxed by <see cref="FigureBox"/>: its figure is the cells within this many log-odds of some other called tag's
+    /// own peak. A character's map peaks on the face and marks who, not where the figure ends: the 4-below-peak cut boxed a face (box
+    /// precision 0.17 -> 0.01), and no cut of the character's own map beat one box over the whole image on any model from run 1 to run
+    /// 5 (2026-11-04, `review/regions/tune_chars.py`). Run 4 at 2.12M, 308 called character gold pairs (`tune_figure.py`): box F1 at
+    /// IoU 0.5 0.39 (whole image 0.33, own map 0.00); solo images 89% found, several characters 31%, where touching figures merge.
+    /// On an image with several characters that figure takes in everyone touching: 96% of those boxes covered another character's
+    /// gold box, 87% held another character's peak. So unless the model calls "solo", the figure is split between the called
+    /// characters, each cell to the nearest character's peak along the figure (<see cref="DefaultSamePersonDistance"/>): 2 gold
+    /// characters found 0.48 -> 0.54, another character's peak inside the box 0.85 -> 0.26; 3-5 characters 0.09 -> 0.25 and 0.85 ->
+    /// 0.22; solo images 0.80 -> 0.78. Split on every image it cost solo images 13 points (a wrongly called second character peaks on
+    /// the same figure), and split by straight-line distance or by the characters' own maps it did worse.
+    /// </summary>
+    public const float DefaultFigureBand = 3f;
+
+    /// <summary>
+    /// Characters whose peaks are closer than this share of the map's width are one person in <see cref="FigureBox"/>'s split (48px of
+    /// a 512px input): a character and its costume variant (gold ship and gold ship (red strife)) are called on the same face.
+    /// </summary>
+    public const float DefaultSamePersonDistance = 12f / 128;
+
+    /// <summary>Whether <see cref="FigureBox"/>, not <see cref="DetectBoxes"/>, boxes <paramref name="tag"/>.</summary>
+    public static bool IsCharacter(string tag) => tag.StartsWith("character:", StringComparison.Ordinal);
 
     /// <summary>Confidence that <paramref name="tagEmbedding"/> applies to the whole image. <paramref name="scaling"/> defaults to <see cref="LogitScaling.Identity"/> (plain <c>sigmoid(dot)</c>) for a model bundle exported before <see cref="LogitScaling"/> existed.</summary>
     public static float Score(ReadOnlySpan<float> imageEmbedding, ReadOnlySpan<float> tagEmbedding, LogitScaling? scaling = null) =>
@@ -161,6 +184,116 @@ public static class TagScorer
             boxes = boxes.OrderByDescending(b => b.Confidence).Take(maxBoxes).ToList();
 
         return boxes;
+    }
+
+    /// <summary>
+    /// One box for a character (<see cref="DefaultFigureBand"/>): the connected region holding the character's peak, over the cells
+    /// within <paramref name="ownBand"/> log-odds of its own peak or within <paramref name="figureBand"/> of the peak of any of
+    /// <paramref name="figureHeatmaps"/> (the other localizable tags the model calls on the image, same grid). With none, the whole
+    /// image. With <paramref name="otherCharacters"/> (the other called characters' maps; pass none on an image the model calls solo),
+    /// the figure is split first: each cell goes to whichever peak a path through the figure reaches first, this character's and those
+    /// within <paramref name="samePersonDistance"/> of it against the rest. Same spaces, <paramref name="threshold"/> and
+    /// <paramref name="minRange"/> as <see cref="DetectBoxes"/>; the box's confidence is the character's peak.
+    /// </summary>
+    public static List<BoundingBox> FigureBox(
+        float[,] heatmap, IReadOnlyList<float[,]> figureHeatmaps, float threshold,
+        LetterboxBox content, int canvasSize, int imageWidth, int imageHeight, float minRange = DefaultMinHeatmapRange,
+        float ownBand = DefaultBoxBelowPeak, float figureBand = DefaultFigureBand,
+        IReadOnlyList<float[,]>? otherCharacters = null, float samePersonDistance = DefaultSamePersonDistance)
+    {
+        var height = heatmap.GetLength(0);
+        var width = heatmap.GetLength(1);
+        var (min, max, peakX, peakY) = PeakOf(heatmap);
+        if (max - min < minRange || max < threshold)
+            return [];
+
+        // Cuts in log-odds below a map's peak, compared as probabilities (the sigmoid is monotone).
+        static float CutBelow(float peak, float band)
+        {
+            var p = Math.Clamp(peak, 1e-7f, 1 - 1e-7f);
+            return Sigmoid(MathF.Log(p / (1 - p)) - band);
+        }
+        var mask = new float[height, width];
+        var ownCut = CutBelow(max, ownBand);
+        for (var y = 0; y < height; y++)
+        for (var x = 0; x < width; x++)
+            mask[y, x] = figureHeatmaps.Count == 0 || heatmap[y, x] >= ownCut ? 1 : 0;
+        foreach (var figure in figureHeatmaps)
+        {
+            if (figure.GetLength(0) != height || figure.GetLength(1) != width)
+                throw new ArgumentException("Figure heatmaps must share the character heatmap's grid.", nameof(figureHeatmaps));
+            var figureMax = float.MinValue;
+            foreach (var value in figure)
+                figureMax = Math.Max(figureMax, value);
+            var cut = CutBelow(figureMax, figureBand);
+            for (var y = 0; y < height; y++)
+            for (var x = 0; x < width; x++)
+                if (figure[y, x] >= cut)
+                    mask[y, x] = 1;
+        }
+
+        if (otherCharacters is { Count: > 0 })
+            SplitFigure(mask, peakX, peakY, otherCharacters, samePersonDistance * width);
+        mask[peakY, peakX] = 1;
+
+        var (box, _) = FloodFillComponent(
+            mask, new bool[height, width], peakX, peakY, 0.5f,
+            canvasSize / (float)width, canvasSize / (float)height, imageWidth / (float)content.Width, imageHeight / (float)content.Height,
+            content, imageWidth, imageHeight);
+        return [box with { Confidence = max }];
+    }
+
+    private static (float Min, float Max, int X, int Y) PeakOf(float[,] map)
+    {
+        var (min, max, peakX, peakY) = (float.MaxValue, float.MinValue, 0, 0);
+        for (var y = 0; y < map.GetLength(0); y++)
+        for (var x = 0; x < map.GetLength(1); x++)
+        {
+            min = Math.Min(min, map[y, x]);
+            if (map[y, x] > max)
+                (max, peakX, peakY) = (map[y, x], x, y);
+        }
+        return (min, max, peakX, peakY);
+    }
+
+    /// <summary>
+    /// Clears the mask's cells that a breadth-first flood through the mask reaches from another person's peak before this one's (ties
+    /// to this one). The other characters' peaks within <paramref name="samePerson"/> cells of (peakX, peakY) seed this person.
+    /// </summary>
+    private static void SplitFigure(float[,] mask, int peakX, int peakY, IReadOnlyList<float[,]> otherCharacters, float samePerson)
+    {
+        var height = mask.GetLength(0);
+        var width = mask.GetLength(1);
+        var owner = new int[height, width]; // 0 unreached, 1 this person, 2 someone else
+        var queue = new Queue<(int X, int Y)>();
+        var seeds = new List<(int X, int Y, int Owner)> { (peakX, peakY, 1) };
+        foreach (var other in otherCharacters)
+        {
+            if (other.GetLength(0) != height || other.GetLength(1) != width)
+                throw new ArgumentException("Character heatmaps must share the character heatmap's grid.", nameof(otherCharacters));
+            var (_, _, x, y) = PeakOf(other);
+            seeds.Add((x, y, MathF.Sqrt((x - peakX) * (x - peakX) + (y - peakY) * (y - peakY)) < samePerson ? 1 : 2));
+        }
+        foreach (var (x, y, who) in seeds.OrderBy(s => s.Owner))
+            if (owner[y, x] == 0)
+            {
+                owner[y, x] = who;
+                queue.Enqueue((x, y));
+            }
+        while (queue.TryDequeue(out var cell))
+        {
+            var (x, y) = cell;
+            foreach (var (nx, ny) in new[] { (x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1) })
+                if (nx >= 0 && nx < width && ny >= 0 && ny < height && owner[ny, nx] == 0 && mask[ny, nx] > 0)
+                {
+                    owner[ny, nx] = owner[y, x];
+                    queue.Enqueue((nx, ny));
+                }
+        }
+        for (var y = 0; y < height; y++)
+        for (var x = 0; x < width; x++)
+            if (owner[y, x] != 1)
+                mask[y, x] = 0;
     }
 
     /// <summary>BFS over 4-connected above-threshold grid cells starting at (startX, startY), returning their pixel-space bounding box and how many grid cells the region covers.</summary>

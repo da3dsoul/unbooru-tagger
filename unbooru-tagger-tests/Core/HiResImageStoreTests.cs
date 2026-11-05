@@ -137,6 +137,33 @@ public class HiResImageStoreTests
     }
 
     [Fact]
+    public void SkipFile_LeavesRowsOut_AndARowTakenOffItComesBack()
+    {
+        var directory = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            Write(directory, [(1, Jpeg(8, 8, SKColors.Black), 8, 8), (2, Jpeg(8, 8, SKColors.White), 8, 8)], 8);
+            File.WriteAllText(Path.Combine(directory, "skip.txt"), "# large single figures\n2\n");
+            using var store = HiResImageStore.Open(directory);
+            Assert.True(store.Contains(1));
+            Assert.False(store.Contains(2));
+            Assert.Equal([1], store.Rows);
+
+            // Skipping one row while the pull adds another is two changes, not none.
+            Write(directory, [(3, Jpeg(8, 8, SKColors.Black), 8, 8)], 8, append: true);
+            File.WriteAllText(Path.Combine(directory, "skip.txt"), "1\n");
+            Assert.Equal(3, store.Refresh()); // 2 and 3 in, 1 out
+            Assert.Equal([2, 3], store.Rows.Order());
+            Assert.True(store.Read(2, 8).Pixels[0] > 240);
+            Assert.Equal(0, store.Refresh());
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public void Pick_TakesTheSmallestStoreThatReachesTheSize_ElseTheLargest()
     {
         var directories = new[] { 8, 16, 32 }.Select(_ => Directory.CreateTempSubdirectory().FullName).ToArray();

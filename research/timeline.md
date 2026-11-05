@@ -201,6 +201,12 @@ See [experiments-window-labels.md](experiments-window-labels.md).
 - **11-04 17:00:** the A4000's evaluation queue backed up (three waiting): each snapshot's evaluation took ~22 minutes,
   14 of them the 1,024 checks, against a snapshot every ~29. The 1,024 checks now run every 20,000 steps.
 
+- **11-04 evening:** characters boxed over their figure from the other called tags (their maps peak on the face), split between
+  characters unless `solo` is called. Training the maps to cover the figure (an extent term; hide-and-seek) failed. Two held-out
+  gold sets: `gold-characters` (62; popular one-look / many-costume / unpopular) and `gold-collage` (12 large crowded images). The
+  2,048 store dropped large single figures (`skip.txt`) and added ~800 wide scenes; on the collage set, run 4 now points better at
+  2,048 than at 1,024 (63 vs 51%), the reverse of before mixed training.
+
 See [experiments-localization.md](experiments-localization.md#aliasing-or-resolution-the-gold-originals-2026-11-04).
 
 ## Current work (11-04)
@@ -210,5 +216,8 @@ See [experiments-localization.md](experiments-localization.md#aliasing-or-resolu
 - The plan is to gather resolution where evaluations show weakness: by tag (small objects at 1,024, medium at 768)
   and by kind of image (collages, comics, crowds at 2,048), and to adjust the scale mix as the 1,024 trend charts
   and per-tag AP move.
-- Open: whether 2,048 gains over 1,024 on the gold images that have originals that large (scoring in progress); the
-  occlusion object effect falls a little at higher input sizes (1.32 → 1.17), not yet explained.
+- The 2,048 share is for inference on large collages, judged on `gold-collage` (every 20,000 steps), not on whether 2,048
+  beats 1,024 on ordinary images.
+- Characters: maps mark who, not the figure's extent (2-4% of a character's box at every popularity). The box comes from
+  the figure; a training fix is still open.
+- Open: the occlusion object effect falls a little at higher input sizes (1.32 → 1.17), not yet explained.

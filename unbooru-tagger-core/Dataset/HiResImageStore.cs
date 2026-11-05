@@ -16,6 +16,9 @@ namespace UnbooruTagger.Core.Dataset;
 /// <item><c>index.bin</c>: 24-byte little-endian records, one per image: int32 cache row, int64 offset into images.bin,
 /// int32 length, int32 width, int32 height. A row's last record wins; a record whose bytes run past images.bin's end
 /// (a write cut off, or not finished yet) is ignored until it is, so the writer appends the image before its record.</item>
+/// <item><c>skip.txt</c> (optional): cache rows, one per line, the store leaves out as if it didn't hold them, re-read at every
+/// <see cref="Refresh"/>. Kept rather than deleted, so a selection can change without losing the download (2026-11-04: the 2048
+/// store dropped its large single-figure images; it is for collages and wide scenes, many small figures in one big image).</item>
 /// </list>
 /// Each image is stored at its letterbox content size for a <see cref="LongSide"/> canvas, so reading it at that input size
 /// needs no resize.
@@ -44,20 +47,32 @@ public sealed class HiResImageStore : IDisposable
     /// <summary>Bytes of index.bin read so far: <see cref="Refresh"/> reads on from here.</summary>
     private long _indexRead;
 
+    /// <summary>Every record read, skipped rows included (only <see cref="Refresh"/> touches it).</summary>
+    private readonly Dictionary<int, (long Offset, int Length, int Width, int Height)> _all = new();
+    private HashSet<int> _skipped = [];
+
+    private HashSet<int> ReadSkip()
+    {
+        var path = Path.Combine(Directory, "skip.txt");
+        return File.Exists(path)
+            ? File.ReadLines(path).Select(l => l.Trim()).Where(l => l.Length > 0 && !l.StartsWith('#')).Select(int.Parse).ToHashSet()
+            : [];
+    }
+
     /// <summary>
-    /// Reads the records appended to index.bin since the last read (a pull still writing the store), returning how many rows
-    /// were added. A record whose image isn't all in images.bin yet stops the read there, to be read again next time. Readers on
+    /// Reads the records appended to index.bin since the last read (a pull still writing the store) and skip.txt, returning how
+    /// many rows were added or removed. A record whose image isn't all in images.bin yet stops the read there, to be read again next time. Readers on
     /// other threads are safe (the index is swapped whole); call it from one thread at a time.
     /// </summary>
     public int Refresh()
     {
-        var entries = new Dictionary<int, (long Offset, int Length, int Width, int Height)>(_entries);
         var dataLength = RandomAccess.GetLength(_data);
         using var index = new FileStream(Path.Combine(Directory, "index.bin"), FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         var available = (index.Length - _indexRead) / RecordBytes * RecordBytes;
-        if (available <= 0)
+        var skipped = ReadSkip();
+        if (available <= 0 && skipped.SetEquals(_skipped))
             return 0;
-        var bytes = new byte[available];
+        var bytes = new byte[Math.Max(0, available)];
         index.Seek(_indexRead, SeekOrigin.Begin);
         index.ReadExactly(bytes);
         for (var at = 0; at < bytes.Length; at += RecordBytes)
@@ -68,13 +83,18 @@ public sealed class HiResImageStore : IDisposable
             var length = BinaryPrimitives.ReadInt32LittleEndian(record[12..]);
             if (offset + length > dataLength)
                 break;
-            entries[row] = (offset, length, BinaryPrimitives.ReadInt32LittleEndian(record[16..]), BinaryPrimitives.ReadInt32LittleEndian(record[20..]));
+            _all[row] = (offset, length, BinaryPrimitives.ReadInt32LittleEndian(record[16..]), BinaryPrimitives.ReadInt32LittleEndian(record[20..]));
             _indexRead += RecordBytes;
         }
 
-        var added = entries.Count - _entries.Count;
+        // Every record read so far, less the skipped rows: a row taken off skip.txt comes back.
+        var entries = _all.Where(e => !skipped.Contains(e.Key)).ToDictionary();
+        _skipped = skipped;
+
+        // Rows that came or went: a caller holding a list of the store's rows must rebuild it whenever this isn't 0.
+        var changed = entries.Keys.Count(row => !_entries.ContainsKey(row)) + _entries.Keys.Count(row => !entries.ContainsKey(row));
         _entries = entries;
-        return added;
+        return changed;
     }
 
     public static HiResImageStore Open(string directory) => new(directory);

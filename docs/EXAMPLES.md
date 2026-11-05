@@ -25,7 +25,8 @@ as a coat. It now cuts 4 log-odds below each tag's peak (`--box-below-peak`): ov
 0.08 → 0.19, recall 0.12 → 0.25, and small objects found at all (0 → 0.11 / 0.14). Cutting 2 log-odds below the peak, 62% of a
 medium object's region lies on the object, against 12% before. A further region now gets a box only if its own peak is within 1
 log-odds of the tag's (`--box-peak-margin`): precision 0.27, recall 0.22. Boxes still read worse than the maps, since a map's extent
-isn't its object's; the peak and the band are what to read.
+isn't its object's; the peak and the band are what to read. A character's map peaks on the face, so a character is boxed over its
+figure instead: the region the other called tags (hair, clothes, accessories) cover around the character's peak.
 
 ---
 

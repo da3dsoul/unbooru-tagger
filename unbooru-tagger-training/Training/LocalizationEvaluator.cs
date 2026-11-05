@@ -214,6 +214,13 @@ public sealed class LocalizationEvaluator(
     /// </summary>
     public bool CropTeacher { get; init; } = true;
 
+    /// <summary>
+    /// Per vocabulary row, the threshold at which the model calls a tag: a character's gold box is extracted as <c>detect</c> does,
+    /// over its figure (<see cref="TagScorer.FigureBox"/>) from the localizable tags called on the image. <c>evaluate</c> passes its
+    /// calibrated thresholds; without them 0.5.
+    /// </summary>
+    public IReadOnlyList<float>? FigureThresholds { get; init; }
+
     /// <summary>What the occlusion check fills blanked rectangles with (<see cref="Training.OcclusionFill"/>).</summary>
     public OcclusionFill OcclusionFill { get; init; } = OcclusionFill.Zero;
 
@@ -323,7 +330,7 @@ public sealed class LocalizationEvaluator(
             rowOf[record.Tag] = record.RowIndex;
         var localizable = vocabulary.Records.Select(r => localizability.IsLocalizable(r.Tag)).ToArray();
 
-        var (goldSummary, goldTags) = gold is { Count: > 0 } ? EvaluateGold(gold, rowOf) : ([], []);
+        var (goldSummary, goldTags) = gold is { Count: > 0 } ? EvaluateGold(gold, rowOf, localizable) : ([], []);
         var (teacherSummary, teacherTags) = gold is { Count: > 0 } && CropTeacher ? EvaluateTeacher(gold, rowOf, random) : ([], []);
         var (occlusionSummary, occlusionTags) = gold is { Count: > 0 } ? EvaluateOcclusion(gold, rowOf, random, (pixels, boxes) => Score(pixels, boxes), _ => true, OcclusionPairs) : ([], []);
         // Its own random source: the pooled check and everything after it see the same draws as before.
@@ -489,8 +496,12 @@ public sealed class LocalizationEvaluator(
         return w * (double)h / area;
     }
 
-    private (List<GoldResult> Summary, List<GoldResult> Tags) EvaluateGold(IReadOnlyList<GoldImage> gold, IReadOnlyDictionary<string, int> rowOf)
+    private (List<GoldResult> Summary, List<GoldResult> Tags) EvaluateGold(IReadOnlyList<GoldImage> gold, IReadOnlyDictionary<string, int> rowOf, bool[] localizable)
     {
+        // The rows a character's figure may come from: localizable tags other than characters.
+        var figureRows = rowOf.Where(kv => localizable[kv.Value] && !TagScorer.IsCharacter(kv.Key)).Select(kv => kv.Value).Order().ToArray();
+        var characterRows = rowOf.Where(kv => TagScorer.IsCharacter(kv.Key)).Select(kv => kv.Value).Order().ToArray();
+        var soloRow = rowOf.TryGetValue("solo", out var solo) ? solo : -1;
         var perTag = new Dictionary<string, GoldTally>();
         var perStratum = new Dictionary<string, GoldTally> { ["all"] = new() };
         foreach (var chunk in gold.Chunk(ImagesPerPass))
@@ -499,7 +510,8 @@ public sealed class LocalizationEvaluator(
                 .Where(t => !g.NotVisible.Contains(t) && rowOf.ContainsKey(t)
                     && g.Instances.Any(x => x.Tag == t && x.Kind != GoldKind.Ignore))
                 .ToArray()).ToArray();
-            var heatmaps = Heatmaps(chunk.Select(g => g.CacheIndex).ToArray(), tagsPerImage.Select(ts => ts.Select(t => rowOf[t]).ToArray()).ToArray(), out var boxes);
+            var heatmaps = Heatmaps(chunk.Select(g => g.CacheIndex).ToArray(), tagsPerImage.Select(ts => ts.Select(t => rowOf[t]).ToArray()).ToArray(), out var boxes,
+                tagsPerImage.Select(ts => ts.Any(TagScorer.IsCharacter)).ToArray(), figureRows, characterRows, soloRow, out var figures);
 
             for (var i = 0; i < chunk.Length; i++)
             {
@@ -509,7 +521,7 @@ public sealed class LocalizationEvaluator(
                     var tag = tagsPerImage[i][k];
                     var instances = image.Instances.Where(x => x.Tag == tag).ToList();
                     var map = heatmaps[i][k];
-                    var extracted = DetectBoxes(map, boxes[i])
+                    var extracted = (TagScorer.IsCharacter(tag) ? FigureBox(map, figures[i]!.Value, rowOf[tag], boxes[i]) : DetectBoxes(map, boxes[i]))
                         .Select(b => new[] { b.X, b.Y, b.Width, b.Height }).ToList();
                     var peak = PeakCellCenterInContent(map, boxes[i]);
                     var boxedInstances = instances.Where(x => x.Kind != GoldKind.Ignore).Select(x => x.Box).ToList();
@@ -1360,15 +1372,37 @@ public sealed class LocalizationEvaluator(
 
     private Tensor? _deviceTags;
 
-    private float[][][,] Heatmaps(IReadOnlyList<int> indices, int[][] tagsPerImage, out LetterboxBox[] boxes)
+    private float[][][,] Heatmaps(IReadOnlyList<int> indices, int[][] tagsPerImage, out LetterboxBox[] boxes) =>
+        Heatmaps(indices, tagsPerImage, out boxes, new bool[indices.Count], [], [], -1, out _);
+
+    /// <summary>What <see cref="FigureBox"/> needs from one image: the called figure tags' maps, the called characters' (row, map), and
+    /// whether the model calls it solo.</summary>
+    private readonly record struct FigureMaps(List<float[,]> Figure, List<(int Row, float[,] Map)> Characters, bool Solo);
+
+    /// <summary>
+    /// With <paramref name="needsFigure"/>, also that image's <see cref="FigureMaps"/>: the <paramref name="figureRows"/> and
+    /// <paramref name="characterRows"/> the model calls (<see cref="FigureThresholds"/>), for <see cref="FigureBox"/>.
+    /// </summary>
+    private float[][][,] Heatmaps(IReadOnlyList<int> indices, int[][] tagsPerImage, out LetterboxBox[] boxes,
+        bool[] needsFigure, int[] figureRows, int[] characterRows, int soloRow, out FigureMaps?[] figures)
     {
         using var scope = NewDisposeScope();
         var (pixels, loadedBoxes) = Load(indices);
         boxes = loadedBoxes;
-        var (_, spatial) = Forward(pixels, loadedBoxes);
+        var (pooledScore, spatial) = Forward(pixels, loadedBoxes);
         var result = new float[indices.Count][][,];
+        figures = new FigureMaps?[indices.Count];
         for (var i = 0; i < indices.Count; i++)
+        {
             result[i] = tagsPerImage[i].Select(t => HeatmapOf(spatial, i, t)).ToArray();
+            if (!needsFigure[i])
+                continue;
+            bool Called(int row) => pooledScore(i, row) >= (FigureThresholds?[row] ?? 0.5f);
+            figures[i] = new FigureMaps(
+                figureRows.Where(Called).Select(r => HeatmapOf(spatial, i, r)).ToList(),
+                characterRows.Where(Called).Select(r => (r, HeatmapOf(spatial, i, r))).ToList(),
+                soloRow >= 0 && Called(soloRow));
+        }
         return result;
     }
 
@@ -1465,6 +1499,11 @@ public sealed class LocalizationEvaluator(
         TagScorer.DetectBoxes(map, TagScorer.DefaultBoxThreshold, TagScorer.DefaultBoxPercentile, content, inputSize, content.Width, content.Height,
             TagScorer.DefaultMinHeatmapRange, TagScorer.DefaultMinBoxFraction, TagScorer.DefaultMaxBoxesPerTag, TagScorer.DefaultBoxBelowPeak,
             TagScorer.DefaultBoxPeakMargin);
+
+    /// <summary>A character's box as <c>detect</c> extracts it (<see cref="TagScorer.FigureBox"/>), in content pixels, without refinement.</summary>
+    private List<BoundingBox> FigureBox(float[,] map, FigureMaps figure, int row, LetterboxBox content) =>
+        TagScorer.FigureBox(map, figure.Figure, TagScorer.DefaultBoxThreshold, content, inputSize, content.Width, content.Height, TagScorer.DefaultMinHeatmapRange,
+            otherCharacters: figure.Solo ? [] : figure.Characters.Where(c => c.Row != row).Select(c => c.Map).ToList());
 
     /// <summary>The best map cell inside <paramref name="boxes"/> (cell centres, content pixels), as the share of the content's cells at or below it.</summary>
     private double BoxBestRank(float[,] map, LetterboxBox content, int[][] boxes)

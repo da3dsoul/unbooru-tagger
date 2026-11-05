@@ -106,6 +106,76 @@ public class TagScorerTests
     }
 
     [Fact]
+    public void FigureBox_SpansTheFigureConnectedToTheCharactersPeak()
+    {
+        static float P(float logit) => 1f / (1f + MathF.Exp(-logit));
+        // The character peaks on the face (top left); a clothing tag covers the body below it, a background tag the far column.
+        var character = new float[,]
+        {
+            { P(6), P(-8), P(-8), P(-8) },
+            { P(-8), P(-8), P(-8), P(-8) },
+            { P(-8), P(-8), P(-8), P(-8) },
+            { P(-8), P(-8), P(-8), P(-8) }
+        };
+        var dress = new float[,]
+        {
+            { P(-9), P(-9), P(-9), P(-9) },
+            { P(4), P(3), P(-9), P(-9) },
+            { P(3.5f), P(2), P(-9), P(-9) },
+            { P(-9), P(-9), P(-9), P(-9) }
+        };
+        var sky = new float[,]
+        {
+            { P(-9), P(-9), P(-9), P(5) },
+            { P(-9), P(-9), P(-9), P(5) },
+            { P(-9), P(-9), P(-9), P(5) },
+            { P(-9), P(-9), P(-9), P(5) }
+        };
+        var canvas = new LetterboxBox(0, 0, 4, 4);
+
+        var box = Assert.Single(TagScorer.FigureBox(character, [dress, sky], threshold: 0.5f, canvas, canvasSize: 4, imageWidth: 4, imageHeight: 4));
+        var own = Assert.Single(TagScorer.DetectBoxes(character, 0.5f, 0.6f, canvas, 4, 4, 4, belowPeak: 4f));
+
+        Assert.Equal((0, 0, 2, 3), (box.X, box.Y, box.Width, box.Height));
+        Assert.Equal(P(6), box.Confidence);
+        Assert.Equal((1, 1), (own.Width, own.Height));
+    }
+
+    [Fact]
+    public void FigureBox_SplitsATouchingFigureBetweenCharactersButNotFromTheSamePerson()
+    {
+        static float P(float logit) => 1f / (1f + MathF.Exp(-logit));
+        static float[,] PeakAt(int x, int width) { var m = new float[1, width]; for (var i = 0; i < width; i++) m[0, i] = P(i == x ? 6 : -8); return m; }
+        // One row of 16 cells, all covered by clothing tags: two characters side by side, touching.
+        var clothes = new float[1, 16];
+        for (var i = 0; i < 16; i++)
+            clothes[0, i] = P(3);
+        var canvas = new LetterboxBox(0, 0, 16, 1);
+        var a = PeakAt(2, 16);
+
+        var merged = Assert.Single(TagScorer.FigureBox(a, [clothes], 0.5f, canvas, 16, 16, 1));
+        var split = Assert.Single(TagScorer.FigureBox(a, [clothes], 0.5f, canvas, 16, 16, 1, otherCharacters: [PeakAt(12, 16)]));
+        // A costume variant peaking on the same face (within the same-person distance) doesn't split it.
+        var variant = Assert.Single(TagScorer.FigureBox(a, [clothes], 0.5f, canvas, 16, 16, 1, otherCharacters: [PeakAt(3, 16)], samePersonDistance: 0.2f));
+
+        Assert.Equal((0, 16), (merged.X, merged.Width));
+        Assert.Equal((0, 8), (split.X, split.Width));
+        Assert.Equal((0, 16), (variant.X, variant.Width));
+    }
+
+    [Fact]
+    public void FigureBox_WithoutOtherTagsBoxesTheWholeImageAndBelowThresholdNothing()
+    {
+        var character = new float[,] { { 0.9f, 0.01f }, { 0.01f, 0.01f } };
+        var canvas = new LetterboxBox(0, 0, 2, 2);
+
+        var whole = Assert.Single(TagScorer.FigureBox(character, [], threshold: 0.5f, canvas, canvasSize: 2, imageWidth: 2, imageHeight: 2));
+
+        Assert.Equal((0, 0, 2, 2), (whole.X, whole.Y, whole.Width, whole.Height));
+        Assert.Empty(TagScorer.FigureBox(character, [], threshold: 0.95f, canvas, canvasSize: 2, imageWidth: 2, imageHeight: 2));
+    }
+
+    [Fact]
     public void DetectBoxes_AbsoluteThresholdActsAsAFloorRegardlessOfPercentile()
     {
         var heatmap = new float[,] { { 0.3f, 0.2f }, { 0.1f, 0.05f } };

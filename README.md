@@ -181,6 +181,9 @@ unbooru-tagger-inference detect ./image.png --model-dir ./model [--out detected.
 - Prints the detections as JSON to stdout.
 - `--out` also writes the image with colored, labelled boxes.
 - Each box is labelled with its own peak confidence, not the tag's whole-image score.
+- A character (`character:*`) gets one box over its figure: the region around its peak that the other called tags (hair, clothes,
+  accessories) cover. Its own map peaks on the face. Unless the model calls the image `solo`, that region is split between the
+  called characters along the figure, so touching figures don't merge.
 
 ### `detect-batch`: tags and boxes for a directory, in one pass
 

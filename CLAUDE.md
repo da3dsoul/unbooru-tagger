@@ -656,6 +656,11 @@ built the corpus around:
   nothing from real pixels at test time. Run 4 trains this way from ~2.09M (`512:10:0.3,768:5:0.3:0.2,1024:3:0.3:0.3,2048:1:0.1:1`;
   2,048 only on stored rows). `ScaleStats` logs what each size did; the snapshot evaluations add the gold checks at 1,024
   (`HigherScalePoint`, four chart panels; every 20,000 steps, since at every snapshot the A4000's queue fell behind). The plan: gather resolution where evaluations show weakness, by tag and by kind of image.
+  The 2048 share is for running inference on large collages (many small figures in one big image), not a candidate main input
+  size (the user). The store holds collage kinds and ~800 wide scenes with people; large single-figure images are left out by
+  the store's `skip.txt` (`HiResImageStore`, re-read every refresh; `review/hires/next/collage_rule.py`). Judged on `gold-collage`
+  (12 held-out images, outside git) at 1024 vs 2048: run 4 before mixed training 54 / 45%, at 2.22M 51 / 63%. `gold-characters`
+  (62 held-out images; popular one-look, popular many-costume, unpopular) is scored at every snapshot.
 
 ## Localization — implemented: heatmap, and (beyond the original scope) approximate boxes
 - **Heatmap** (`TagScorer.Heatmap`; `unbooru-tagger-inference heatmap`
@@ -679,6 +684,15 @@ built the corpus around:
     A tag's further regions are boxed only when their own peak is within 1 log-odds of its peak (`--box-peak-margin`,
     `TagScorer.DefaultBoxPeakMargin`): the band took in faint blobs the drawn map shows as clear. Box precision 0.19 -> 0.27, recall
     0.25 -> 0.22; no cut, smoothing or trim did much better, since a map's extent isn't its object's.
+  - **Characters are boxed over their figure (`TagScorer.FigureBox`, 2026-11-04).** A character's map peaks on the face: the peak cut
+    boxed faces (precision 0.17 -> 0.01), and no cut of its own map beat one box over the whole image on any model from run 1 to run 5,
+    so training wasn't the fix. The box is the connected region around the character's peak covered by the other localizable tags the
+    model calls (each within 3 log-odds of its own peak, `DefaultFigureBand`). Merged, a figure took in everyone touching it (on
+    multi-character images 96% of boxes covered another character), so unless the model calls `solo` it is split between the called
+    characters, each cell to the nearest peak along the figure, characters peaking within 48px of each other (a character and its
+    costume variant) counted as one person. Run 4 at 2.12M, called characters at IoU 0.5: 0.05 / 0.06 -> 0.44 / 0.40; covering
+    another character 100% -> 47%. Training the maps to cover the figure instead (`CharacterExtent`, off) failed: an extent term
+    flattened every map (mAP 0.80 -> 0.16) and hide-and-seek changed nothing (research/experiments-localization.md).
   - A joint bilateral filter (`HeatmapRefiner`) uses the source image's own
     edges as a guide to snap the heatmap boundary to real object
     contours — the label-free version of the CAM+DenseCRF refinement trick

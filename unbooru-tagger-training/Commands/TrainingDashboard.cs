@@ -80,7 +80,8 @@ public sealed class TrainingDashboard
     private bool _printEvents;
     private (int TrustedTags, double CroppedFraction)? _cropTeacher;
     private readonly List<string> _events = [];
-    private const int ShownEvents = 8;
+    // Two, one line each (2026-11-04: the user found the charts too small again; the full list is printed when training stops).
+    private const int ShownEvents = 2;
 
     public TrainingDashboard(TrainingRunInfo info, Func<DateTime>? now = null, LossHistory? lossHistory = null)
     {
@@ -476,11 +477,10 @@ public sealed class TrainingDashboard
 
             if (_events.Count > 0)
             {
-                var events = new Grid().AddColumn(new GridColumn().NoWrap().PadRight(2)).AddColumn();
+                var events = new Grid().AddColumn(new GridColumn().NoWrap().PadRight(2)).AddColumn(new GridColumn().NoWrap());
                 var shown = _events.Skip(Math.Max(0, _events.Count - ShownEvents)).ToList();
                 for (var k = 0; k < shown.Count; k++)
-                    events.AddRow(new Markup(k == 0 ? $"[grey]events{(_events.Count > ShownEvents ? $" (last {ShownEvents})" : "")}[/]" : ""), new Markup(shown[k]));
-                body.Add(new Text(""));
+                    events.AddRow(new Markup(k == 0 ? $"[grey]events{(_events.Count > ShownEvents ? $" (last {ShownEvents})" : "")}[/]" : ""), new Markup(shown[k]) { Overflow = Overflow.Ellipsis });
                 body.Add(events);
             }
 

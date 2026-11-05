@@ -57,7 +57,9 @@ public static class DetectCommandHandler
     /// to suppress boxes entirely for a tag whose heatmap has no real spatial signal to cut into.
     /// Regions smaller than <paramref name="minBoxFraction"/> of the grid are dropped as specks,
     /// and at most <paramref name="maxBoxesPerTag"/> (strongest peak first; 0 = unlimited) are kept.
-    /// Boxes are reported in the original image's pixel space, not the resized model-input space.
+    /// Boxes are reported in the original image's pixel space, not the resized model-input space. A character gets one box over its
+    /// figure instead (<see cref="TagScorer.FigureBox"/>), from the other localizable tags the model calls at their own thresholds,
+    /// split between the called characters unless it calls the image solo.
     /// </summary>
     public static List<TagDetection> Detect(
         ModelBundle model, string imagePath, float? threshold, float boxThreshold, float boxPercentile, float minHeatmapRange = 0.05f,
@@ -86,7 +88,16 @@ public static class DetectCommandHandler
         var spatialFeatures = encoding.SpatialFeatures
             ?? throw new ArgumentException("Detection needs the encoding's spatial features (EncodeBatch with withHeatmapFeatures: true).", nameof(encoding));
         var detections = new List<TagDetection>();
-        foreach (var (row, confidence) in TagCommandHandler.ScoreRows(model, encoding, threshold, scores, onlyTags))
+        var raw = new Dictionary<int, float[,]>();
+        var refined = new Dictionary<int, float[,]>();
+        float[,] Raw(int row) => raw.TryGetValue(row, out var map) ? map : raw[row] = TagScorer.Heatmap(model.Embeddings.GetRow(row), spatialFeatures, model.LogitScaling);
+        float[,] Refined(int row) => refined.TryGetValue(row, out var map) ? map : refined[row] = HeatmapRefiner.Refine(Raw(row), guide.Guide);
+        var called = TagCommandHandler.ScoreRows(model, encoding, threshold, scores, onlyTags);
+        // A character's figure comes from the tags the model calls at their own thresholds, whichever tags this call reports.
+        List<(int Row, float Confidence)>? ownCalls = null;
+        List<(int Row, float Confidence)> OwnCalls() => ownCalls ??= threshold is null && onlyTags is null ? called : TagCommandHandler.ScoreRows(model, encoding, null, scores);
+        List<float[,]>? figure = null;
+        foreach (var (row, confidence) in called)
         {
             var tag = model.Vocabulary.GetByRowIndex(row).Tag;
             if (!model.Localizability.IsLocalizable(tag))
@@ -96,14 +107,26 @@ public static class DetectCommandHandler
                 continue;
             }
 
-            var tagEmbedding = model.Embeddings.GetRow(row);
-            var heatmap = TagScorer.Heatmap(tagEmbedding, spatialFeatures, model.LogitScaling);
-            heatmaps?.Add(tag, heatmap);
-            var refinedHeatmap = HeatmapRefiner.Refine(heatmap, guide.Guide);
-            var boxes = TagScorer.DetectBoxes(
-                refinedHeatmap, boxThreshold, boxPercentile, guide.Content, RefinementSize, guide.ImageWidth, guide.ImageHeight, minHeatmapRange,
-                minBoxFraction, maxBoxesPerTag, boxBelowPeak, boxPeakMargin);
-            detections.Add(new TagDetection(model.Vocabulary.GetByRowIndex(row).Tag, confidence, boxes));
+            heatmaps?.Add(tag, Raw(row));
+            List<BoundingBox> boxes;
+            if (TagScorer.IsCharacter(tag))
+            {
+                figure ??= OwnCalls()
+                    .Where(r => model.Localizability.IsLocalizable(model.Vocabulary.GetByRowIndex(r.Row).Tag) && !TagScorer.IsCharacter(model.Vocabulary.GetByRowIndex(r.Row).Tag))
+                    .Select(r => Refined(r.Row)).ToList();
+                // Split between the other called characters unless the model calls the image solo.
+                var others = OwnCalls().Any(r => model.Vocabulary.GetByRowIndex(r.Row).Tag == "solo") ? []
+                    : OwnCalls().Where(r => r.Row != row && TagScorer.IsCharacter(model.Vocabulary.GetByRowIndex(r.Row).Tag)).Select(r => Refined(r.Row)).ToList();
+                boxes = TagScorer.FigureBox(Refined(row), figure, boxThreshold, guide.Content, RefinementSize, guide.ImageWidth, guide.ImageHeight, minHeatmapRange,
+                    otherCharacters: others);
+            }
+            else
+            {
+                boxes = TagScorer.DetectBoxes(
+                    Refined(row), boxThreshold, boxPercentile, guide.Content, RefinementSize, guide.ImageWidth, guide.ImageHeight, minHeatmapRange,
+                    minBoxFraction, maxBoxesPerTag, boxBelowPeak, boxPeakMargin);
+            }
+            detections.Add(new TagDetection(tag, confidence, boxes));
         }
 
         detections.Sort((a, b) => b.Confidence.CompareTo(a.Confidence));

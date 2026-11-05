@@ -430,3 +430,81 @@ Nothing did much better (best F1 0.26 against 0.24): smoothing gains medium obje
 and at IoU ≥ 0.5 every rule is near 0.1. A map's extent isn't its object's; the peak and the band are what to read.
 `TagScorer.DefaultBoxPeakMargin` = 1 (`--box-peak-margin`); `render-gold` and the evaluator follow it. The compare page also has a
 mode with nothing drawn, where hovering a tag, a gold box or a spot on the image shows that tag's map, peak and boxes.
+
+**Character boxes from the figure (2026-11-04).** The peak cut boxed characters' faces: in the evaluator, character box precision
+went 0.17 → 0.01 (recall 0.40 → 0.02) on run 4's pre-mixed checkpoint (`review/hires/mixed/baseline31`). The user asked whether it
+needed more training. It doesn't: over all 13 rendered models, run 1's epoch 12 to run 5 (`review/regions/tune_chars.py`, 389
+character gold pairs each), the peak − 4 cut scored F1 0.00-0.03 at IoU ≥ 0.5 on every one, and the best cut of a character's own
+map (peak − 24, or 30% of its log-odds range) 0.28-0.30 on every model since run 2, the same as one box over the whole image
+(0.29). A character's map peaks on the face and marks who, not where the figure ends. The figure comes from the other tags the model
+calls (`render-gold --all-tags --heatmaps`, `tune_figure.py`, run 4 at 2.12M, 308 called character pairs): the cells within b
+log-odds of any called localizable non-character tag's own peak, plus the character's own peak − 4 band, and the connected region
+holding the character's peak.
+
+| Character box rule | P / R at IoU ≥ 0.3 | at IoU ≥ 0.5 | solo found (0.5) | several characters found (0.5) |
+|---|---|---|---|---|
+| peak − 4 (as other tags) | 0.01 / 0.01 | 0.00 / 0.00 | | |
+| whole image | 0.57 / 0.51 | 0.35 / 0.31 | 0.77 | 0.26 |
+| figure, b = 2 | 0.67 / 0.60 (closed 2 cells) | 0.40 / 0.36 | | |
+| figure, b = 3 (adopted) | 0.65 / 0.58 | 0.42 / 0.37 | 0.89 | 0.31 |
+| figure, b = 4 | 0.59 / 0.53 | 0.37 / 0.33 | 0.79 | 0.28 |
+
+252 of the 308 pairs are on images with several characters, and there the merged figure was wrong in a way the hit rate hid
+(the user: "that sounds like it would be wrong... a lot"): 96% of those boxes covered half of another character's gold box, 87%
+held another called character's peak. Splitting the figure between the called characters fixes most of it, with two conditions
+(`review/regions/fig_multi.py`, `fig_split.py`, b = 3, found at IoU 0.5 / box holds a far character's peak):
+
+| Split | solo images | 2 characters | 3-5 characters |
+|---|---|---|---|
+| none (merged) | 0.80 / 0.27 | 0.48 / 0.85 | 0.09 / 0.85 |
+| every image, characters within 12 cells = one person, geodesic | 0.67 / 0.05 | 0.51 / 0.15 | 0.21 / 0.17 |
+| **only when the model doesn't call `solo` (adopted)** | 0.78 / 0.16 | 0.54 / 0.26 | 0.25 / 0.22 |
+
+- The split is geodesic: each figure cell goes to whichever peak a breadth-first flood through the figure reaches first, so a limb
+  isn't cut off by a straight line (nearest-peak by straight-line distance: 0.43 vs 0.44 at 2 characters, more boxes holding another
+  face). Splitting by the characters' own maps (each cell to the map highest relative to its own peak) was far worse (0.12).
+- Characters whose peaks are within 12 of 128 cells (48px at 512; `DefaultSamePersonDistance`) are one person: the model calls a
+  character and its costume variant (gold ship and gold ship (red strife)) on one face, and splitting them halved the figure.
+- Split on every image it cost solo images 13 points: a wrongly called second character peaks on the same figure. Gating on the
+  model's own `solo` call keeps solo images at 0.78.
+
+`TagScorer.FigureBox` (`DefaultFigureBand` = 3) boxes every `character:` tag in `detect`, `detect-batch`, `render-gold` and the
+evaluator. The figure's tags are those the model calls at their calibrated thresholds, whatever `--threshold` or render-gold's
+gold-tags-only filter report; the evaluator takes `evaluate`'s own calibrated thresholds (0.5 without them). End to end through
+`detect`'s edge refinement (`render-gold`, `score_char_boxes.py`), called characters at IoU ≥ 0.5: peak cut 0.05 / 0.06, merged
+figure 0.36 / 0.32, split 0.44 / 0.40; boxes covering half of another character's gold box on multi-character images 100% → 47%.
+In the evaluator (IoU ≥ 0.3, run 4 at 2.22M): character boxes 0.01 / 0.02 → 0.60 / 0.53 (merged, build33) → 0.66 / 0.57 (split,
+build34), every other number unchanged.
+
+**Training a character's map to cover the character (2026-11-04, not adopted).** The user's idea: "a character is a contiguous
+entity", so fix the maps, not the boxes. A character's map covers 2-4% of its gold box at the 4-log-odds band (region precision
+0.86-0.98) on every model. Two label-free terms (`CharacterExtent`, both off by default), each on images labelled solo with one
+character; 12,000 steps from run 4 at 2,257,658, run 4's mixed-scale recipe, constant LR 1.7e-5, B70 (`review/characters/`):
+- `--character-extent-weight 0.05`: the figure is the cells within 3 log-odds of one of the image's other labelled localizable tags'
+  peaks (the live map, detached); the character's map is pushed to hold them within 4 of its (detached) peak and the rest below.
+- `--character-hide-weight 0.3` (hide-and-seek, Singh & Lee 2017; adversarial erasing, Wei et al. 2017): the region the
+  character's map points at is blanked, and the character is a positive MIL bag on that view's localization map.
+
+| Arm | mAP | main gold characters: pointing / region recall | character set (below): pointing / region recall |
+|---|---|---|---|
+| control | 0.803 | 88.5% / 0.03 | 97% / 0.02 |
+| extent | 0.156 | 6.2% / 0.99 | 16% / 0.97 |
+| hide-and-seek | 0.803 | 88.1% / 0.03 | 99% / 0.02 |
+
+The extent term flattened every map (region recall 0.99 = everything lights up): it starts at 10-20 per image against a
+localization loss under 1, and its gradient runs through the map features every tag shares. Hide-and-seek changed nothing:
+blanking the face didn't make the map find the body. Speed: 174 / 197 ms/step vs 182 (hide's extra view, 26.8 GB peak).
+
+**Two new gold sets (2026-11-04, outside git, labelled by Claude subagents under each set's `tools/LABELING.md`, reviewed by the user
+in `review.html`).**
+- `gold-characters/`: 62 held-out images in three strata (the user's): popular-distinct (>= 5,000 training images, <= 3 costume
+  variants, i.e. Danbooru implications into the character), popular-diverse (>= 5,000, >= 10 variants: hatsune_miku 467, kirby 109,
+  artoria_pendragon_(fate) 112, plus tohsaka_rin at 3,485 by request) and unpopular (under 1,000 training images, the bottom ~25% of
+  the vocabulary's characters; the truly rare ones were never in it), 20-22 each, 5 per stratum with two characters. One whole-figure
+  box per appearance; 79 certain, 7 ignore. Why: the main set has 341 characters in 391 pairs, but 259 of its 289 images are in run
+  4's training split. Pointing on it is 96-100% in every stratum, unpopular included; region recall 0.02-0.04 in every stratum.
+- `gold-collage/`: 12 held-out images from the 2048 store (crowds, lineups, comics, a panel collage, wide scenes with small
+  figures), at 2048; characters plus concrete object tags; 207 certain, 34 group, 73 ignore. `tools/at_size.py` writes it at an input
+  size (boxes in that size's content pixels). Gold pointing at 1024 / 2048 on the same pairs: run 4 before mixed training 53.8 /
+  44.9% (small objects 36.7 / 33.3%), at 2.22M 50.7 / 63.0% (small 20.0 / 50.0%; 30 small pairs, so noisy). On the images the 2048
+  share is for, mixed training turned 2048 input from worse than 1024 into clearly better.

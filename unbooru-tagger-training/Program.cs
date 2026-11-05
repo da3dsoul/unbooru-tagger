@@ -539,6 +539,24 @@ var twinPasteOption = new Option<int>("--twin-paste")
     DefaultValueFactory = _ => 0
 };
 trainCommand.Options.Add(twinPasteOption);
+var characterExtentWeightOption = new Option<float>("--character-extent-weight")
+{
+    Description = "Characters' maps cover the character (CharacterExtent): on images labelled solo with one character, the cells within 3 log-odds of the peak of one of its other labelled localizable tags (the live map, detached) make the figure, and the character's map is pushed so figure cells sit within 4 log-odds of its own peak and cells outside below that. 0 = off.",
+    DefaultValueFactory = _ => 0f
+};
+trainCommand.Options.Add(characterExtentWeightOption);
+var characterHideWeightOption = new Option<float>("--character-hide-weight")
+{
+    Description = "Hide-and-seek for characters (CharacterExtent): on images labelled solo with one character, the region the character's map points at is blanked, and the character is a positive bag on that view's localization map at this weight. 0 = off.",
+    DefaultValueFactory = _ => 0f
+};
+trainCommand.Options.Add(characterHideWeightOption);
+var characterHidePerStepOption = new Option<int>("--character-hide-per-step")
+{
+    Description = "With --character-hide-weight: hidden views per micro-batch (each an extra image through the tower).",
+    DefaultValueFactory = _ => 2
+};
+trainCommand.Options.Add(characterHidePerStepOption);
 var selfMapWeightOption = new Option<float>("--self-map-weight")
 {
     Description = "Window labels from the model's own localization map (SelfMapWindows; review/open-vocab-research PLAN #1): per labelled localizable positive, the 64/128px windows at the tag's map peak are a \"yes\" and two of its bottom-40% 64px windows a \"no\", each window embedded as a 64px glimpse by the image tower and trained by a per-window BCE at this weight. Image-level losses unchanged. 0 = off.",
@@ -713,6 +731,9 @@ trainCommand.SetAction(parseResult => TrainCommandHandler.Run(
         TwinWeight: parseResult.GetValue(twinWeightOption),
         TwinDetachScaling: parseResult.GetValue(twinDetachScalingOption),
         TwinPaste: parseResult.GetValue(twinPasteOption),
+        CharacterExtentWeight: parseResult.GetValue(characterExtentWeightOption),
+        CharacterHideWeight: parseResult.GetValue(characterHideWeightOption),
+        CharacterHidePerStep: parseResult.GetValue(characterHidePerStepOption),
         SelfMapWeight: parseResult.GetValue(selfMapWeightOption),
         SelfMapDetachScaling: parseResult.GetValue(selfMapDetachScalingOption),
         SelfMapNegatives: parseResult.GetRequiredValue(selfMapNegativesOption),
